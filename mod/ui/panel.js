@@ -6,7 +6,7 @@
 //      控件高 30px 圆角 24px，强调色取客户端复选框的 #FF3A3A；
 //   3. 不接管原生控件，不改动原有 DOM，只在「输出设备」之后插入一段。
 //
-// 配置来源：本地 nexctl 的 /api/cfg，失败时退回 localStorage 并显示未连接。
+// 配置来源：宿主的本机配置服务 /api/cfg，失败时退回 localStorage 并显示未连接。
 (function () {
   'use strict';
 
