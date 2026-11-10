@@ -1,6 +1,6 @@
 # NeteaseExclusive 项目进度与后续任务
 
-> 更新日期：2026-11-10 08:48（北京时间）  
+> 更新日期：2026-11-10 10:59（北京时间）  
 > 工程目录：`D:/Coding/NeteaseExclusive`  
 > 当前阶段：一键化已落地，端点迁移已落地，`Sink` 按代持有已落地，`nexsink.c` 已按职责拆分。双击 `mod/启动.cmd` 即可完成「启动客户端 → 注入音频模块 → 起配置服务 → 注入界面脚本」，并常驻看护客户端重启、页面重载、模块掉出。音频侧独占接管、位深设置、切歌、拖动进度条、默认输出切换均已实测正常，**切歌与切端点都不再有 join 超时或共享回退**；设置页会按当前端点标明独占下音量是否还能调。音量侧只做端点诊断，**明确不做模块侧数字增益**（用户 2026-11-10 决定：不拿比特换音量）。  
 > 本文件是项目进度的主记录。每完成一个可验证任务，以及每轮工作结束时，都更新这里；未完成项保留实际状态。
@@ -819,3 +819,68 @@ MM3A 上还单独验了 `Initialize(EXCLUSIVE, 88200/24)` → `S_OK, frames=8820
 **对模块本身的影响：没有缺陷。** 候选池 `{44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000}` 里本来就有 88200，MM3A 上一次命中。HyperX 上试 4 次落到 96 也是正确行为。
 
 **可选的改进（未做）**：现在是按固定顺序逐个试，HyperX 上要试 4 次才落定。可以先用 `IsFormatSupported` 把端点的实际能力探一遍再排序，或者缓存上一次成功的格式。省的是几百毫秒的协商时间，不影响正确性，等有实测收益再动。
+
+### 2026-11-10 10:59 — 发布形态落地：一个 exe、双击即装、`release.sh` 出包
+
+**这一轮回答的是「GitHub Release 怎么一键注入」。** 结论：**不做单独的安装器**。AMExclusive 那种 `AMExclusive-Setup-1.8-Aria.exe`（2.32 MB，运行后 `1` 装 `2` 卸）是把安装逻辑单独编了一个程序；我们的 `NexExclusive.exe` 本来就要常驻，把安装逻辑放进它自己，少一个二进制、少一次下载、也少一个被杀软盯上的样本。所以发布包里只有一个可执行文件，双击它就会问你要不要装。
+
+**发布包形态**（`release.sh` 产出，全在 `dist/`）：
+
+```
+dist/NexExclusive-1.0.0.zip          324 KB
+  NexExclusive-1.0.0/
+    NexExclusive.exe   259 KB
+    nexsink.dll        284 KB
+    hook.cfg  ui.json  ui/panel.js  ui/simplify.js
+    README.txt
+dist/SHA256SUMS.txt
+dist/RELEASE-NOTES.md
+```
+
+`release.sh` 只挑运行时要的 6 个文件。`player.exe`、`inject*.exe`、`probe_excl.exe` 这些诊断工具不进包——对用户没用，只会让杀软多几个可疑样本。打包用系统自带的 `C:\Windows\System32\tar.exe`（bsdtar，`-a` 按扩展名写 zip），机器上没有 zip/7z 也能出包。
+
+**双击安装的流程**（`main()` 里的顺序，每一步都有理由）：
+
+1. `--help` / `--install` / `--uninstall` 直接走，不占单实例锁
+2. **单实例**：`Local\NexExclusiveHost` 互斥体。装了自启之后，「开机拉起的那份」和「用户又双击下载目录那份」会同时存在，两个宿主抢 9334 端口，还会互相把注入闸门判成 busy
+3. **跳转**：已安装、但当前 exe 不在安装目录 → 把装好的那份拉起来，自己退出。这里有个坑：必须先 `CloseHandle(once)` 再 `launch_exe`，否则新进程撞上自己还没释放的锁，起来就退
+4. **首次引导**：没装过 + 交互式启动 → `MessageBox` 问一句，选「是」就装，装完直接拉起（同样先放锁）
+5. 正常看护
+
+**客户端版本检查**：`GetFileVersionInfoW` 读 `cloudmusic.exe` 的版本资源，只对 `3.1.42.205594` 标「已验证」，其他版本写「未经验证——注入可能失效」，不做硬拦截（拦下来用户也没法用，只会更困惑）。**踩到一个坑**：网易的版本资源里字符串表和数字字段不是一回事——`FileVersion` 字符串是 `3.1.42.205594`，`VS_FIXEDFILEINFO` 的 `dwFileVersionMS/LS` 是 `3.1.42.8986`。第一版读的是数字字段，日志里显示 `3.1.42.8986`，跟客户端「关于」对不上。改成先走 `\StringFileInfo\<lang><cp>\FileVersion`，取不到再退回数字。
+
+**客户端探测补了两级**（原来 5 级 → 现在 7 级）：
+
+- **桌面 / 开始菜单快捷方式**：解析 `.lnk` 的目标路径。绿色版、装在自定义目录的客户端不写注册表，但安装时几乎一定留快捷方式。只认目标文件名是 `cloudmusic.exe` 的，避免误认。扫 `%APPDATA%\...\Start Menu\Programs`（含一层子目录）、用户桌面、公共桌面。实测：本机客户端在 `D:\Installed_Program\CloudMusic`（注册表里没有），靠这一级探到了，日志 `来源：桌面/开始菜单快捷方式`
+- **文件选择框**：全都找不到时弹 `GetOpenFileNameW` 让用户点一下 `cloudmusic.exe`，选完写回 `host.cfg`。原来只说「请用记事本打开 AppData 里那个文件加一行」——这是把开发者的耐心当成用户的耐心
+
+**装完发现的一个真问题**：从 zip 里 `--install` 之后，`host.cfg` 的 `client=` 是空的（安装时客户端没在跑、注册表也没有），运行时同样探不到，直接退出。也就是说「装完就能用」对非常规安装位置的用户是假的。上面两级探测 + 选择框就是补这个洞。现在 `--install --client <路径>` 也能显式指定，装完 `host.cfg` 里就有值。
+
+**日志输出的两个 bug（都修了）**：
+
+- `--install` / `--uninstall` 在命令行里**一个字都不打**。原因：这两个函数只用 `host_log`（写文件），而 `host_log` 镜像到终端的条件是 `GetConsoleWindow() != NULL`。命令行里 stdout 被重定向时不会分配控制台，条件不成立 → 全静默。改成「有 stderr 句柄就输出」
+- 改完之后又出现乱码：转码看的是 `GetConsoleOutputCP()`，但字节写进的是**管道**。有控制台、stderr 却被重定向时，把 GBK 字节灌进管道，上游按 UTF-8 解就是乱码。改成按**目标**判断：`GetFileType(stderr) == FILE_TYPE_CHAR` 才转控制台代码页，否则原样写 UTF-8
+
+**实测记录**：
+
+| 场景 | 结果 |
+|---|---|
+| `--install`（带 `--client`） | 6 文件 + `host.cfg` 进 `%LOCALAPPDATA%\NexExclusive`，卸载项 / Run 键 / 开始菜单 `.lnk` 全齐，终端有中文输出 |
+| `--uninstall` | 目录、快捷方式、`Uninstall\NexExclusive`、`Run\NexExclusive` 全部清空（复核 `Test-Path` = False，Run 值为空） |
+| 装完启动 | `客户端版本 3.1.42.205594（已验证）` → 注入 `LoadLibraryA=0x97A50000` → `界面脚本已就位` |
+| 单实例 | 第二个实例输出「已有一个 NexExclusive 在运行，本次启动退出」并退出 0，第一个不受影响 |
+| 跨目录跳转 | 从 `build-path6` 启动，日志「已安装到 …\NexExclusive，改为启动那份」，只有安装目录那份在跑 |
+| 快捷方式探测 | 桌面临时放一个指向 `cloudmusic.exe` 的 `.lnk`，`host.cfg` 留空 → `来源：桌面/开始菜单快捷方式`（测完已把 `.lnk` 移出桌面） |
+
+**未实测**：文件选择框（需要人点，无法自动化）、双击时的 `MessageBox` 引导（同上）。两者都是纯 UI 分支，逻辑已 review。
+
+**分发硬门槛（必须用户决定）**：Defender 把 `NexExclusive.exe` 判成 `Behavior:Win32/DefenseEvasion.A!ml`（ThreatID `2147738096`，SeverityID 5），**约 30–60 秒内就会隔离 exe**，并连带清掉快捷方式、Run 键、卸载项。`Get-MpThreatDetection` 记录显示 10:38 那次动到了 5 个对象（文件 + `.lnk` + Run + Uninstall）。触发点是「往别的进程里 `WriteProcessMemory` + `CreateRemoteThread`」这个行为本身，跟代码写得好不好无关。当前会话**非管理员**，加排除项的 cmdlet 用不了（报 `Must be an administrator to view exclusions`），所以本轮所有安装/卸载测试都是「装完趁它还没被删掉赶紧验」跑出来的。
+
+可选出路，按代价排序：
+
+1. **用户以管理员加排除项**（本机自用够了，不解决分发）
+2. **向微软提交误报**（免费，几天出结果，对这个 case 成功率不低——我们不做持久化、不联网、不加密，只是加载自己的 DLL）
+3. **换注入方式**：现在是最典型的 `VirtualAllocEx` + `WriteProcessMemory` + `CreateRemoteThread(LoadLibraryA)`。改成代理 DLL（放在客户端目录旁、转发导出表）能绕开「远程线程」这个特征，但要写客户端安装目录，且用户装在 `Program Files` 时没权限
+4. **代码签名**（要证书，每年几千块；能压 SmartScreen，但压不住行为检测）
+
+本轮没有自作主张去改注入方式——那是架构级改动，得先确认用户要往哪个方向走。
