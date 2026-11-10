@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 # 使用现有 Zig 工具链构建；OUT_DIR 必须是绝对目录，默认本脚本所在的 mod。
+# Zig 的位置默认取下面的开发机路径，换机器时用 ZIG=/path/to/zig 覆盖。
 set -euo pipefail
 MOD_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ZIG=${ZIG:-/d/Installed_Program/zig/zig-x86_64-windows-0.17.1}
 export ZIG_LIB_DIR="$ZIG/lib"
 CC="$ZIG/zig.exe"
+
+# 工具链缺失时给出一句能照着做的提示，而不是让 zig.exe 的 ENOENT 冒上来。
+if [[ ! -x "$CC" ]]; then
+    printf '找不到 zig 工具链：%s\n' "$CC" >&2
+    printf '请设置 ZIG 指向 zig 安装目录（内含 zig.exe 与 lib/），例如：\n' >&2
+    printf '  ZIG=/c/zig/zig-x86_64-windows-0.17.1 %s all\n' "$0" >&2
+    exit 2
+fi
 
 FLAGS=(-target x86_64-windows-gnu -O2 -Wall)
 LIBS=(-lole32 -loleaut32 -luuid)
