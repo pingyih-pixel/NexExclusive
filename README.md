@@ -125,6 +125,12 @@ nexsink.dll ───────┬─ hook IMMDevice / IAudioClient 的 vtable
 更细的设计取舍、实测数据和踩过的坑都在 [`PROJECT_STATUS.md`](PROJECT_STATUS.md)
 （中文，工程日志，很长）。
 
+## 还差什么
+
+[`docs/ROADMAP.md`](docs/ROADMAP.md) 按优先级列了离「可以发给任何人」还差哪些事。
+一句话版本：**Defender 误报不解决，对外分发就不可用**；其余是兼容性覆盖
+（更多客户端版本、更多声卡）和功能缺口（ASIO / 网播通路、面板回归）。
+
 ## 免责
 
 - 与网易公司无关，非官方工具。
