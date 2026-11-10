@@ -3,6 +3,10 @@ name: build
 # 公开构建：任何人 push 都能看到产物，tag 推上来自动发 Release。
 # 用和本地完全相同的 release.sh —— CI 只是换了个地方跑同一条命令，
 # 不做任何 CI 专属的分支逻辑，避免「本地能出包、CI 出不来」。
+#
+# action 一律跟最新大版本：GitHub 已经把 Node 20 标记弃用，旧版 action 会被
+# 强制跑在 Node 24 上并每次报 annotation。升级前确认过新版的入参对我们是兼容的
+# （v7/v8 只加了可选参数，ESM 迁移对调用方透明）。
 
 on:
   push:
@@ -18,7 +22,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 安装 Zig
         shell: pwsh
@@ -45,7 +49,7 @@ jobs:
         run: bash release.sh
 
       - name: 上传产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: NexExclusive-package
           path: |
@@ -61,7 +65,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: NexExclusive-package
           path: dist

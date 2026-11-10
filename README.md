@@ -106,6 +106,18 @@ bash release.sh              # 打包：dist/NexExclusive-x.y.z.zip + 校验和 
 CI 在 GitHub Actions 上跑同样的 `release.sh`，产物可在 Actions 页面下载
 （`.github/workflows/build.yml`）。
 
+### 关于可复现构建
+
+**同一个输出路径下重复构建，产物逐字节一致**——`nexsink.dll` 和
+`NexExclusive.exe` 的 SHA256 完全相同，这一点实测过。
+
+但**换个输出目录哈希就变**：链接器把 PDB 的绝对路径写进了 PE 的调试目录，
+CI 上的 `D:\a\NexExclusive\NexExclusive\dist\.build` 和你本机的路径不一样，
+所以本地构建的哈希对不上 `dist/SHA256SUMS.txt` 是正常的，不代表源码有问题。
+
+`SHA256SUMS.txt` 校验的是**下载完整性**（文件没被截断、没被中间人替换），
+不是「这个包确实由这份源码编出来」的证明。要后者，请在相同路径下构建后比对。
+
 ## 它是怎么工作的
 
 ```
