@@ -932,3 +932,53 @@ dist/RELEASE-NOTES.md
 **为什么不彻底解决自删除**：非管理员删不掉正在运行的 exe，常见解法是「复制自己到 %TEMP% → 退出 → 临时副本删原文件」，但那是典型的释放器收尾行为，在 Defender 已经在盯这个程序的当下属于自找麻烦。当前取舍是：**说实话 + 给一条用户能照做的路**，不引入更可疑的行为。
 
 **包已重出**：`dist/NexExclusive-1.0.0.zip`，sha256 `9d80ae99…ef9f`。安装版在跑，客户端已注入，端点 41% 静音。
+
+### 2026-11-10 11:26 — 对着 AME 源码查「为什么人家不被删」，顺手补上版本资源
+
+**问题**：用户问「别人用管理员运行呢？为什么 AME 用脚本装就没事？」
+
+**管理员运行没用**。检测不看令牌权限，反而「提权 + 注入」是加分项。管理员能做的只有两件事：加排除项，或者从隔离区恢复并「允许在设备上」——都是事后动作，不是免疫。
+
+**AME 用的是完全一样的注入方式**。`analysis/ame-ref/mod/src/Broker.cpp:461-469`：
+
+```cpp
+void* remote = VirtualAllocEx(process, nullptr, bytes, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+if (!remote || !WriteProcessMemory(process, remote, dll.c_str(), bytes, nullptr)) { ... }
+HANDLE thread = CreateRemoteThread(process, nullptr, 0, loadLibrary, remote, 0, nullptr);
+```
+
+和我们的四步一模一样。所以「人家没被报」不是因为它更干净。
+
+**真正的差异（按证据强弱）**：
+
+| | AME | 我们（改之前） |
+|---|---|---|
+| 版本资源 | `VersionInfo.rc.in`：CompanyName / FileDescription / FileVersion / InternalName / OriginalFilename 全齐 | **全空**，文件属性里一片空白 |
+| 清单 | `/MANIFESTDEPENDENCY` 声明公共控件 v6 | **没有** |
+| 图标 | 有 | 只有 `IDI_APPLICATION` 默认图标 |
+| 代码签名 | 没找到签名步骤 | 无 |
+| 普及度 | Release 被大量下载，云保护有信誉分 | 从未见过的哈希 |
+
+前三条是我们能改的，后一条只能靠时间。
+
+**做了什么**：
+
+- `mod/tools/nexhost.rc.in` —— VERSIONINFO（含 `Comments` 说明「Loads nexsink.dll into the music player process to enable WASAPI exclusive output」，分析员一看就知道这程序干什么），版本号用 `@V1@/@V2@/@V3@` 占位
+- `mod/tools/nexhost.manifest` —— `asInvoker`（永不提权）、per-monitor v2 DPI、公共控件 v6、longPathAware
+- `build.sh` —— `zig rc` 生成 `.res` 再交给 `zig cc`。**zig 自带资源编译器**，不需要 windres 或 Windows SDK，换机器照样能构建；版本号从 `nexhost.c` 的 `APP_VERSION` 读，只有一处真相
+
+**踩的坑（值得记）**：清单里也有版本占位符。第一版只 sed 了 `.rc`，没 sed `.manifest`，编出来的清单是 `version="@V1@.@V2@.@V3@.0"`。`zig rc` 不报错、链接成功，**一运行就死**：
+
+```
+bash: ./NexExclusive.exe: Permission denied
+```
+
+看起来像杀软拦截，实际是「应用程序的并行配置不正确」（`ERROR_SXS_CANT_GEN_ACTCTX`）。`sxstrace` 不用跑，事件日志直接说了：
+
+> 元素"assemblyIdentity"中属性"version"的值"@V1@.@V2@.@V3@.0"无效
+
+**这是本轮最容易误判的一次**——差一点就去查 Defender 了。
+
+**验证**：`FileDescription = NexExclusive - WASAPI exclusive audio host`、`FileVersion = 1.0.0.0`、清单里 `asInvoker` 和 `version="1.0.0.0"` 都在；安装版启动、注入、界面脚本全部正常。包重出，sha256 `5bd701a4…6f57`。
+
+**不承诺这能解决误报**。它降低的是「裸 PE」这个特征分，不是消除行为判定。真正的解法还是向微软报误报（材料在 `docs/defender-false-positive.md`），或者换注入方式。
