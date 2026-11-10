@@ -37,8 +37,8 @@
 #define CDP_PORT 9333
 
 /* 自带文件一律从 exe 所在目录推导。这里原来躺着 7 条写死的开发机绝对路径
-   （D:\Coding\NeteaseExclusive\mod\...），换台机器就全失效——正是「别人
-   拿到能编译、但跑不起来」的根因。所以发布包就是 OUT_DIR 本身，扁平结构：
+   （<项目目录>\mod\...），换台机器就全失效——正是「别人拿到能编译、但跑
+   不起来」的根因。所以发布包就是 OUT_DIR 本身，扁平结构：
      NexExclusive.exe  nexsink.dll  hook.cfg  ui.json  ui\panel.js  ui\simplify.js
    客户端不归我们管，它的位置要探测，见 resolve_client()。 */
 extern IMAGE_DOS_HEADER __ImageBase;
