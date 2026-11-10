@@ -136,7 +136,10 @@ build_tools() {
     "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/sess_vol.exe"   "$MOD_DIR/tools/sess_vol.c"   "${LIBS[@]}" -lshell32
     "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/probe_excl.exe" "$MOD_DIR/tools/probe_excl.c" "${LIBS[@]}"
     "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/ep_formats.exe" "$MOD_DIR/tools/ep_formats.c" "${LIBS[@]}" -lpropsys
-    printf '已构建到 %s：list_eps.exe set_ep.exe sess_vol.exe probe_excl.exe ep_formats.exe\n' "$OUT_DIR"
+    # 开发辅助：带 DevTools 端口启动客户端（参数或 NEX_CLIENT 给路径）。
+    # 之前一直没进构建脚本，改完没人编译就烂在那儿了。
+    "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/nexlaunch.exe" "$MOD_DIR/tools/launch.c"
+    printf '已构建到 %s：list_eps.exe set_ep.exe sess_vol.exe probe_excl.exe ep_formats.exe nexlaunch.exe\n' "$OUT_DIR"
 }
 
 build_test() {
