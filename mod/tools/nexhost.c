@@ -1445,6 +1445,27 @@ static int launch_exe(const wchar_t *exe, const wchar_t *workdir) {
     return 1;
 }
 
+/* 停掉所有 NexExclusive.exe 进程（自己除外）。安装要覆盖正在运行的主程序、
+   卸载要删掉它，都得先停。原来只有卸载做了这件事，于是「程序在跑的时候重装」
+   会卡在 CopyFileW 的共享冲突上，报一句「有文件没复制成功」就中止。 */
+static int stop_other_hosts(void) {
+    int n = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"NexExclusive.exe") != 0) continue;
+            if (pe.th32ProcessID == GetCurrentProcessId()) continue;
+            HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+            if (h) { TerminateProcess(h, 0); CloseHandle(h); n++; }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return n;
+}
+
 static int do_install(const wchar_t *client_override) {
     /* IShellLink 是 COM，没初始化会返回 CO_E_NOTINITIALIZED (0x800401F0)。
        建不了快捷方式不影响主功能，但既然要做就做对。 */
@@ -1469,6 +1490,9 @@ static int do_install(const wchar_t *client_override) {
       CreateDirectoryW(ui, NULL); }
 
     log_w("安装到 %s", dst);
+
+    /* 覆盖正在运行的主程序会撞共享冲突，先停掉；停完等它真正退出再复制。 */
+    if (stop_other_hosts()) { host_log("已停止运行中的旧宿主"); Sleep(500); }
 
     int ok = 1;
     ok &= copy_into(src, dst, L"NexExclusive.exe");
@@ -1538,22 +1562,7 @@ static int do_uninstall(void) {
     if (!install_dir(dst, MAX_PATH)) return 1;
 
     /* 先停掉正在跑的宿主（从安装目录启动的那个），否则文件删不掉 */
-    DWORD pid = find_main_client();
-    (void)pid;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32W pe;
-        pe.dwSize = sizeof(pe);
-        if (Process32FirstW(snap, &pe)) {
-            do {
-                if (_wcsicmp(pe.szExeFile, L"NexExclusive.exe") != 0) continue;
-                if (pe.th32ProcessID == GetCurrentProcessId()) continue;
-                HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
-                if (h) { TerminateProcess(h, 0); CloseHandle(h); host_log("已停止运行中的宿主"); }
-            } while (Process32NextW(snap, &pe));
-        }
-        CloseHandle(snap);
-    }
+    if (stop_other_hosts()) host_log("已停止运行中的宿主");
     Sleep(400);
 
     RegDeleteKeyW(HKEY_CURRENT_USER, UNINST_KEY);
@@ -1573,6 +1582,7 @@ static int do_uninstall(void) {
     static const wchar_t *files[] = {
         L"nexsink.dll", L"hook.cfg", L"ui.json", L"host.cfg",
         L"ui\\panel.js", L"ui\\simplify.js",
+        L"host.log", L"sink.log", L"sink.prev.log",
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
         WCHAR p[MAX_PATH];
@@ -1586,15 +1596,26 @@ static int do_uninstall(void) {
     WCHAR exe_path[MAX_PATH];
     _snwprintf(exe_path, MAX_PATH, L"%ls\\NexExclusive.exe", dst);
     exe_path[MAX_PATH - 1] = 0;
-    /* 如果当前就是从安装目录跑的，把自己也标成重启后删；从别处跑就直接删 */
+    /* 如果当前就是从安装目录跑的，自己正在运行，文件删不掉。
+       MOVEFILE_DELAY_UNTIL_REBOOT 要写 HKLM\...\PendingFileRenameOperations，
+       需要管理员；普通权限下它是静默失败的——原来不管成败都打「将在下次重启后
+       移除」，等于骗人：目录其实一直留着。所以按返回值说话。 */
+    int leftover = 0;
     if (_wcsicmp(self, exe_path) == 0) {
-        MoveFileExW(exe_path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
-        host_log("主程序将在下次重启后移除（它正在运行）");
-    } else {
-        DeleteFileW(exe_path);
+        if (MoveFileExW(exe_path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)) {
+            host_log("主程序已登记为重启后删除");
+        } else {
+            leftover = 1;
+            log_w("主程序正在运行，删不掉（登记重启删除需要管理员权限）。"
+                  "关掉本程序后直接删掉目录 %s 即可。", dst);
+        }
+    } else if (!DeleteFileW(exe_path)) {
+        leftover = 1;
     }
     RemoveDirectoryW(dst);
-    host_log("卸载完成");
+    /* 「卸载完成」和「主程序还在」同时出现会让人以为没卸干净，所以分开说 */
+    if (leftover) host_log("卸载完成（除主程序文件外，其余已清除）");
+    else          host_log("卸载完成");
     return 0;
 }
 

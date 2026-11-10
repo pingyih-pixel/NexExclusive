@@ -101,6 +101,10 @@ NexExclusive $VER —— 给网易云音乐客户端加上 WASAPI 独占输出
 【卸载】
   设置 → 应用 → NexExclusive → 卸载；或者运行 NexExclusive.exe --uninstall。
   卸载会删掉程序文件、开机自启项和卸载项，不动你的音乐和客户端。
+
+  注意：从安装目录里运行卸载时，主程序文件正被自己占用，Windows 不允许
+  删除正在运行的 exe。如果当前不是管理员（无法登记「重启后删除」），目录里
+  会剩下一个 NexExclusive.exe——关掉程序后手动删掉那个文件夹即可。
 EOF
 
 printf '==> 打包\n'
