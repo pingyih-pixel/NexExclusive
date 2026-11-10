@@ -827,10 +827,10 @@ MM3A 上还单独验了 `Initialize(EXCLUSIVE, 88200/24)` → `S_OK, frames=8820
 **发布包形态**（`release.sh` 产出，全在 `dist/`）：
 
 ```
-dist/NexExclusive-1.0.0.zip          324 KB
+dist/NexExclusive-1.0.0.zip          324 KB（331728 字节）
   NexExclusive-1.0.0/
-    NexExclusive.exe   259 KB
-    nexsink.dll        284 KB
+    NexExclusive.exe   320 KB（327680）
+    nexsink.dll        277 KB（284160）
     hook.cfg  ui.json  ui/panel.js  ui/simplify.js
     README.txt
 dist/SHA256SUMS.txt
