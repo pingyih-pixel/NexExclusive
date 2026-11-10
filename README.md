@@ -24,7 +24,10 @@ NexExclusive 让客户端自己用 WASAPI 独占模式打开输出设备：不�
 
 ## 装
 
-1. 下载 `NexExclusive-x.y.z.zip`，解压。
+1. 拿发布包 `NexExclusive-x.y.z.zip`，解压。
+   目前**没有正式 Release**（原因见 [`docs/ROADMAP.md`](docs/ROADMAP.md#为什么还不发-release)），
+   包从 [Actions](https://github.com/pingyih-pixel/NexExclusive/actions) 里最近一次
+   绿色构建的 Artifacts 下载，或者自己构建（见下）。
 2. **先看下面的「已知问题」**——不加排除项的话，exe 会被 Defender 隔离。
 3. 双击 `NexExclusive.exe`。第一次会问要不要安装，选「是」：
    - 装到 `%LOCALAPPDATA%\NexExclusive`

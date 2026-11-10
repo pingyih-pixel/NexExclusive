@@ -30,8 +30,17 @@ exe，连带删快捷方式、自启项、卸载项。触发点是 `WriteProcess
 
 - [x] 公开仓库（README / LICENSE / CI 已就绪）
 - [x] CI 出包（`.github/workflows/build.yml`，与本地同一条 `release.sh`）
-- [ ] 实际推上 GitHub 并跑通一次 CI
+- [x] 实际推上 GitHub 并跑通一次 CI
+      → <https://github.com/pingyih-pixel/NexExclusive>，windows job 2m42s 全绿，
+      产物可下载（`NexExclusive-1.0.0.zip` + `SHA256SUMS.txt` + `RELEASE-NOTES.md`）
+- [ ] 打 tag 发首个 Release（**故意压着**：见下面「为什么还不发 Release」）
 - [ ] 可选：代码签名
+
+### 为什么还不发 Release
+
+误报没解决之前，公开一个「装完 30 秒被 Defender 删掉」的 Release，等于把第一
+印象一次性用掉。代码公开 + CI 绿了，「公开构建」这个目的已经达到；Release
+留到误报有结论再发。现在想要包的人可以从 Actions 产物里拿。
 
 ---
 
