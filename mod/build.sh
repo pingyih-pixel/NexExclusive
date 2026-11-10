@@ -57,9 +57,27 @@ build_sink() {
 }
 
 build_host() {
-    # 一键宿主：内置 HTTP 配置服务 + CDP 注入 + 进程看护
-    "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/NexExclusive.exe" "$MOD_DIR/tools/nexhost.c" -lws2_32 -lole32 -loleaut32
-    printf '已构建到 %s：NexExclusive.exe\n' "$OUT_DIR"
+    # 一键宿主：内置 HTTP 配置服务 + CDP 注入 + 进程看护 + 托盘常驻。
+    # 它按 exe 所在目录找资源，所以 OUT_DIR 就是发布包本身（扁平结构）。
+    #   --subsystem,windows: 不弹控制台窗口，日常运行靠托盘
+    #   advapi32: 客户端路径探测要读注册表、安装要写卸载项
+    #   shell32/user32: 托盘图标与菜单
+    #   version: 读客户端 exe 的版本资源，判断是否为已验证版本
+    #   comdlg32: 找不到客户端时弹文件选择框
+    "$CC" cc "${FLAGS[@]}" -Wl,--subsystem,windows \
+        -o "$OUT_DIR/NexExclusive.exe" "$MOD_DIR/tools/nexhost.c" \
+        -lws2_32 -lole32 -loleaut32 -ladvapi32 -lshell32 -luser32 -lgdi32 \
+        -lversion -lcomdlg32
+    # 配置只在缺失时复制——用户可能改过；界面脚本是代码，每次都覆盖。
+    local f
+    for f in hook.cfg ui.json; do
+        [[ -f "$OUT_DIR/$f" ]] || cp -- "$MOD_DIR/$f" "$OUT_DIR/$f"
+    done
+    if [[ -d "$MOD_DIR/ui" ]]; then
+        mkdir -p "$OUT_DIR/ui"
+        cp -- "$MOD_DIR/ui/panel.js" "$MOD_DIR/ui/simplify.js" "$OUT_DIR/ui/"
+    fi
+    printf '已构建到 %s：NexExclusive.exe（含 hook.cfg / ui.json / ui/）\n' "$OUT_DIR"
 }
 
 build_tools() {
