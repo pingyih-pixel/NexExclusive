@@ -772,7 +772,7 @@ sink: new stream while gen 5 is still running
 
 **`build.sh` 的健壮性补丁**：`ZIG` 默认值仍是开发机路径，别人拿到仓库若没设 `ZIG`，原来只会看到 `zig.exe` 的 ENOENT。现在提前 `[[ -x "$CC" ]]` 判断，打印缺失路径与一行 `ZIG=/c/zig/zig-x86_64-windows-0.17.1 mod/build.sh all` 的示例，退出码 2。
 
-**提交**：`cf05b20` 初始提交（45 files, +10595）、`2c7ef03` build.sh 提示。仓库身份是**仓库级**的 `Pingyi <pingyi@local>`，没有动全局配置，不影响机器上其他项目。**未设远端**——这是注入网易云客户端的代码，公开有风险，等明确决定再说。
+**提交**：`2dad16d` 初始提交（45 files, +10595）、`52021c4` build.sh 提示。仓库身份是**仓库级**的 `Pingyi <pingyi@local>`，没有动全局配置，不影响机器上其他项目。**未设远端**——这是注入网易云客户端的代码，公开有风险，等明确决定再说。
 
 **仍然存在的环境绑定（本次未动，明确列出）**：`mod/tools/nexhost.c:32-40` 有 7 处绝对路径（`kClientExe`/`kClientDir` 指向 `<客户端目录>`，`kSinkDll`/`kHookCfg`/`kUiJson`/`kSinkLog`/`kHostLog`/`kPanelJs`/`kSimplifyJs` 指向 `<项目目录>\mod`），`mod/tools/launch.c:9-11` 与 `mod/tools/nexui.cmd:8` 同样写死了客户端安装位置。这些不影响构建（REL-01 的标准是「空构建目录可产出」），但影响**别人拿到就能跑**。宿主侧的文件路径可由 exe 所在目录推导，客户端路径需要探测或让用户配——这是一项独立工作，不在 REL-01 范围内，留作后续。
 
@@ -982,3 +982,37 @@ bash: ./NexExclusive.exe: Permission denied
 **验证**：`FileDescription = NexExclusive - WASAPI exclusive audio host`、`FileVersion = 1.0.0.0`、清单里 `asInvoker` 和 `version="1.0.0.0"` 都在；安装版启动、注入、界面脚本全部正常。包重出，sha256 `5bd701a4…6f57`。
 
 **不承诺这能解决误报**。它降低的是「裸 PE」这个特征分，不是消除行为判定。真正的解法还是向微软报误报（材料在 `docs/defender-false-positive.md`），或者换注入方式。
+
+### 2026-11-10 11:52 — 公开前最后一次改写：署名、仓库名、CI 去风险
+
+**决定**：公开仓库 + 公开构建（用户批准）。仓库名 `NexExclusive`（与 exe 同名），Public。
+
+**署名改写**：23 个提交的作者与提交者统一从 `Pingyi <pingyi@local>` 改成
+`Pingyi <pingyih-pixel@users.noreply.github.com>`，用
+`git rebase --root --exec 'git commit --amend --no-edit --reset-author'` 一次跑完。
+选 noreply 而不是真实邮箱：提交能关联到 GitHub 账号、贡献图能显示，同时不公开任何邮箱。
+**内容零差异**——`git diff backup-pre-rewrite main` 为空，23 个提交一个没少。
+
+**副作用**：所有旧哈希失效。本文档里引用过两处，已同步更新
+（`cf05b20` → `2dad16d` 初始提交、`2c7ef03` → `52021c4` build.sh 提示）。
+上面 10:12 那节写的「仓库身份是 `Pingyi <pingyi@local>`」是当时的真实状态，保留不改。
+
+**CI 去风险**（`.github/workflows/build.yml`）：Zig 安装从 `Invoke-WebRequest` +
+`Expand-Archive` 换成系统自带的 `curl.exe` + `tar.exe`（bsdtar）。理由不是洁癖——
+`Expand-Archive` 解 100 MB、两万个小文件能磨好几分钟。本机把这一步完整干跑过一遍：
+
+- `curl.exe -fsSL` 下载 **8.2 s**，`Get-FileHash` 与 ziglang.org `index.json` 里
+  0.17.1 的 `shasum`（`b03f477a…562e`）逐字相同
+- `tar.exe -xf` 解压 **20.6 s**，顶层目录确认为 `zig-x86_64-windows-0.17.1`
+  （`GITHUB_PATH` 那行依赖这个名字，写错就是第一次 CI 直接红）
+- 解出来的 `zig.exe version` → `0.17.1`
+
+顺手修了 README 一处硬伤：回归组数写的 18，`main()` 里实际调了 **19** 个
+`test_*`（`test_module_dir` 之后又加了 `test_lifecycle_stress`）。文档里的数字
+要么数得出来，要么别写。
+
+**故意没做的**：打 `v1.0.0` tag、发 Release。误报没解决之前公开一个「装完就被
+杀软删掉」的 Release，等于把第一印象用掉。先只推代码跑通 CI。
+
+**卡点**：`gh auth status` 显示 `pingyih-pixel` 的 token 失效，本机也没有配
+credential helper，推不上去。需要用户本人 `gh auth login -h github.com -p https -w`。
