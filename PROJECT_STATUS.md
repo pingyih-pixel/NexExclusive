@@ -772,7 +772,7 @@ sink: new stream while gen 5 is still running
 
 **`build.sh` 的健壮性补丁**：`ZIG` 默认值仍是开发机路径，别人拿到仓库若没设 `ZIG`，原来只会看到 `zig.exe` 的 ENOENT。现在提前 `[[ -x "$CC" ]]` 判断，打印缺失路径与一行 `ZIG=/c/zig/zig-x86_64-windows-0.17.1 mod/build.sh all` 的示例，退出码 2。
 
-**提交**：`2dad16d` 初始提交（45 files, +10595）、`52021c4` build.sh 提示。仓库身份是**仓库级**的 `Pingyi <pingyi@local>`，没有动全局配置，不影响机器上其他项目。**未设远端**——这是注入网易云客户端的代码，公开有风险，等明确决定再说。
+**提交**：初始提交（45 files, +10595）与 build.sh 提示各一次。仓库身份是**仓库级**的 `Pingyi <pingyi@local>`，没有动全局配置，不影响机器上其他项目。**未设远端**——这是注入网易云客户端的代码，公开有风险，等明确决定再说。
 
 **仍然存在的环境绑定（本次未动，明确列出）**：`mod/tools/nexhost.c:32-40` 有 7 处绝对路径（`kClientExe`/`kClientDir` 指向 `<客户端目录>`，`kSinkDll`/`kHookCfg`/`kUiJson`/`kSinkLog`/`kHostLog`/`kPanelJs`/`kSimplifyJs` 指向 `<项目目录>\mod`），`mod/tools/launch.c:9-11` 与 `mod/tools/nexui.cmd:8` 同样写死了客户端安装位置。这些不影响构建（REL-01 的标准是「空构建目录可产出」），但影响**别人拿到就能跑**。宿主侧的文件路径可由 exe 所在目录推导，客户端路径需要探测或让用户配——这是一项独立工作，不在 REL-01 范围内，留作后续。
 
@@ -994,7 +994,8 @@ bash: ./NexExclusive.exe: Permission denied
 **内容零差异**——`git diff backup-pre-rewrite main` 为空，23 个提交一个没少。
 
 **副作用**：所有旧哈希失效。本文档里引用过两处，已同步更新
-（`cf05b20` → `2dad16d` 初始提交、`2c7ef03` → `52021c4` build.sh 提示）。
+（本文档里引用过两处提交号，已同步更新。后来提交信息又整体改短了一次，
+哈希再变，所以正文里改成不写具体提交号——写了迟早失效。）
 上面 10:12 那节写的「仓库身份是 `Pingyi <pingyi@local>`」是当时的真实状态，保留不改。
 
 **CI 去风险**（`.github/workflows/build.yml`）：Zig 安装从 `Invoke-WebRequest` +
@@ -1063,3 +1064,9 @@ topics `wasapi / exclusive-mode / netease-cloud-music / audio / windows / zig`�
 
 **仍然没做的**：`v1.0.0` tag / Release。理由同上一节，已写进 ROADMAP 的
 「为什么还不发 Release」。
+
+### 2026-11-10 12:30 — 提交信息整体改短
+
+28 条全部重写成一行短句：`filter-branch --msg-filter` 按原哈希查表替换，
+tree 逐字节未变、作者仍是 noreply，然后 force-push。原来那种「A：B；C」把两件事
+塞一行，列表里读着累。**以后一条提交只说一件事。**
