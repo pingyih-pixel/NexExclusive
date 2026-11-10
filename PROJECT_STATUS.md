@@ -1016,3 +1016,50 @@ bash: ./NexExclusive.exe: Permission denied
 
 **卡点**：`gh auth status` 显示 `pingyih-pixel` 的 token 失效，本机也没有配
 credential helper，推不上去。需要用户本人 `gh auth login -h github.com -p https -w`。
+
+### 2026-11-10 12:18 — 推上去了：公开仓库 + 首次 CI 跑通
+
+**仓库**：<https://github.com/pingyih-pixel/NexExclusive>，Public，MIT，
+topics `wasapi / exclusive-mode / netease-cloud-music / audio / windows / zig`。
+`gh auth login` 完成（scope 含 `workflow`，否则 `.github/workflows/` 推不上去）。
+
+**首次 CI**（run `42753878065`，windows job **2m42s**）：全绿。产物
+`NexExclusive-1.0.0.zip` **333466 字节**，与本地包**同尺寸**。
+
+**产物对账**（解包逐文件比 sha256）：
+
+| 文件 | 本地 11:40 包 | CI 包 | 结论 |
+|---|---|---|---|
+| `README.txt` / `hook.cfg` / `panel.js` / `simplify.js` | — | 同 | 一致 |
+| `ui.json` | 112 B | 103 B | **本地那份是 CRLF 工作区副本** |
+| `NexExclusive.exe` | 331264 B | 同尺寸，哈希不同 | 见下 |
+| `nexsink.dll` | 284160 B | 同尺寸，哈希不同 | 见下 |
+
+`ui.json` 那 9 个字节是 CRLF。仓库里存的 blob 一直是 103 B（`.gitattributes`
+的 `* text=auto eol=lf` 在 `git add` 时规范化了索引），但**工作区文件不会自动
+回写**，所以 11:40 打包时用的还是 CRLF 副本。署名改写的 `rebase --root` 重放了
+全部提交、顺带 checkout 了一遍，才把它规整成 LF。不是数据问题。
+
+**构建可复现性实测**（这是本轮最有价值的一条）：
+
+- 先犯了个错：把两次构建输出到 `/tmp/rep1` 和 `/tmp/rep2`，结果 exe/dll 哈希都
+  不同，差点得出「构建不可复现」的结论。**但路径本身是输入**——链接器把 PDB 的
+  绝对路径写进 PE 调试目录。
+- 重做：同一 `OUT_DIR` 连续构建两次 → `NexExclusive.exe`、`nexsink.dll`
+  **逐字节一致**。
+- 顺带确认 lld 写的是**哈希式时间戳**而不是真实时间：PE 头 `TimeDateStamp` 读出来
+  是 1972/2051/1985 这种无意义日期，且两次构建不同。
+- 结论：**同一路径可复现；跨路径不可比。** `SHA256SUMS.txt` 只能证明下载完整性，
+  证明不了「由这份源码编出来」。已写进 README 的「关于可复现构建」。
+
+**CI 告警清理**：首次运行报 Node 20 弃用（`checkout@v4` / `upload-artifact@v4`
+被强制跑在 Node 24 上）。升到 `checkout@v7`、`upload-artifact@v7`、
+`download-artifact@v8`——升之前逐个读了 release notes 确认入参兼容（v7/v8 只加
+可选参数，ESM 迁移对调用方透明）。第二次运行（`42754528060`，3m14s）全绿，
+**annotation 清零**。
+
+步骤耗时（第二次）：装 Zig **17 s**、回归测试 **1m39s**、构建打包 **1m03s**。
+回归测试是大头，符合预期。
+
+**仍然没做的**：`v1.0.0` tag / Release。理由同上一节，已写进 ROADMAP 的
+「为什么还不发 Release」。
