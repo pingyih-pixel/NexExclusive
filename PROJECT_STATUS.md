@@ -208,7 +208,7 @@ P0：先保障接口与音频数据正确性。P1：完成核心体验与集成�
 | UI-06 | P1 | 界面通道的打包与自启 | **已完成** | UI-03 | `mod/启动.cmd` → `NexExclusive.exe` 单进程完成启动/注入/服务/界面注入，不再依赖 Node；客户端退出、页面重载、模块掉出均自动补回 |
 | QA-02 | P1 | 端到端切歌与音质切换矩阵 | 部分完成 | AU-01至AU-08 | 已验：44.1k/16→24、48k/32f→24、连续三次切歌、暂停后重播、拖动进度条 seek 后继续推进、**88.2/96/192 实机（10:00，后两档在本端点走 SRC）**；未验：音质档位切换、两种切换方向 |
 | QA-03 | P1 | SRC 全频与边界测试 | **已验证（代码测试）** | AU-07 | 通带、阻带、过渡带、冲激、峰值、直流、曲尾、多比率（4 组）、实时耗时、线性相位均覆盖；顺带修掉核区间少一格的线性相位缺陷（10:00） |
-| REL-01 | P1 | 建立Git基线与可重复构建 | 待做 | 用户接受版本管理方案 | 空构建目录可产出DLL、注入器、测试；不提交用户资源与日志 |
+| REL-01 | P1 | 建立Git基线与可重复构建 | **已完成** | 用户接受版本管理方案（本地仓库，不设远端） | 空构建目录可产出DLL、注入器、测试；不提交用户资源与日志。`git clone` 到临时目录、全新 `OUT_DIR` 构建 8 个产物 + 18 组回归全 PASS（11:05） |
 | REL-02 | P1 | 替换临时部署流程，自动识别播放进程 | **基本完成** | AU-08、REL-01 | 主进程改按父子关系识别（父进程不是 cloudmusic.exe 的那个），不再靠内存大小猜测；`build.sh` 新增 `host` 目标 |
 | REL-03 | P2 | 安装、停用、恢复与卸载流程 | 待做 | REL-02、QA-02 | 无需反复手工注入；停用可恢复原客户端；不覆盖原资源包 |
 | DOC-01 | P1 | 建立进度主记录并持续更新 | 持续维护 | 无 | 每项完成和每轮结束均更新任务状态、证据及日志 |
@@ -220,6 +220,13 @@ P0/P1 的音频正确性（AU-01…AU-08）已完成编码与桩测试，下一�
 界面侧已越过原计划：UI-02 完成，UI-03 与 UI-05 的面板和开关都能在真实设置页读写，CFG-01 有了文件级通道。接下来是把两端接起来——`nexsink.dll` 真正加载后，面板参数才会影响声音，`/api/status` 也才拿得到本轮运行的状态而不是旧日志。UI-06 负责把「带端口启动 + 服务 + 注入」收成一个入口，不依赖用户手工执行脚本。
 
 当前目标仍是嵌入网易云设置页。面板已经嵌在设置页内，但它与音频模块之间还差一次实机加载；在 DLL 未加载的情况下，界面改动只落到配置文件，不代表听感发生变化。
+
+**11:05 更新——上面两段已经过时。** DLL 与面板之间的加载链路已由 UI-06 打通（`NexExclusive.exe` 单进程完成启动/注入/服务/界面注入），QA-02 的采样率矩阵与 QA-03 的 SRC 全频都已验收，REL-01 的 Git 基线也已建立。当前真正没做的，按优先级：
+
+1. **REL-03 安装 / 停用 / 恢复 / 卸载** —— 现在仍然是「跑一次 `启动.cmd`」，没有可重复的安装，也没有干净卸载。交给别人用之前必须先有这一步。
+2. **`nexhost.c` / `launch.c` 的环境绑定** —— 7 处 + 3 处写死绝对路径（见 11:05 记录末尾）。不做这一步，别人拿到仓库能构建、但跑不起来。
+3. **物理拔插与多进程争用实测** —— 端点失效的代码路径有了（放弃代 + 闸门 + 20×10 ms 重试），但没试过真拔 USB；两个客户端实例同时争一个端点也没验过。
+4. **UI-04** 路由重入与版本校验、**QA-02** 剩余的音质档位切换与两种切换方向。
 
 ## 7. 本轮改动与验证
 
@@ -733,3 +740,38 @@ sink: new stream while gen 5 is still running
 - **对 AMExclusive：功能上已对齐并超出。** 核心独占、原率直通两边都有；多出来的是位深选择、SRC 兜底、设备迁移、独占协调、设置界面、状态诊断、一键部署。它没有的（ASIO/网播）本项目也没有——但那是另一条通路，不是本机播放的质量项。
 - **对 Orion：本机通路覆盖率约 8 成，整体功能面约 6 成。** 差的 4 成集中在 ASIO 与 OpenHome/DLNA 两条独立通路（第 2、3 行），以及一个「自己选端点」的选择器（第 4 行）。本机 WASAPI 这条线上，本项目在诊断、SRC、迁移、界面四项上更完整。
 - **要补齐到 Orion 的量级，需要的是**：ASIO 后端（约等于再写一条设备抽象 + 驱动枚举）、网络播放（OpenHome 控制点 + DLNA 渲染器），以及面板上的端点选择器。前两项是新增通路，不是现有代码的延伸；第三项是几十行的活。
+
+### 2026-11-10 11:05 — REL-01 交付：Git 基线 + 可重复构建，顺带修掉三处写死路径
+
+**规模**：仓库共 45 个文件、10595 行，克隆后 921 KB（含 `.git`）。挡在库外的是 97 MB 里的绝大部分——两个构建目录 39 MB、41 个 `.pdb` 与 30 个 `.exe` 约 25 MB、`sink.log` 348 KB 加十余份 `.prev*.log`、`analysis/ui-probe` 23 MB 与 `ui-shots` 4.5 MB。
+
+**`.gitignore` 的取舍**：`build-*/` 而不是 `build*`，否则会把 `build.sh` 一起挡掉；`analysis/ame-ref/` 是别人的仓库（自带 `.git`、`LICENSE`、`THIRD_PARTY_NOTICES`），混进历史既不合规也没必要，出处留在本文档；`*.bak` 挡掉是因为有了历史之后 `nexsink.c.bak`（62 KB）不再有意义。
+
+**踩到的第一个坑：`core.autocrlf=true`**。本机是 Windows 默认值，`git add` 时只看到一串 `LF will be replaced by CRLF` 警告，但后果不小——checkout 时 `build.sh` 会变成 CRLF，shebang 成了 `#!/usr/bin/env bash\r`，bash 找不到解释器，构建入口直接失效。加 `.gitattributes` 锁死：`* text=auto eol=lf`，只给 `*.cmd` / `*.bat` 留 CRLF（cmd.exe 在纯 LF 下解析 label 会出问题）。`git ls-files --eol` 复核后，`build.sh` / `deploy.sh` / `nexsink.c` 均为 `i/lf w/lf`。
+
+**顺带修掉的真缺陷：三处写死开发机绝对路径**。这三处不是风格问题，是「换台机器就静默失效」——`hook.cfg` 读不到会退回默认值，`sink.log` 写不进会在目标进程目录下乱丢。
+
+| 文件 | 原来 | 现在 |
+|---|---|---|
+| `hooklog.c` `log_line` | `"D:\\Coding\\...\\mod\\hook.log"` | `module_dir()` + `hook.log` |
+| `hooklog.c` `config_path` | `"D:////Coding////...////hook.cfg"` | `module_dir()` + `hook.cfg` |
+| `sink_core.inc` `config_path` | `"D:\\Coding\\...\\mod\\hook.cfg"` | `module_dir()` + `hook.cfg` |
+| `sink_hooks.inc` `DllMain` | `"D:\\Coding\\...\\mod\\sink.log"` | `module_dir()` + `sink.log` |
+
+`module_dir()` 用 `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, &__ImageBase)` 取本模块，再 `GetModuleFileNameW` 截目录。**关键性质**：注入到别的进程之后，它返回的仍是 DLL 自己的完整路径，不受目标进程工作目录影响——所以 `player.exe` 在 `C:\` 下启动、DLL 在 `D:\...\mod\`，配置依旧读得到。用 `__ImageBase` 而不是把函数指针强转成 `LPCWSTR`，是因为后者在 `-Wall` 下会报指针类型不匹配。
+
+**新增第 18 组回归 `test_module_dir`**：先 `SetEnvironmentVariableA("NEX_CFG", NULL)` 逼出回退分支，再断言 `module_dir()` 的结果与 `GetModuleFileNameW(NULL)` 推出的目录逐字相等、`config_path()` 拼出来的就是该目录下的 `hook.cfg`。**这条断言的价值在于它是反向的**——只要哪处再混进硬编码，或者构建目录被搬走，它立刻红。
+
+**验收（REL-01 的三条标准逐条过）**：
+
+1. `git clone` 到 `%TEMP%\nexclone-1849`，45 个文件、零 `.exe`/`.dll`/`.pdb`/`.log` 漏网。
+2. 全新 `OUT_DIR=$CLONE/build-fresh`（不存在，由脚本创建）跑 `build.sh all` → 8 个产物齐：`nexsink.dll` `player.exe` `inject2.exe` `NexExclusive.exe` `host.exe` `hooklog.dll` `inject.exe` `list_eps.exe` `set_ep.exe` `sess_vol.exe`。
+3. 同目录 `build.sh test` → **18 组全 PASS**，`module_dir` 报 `C:\Users\...\Temp\nexclone-1849\build-fresh\`。
+
+另做一次「搬家」验证：把 `regression.exe` 与 `hook.cfg` 复制到 `%TEMP%\nexmove-1773\` 单独运行，`module_dir` 随之变成该临时目录——证明路径是运行时推导的，不是编译期常量。
+
+**`build.sh` 的健壮性补丁**：`ZIG` 默认值仍是开发机路径，别人拿到仓库若没设 `ZIG`，原来只会看到 `zig.exe` 的 ENOENT。现在提前 `[[ -x "$CC" ]]` 判断，打印缺失路径与一行 `ZIG=/c/zig/zig-x86_64-windows-0.17.1 mod/build.sh all` 的示例，退出码 2。
+
+**提交**：`cf05b20` 初始提交（45 files, +10595）、`2c7ef03` build.sh 提示。仓库身份是**仓库级**的 `Pingyi <pingyi@local>`，没有动全局配置，不影响机器上其他项目。**未设远端**——这是注入网易云客户端的代码，公开有风险，等明确决定再说。
+
+**仍然存在的环境绑定（本次未动，明确列出）**：`mod/tools/nexhost.c:32-40` 有 7 处绝对路径（`kClientExe`/`kClientDir` 指向 `D:\Installed_Program\CloudMusic`，`kSinkDll`/`kHookCfg`/`kUiJson`/`kSinkLog`/`kHostLog`/`kPanelJs`/`kSimplifyJs` 指向 `D:\Coding\NeteaseExclusive\mod`），`mod/tools/launch.c:9-11` 与 `mod/tools/nexui.cmd:8` 同样写死了客户端安装位置。这些不影响构建（REL-01 的标准是「空构建目录可产出」），但影响**别人拿到就能跑**。宿主侧的文件路径可由 exe 所在目录推导，客户端路径需要探测或让用户配——这是一项独立工作，不在 REL-01 范围内，留作后续。
