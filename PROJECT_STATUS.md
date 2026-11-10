@@ -884,3 +884,25 @@ dist/RELEASE-NOTES.md
 4. **代码签名**（要证书，每年几千块；能压 SmartScreen，但压不住行为检测）
 
 本轮没有自作主张去改注入方式——那是架构级改动，得先确认用户要往哪个方向走。
+
+### 2026-11-10 11:15 — 排除项实测有效：本机开发与安装都不再被删
+
+**用户以管理员加了两条排除路径**（`D:\Coding\NeteaseExclusive` 与 `%LOCALAPPDATA%\NexExclusive`）。当前会话非管理员，`Get-MpPreference` 仍读不出列表（`Must be an administrator to view exclusions`），所以只能**用行为验证**——造全新 exe、跑完整注入、等它两分钟。
+
+**对照组（加排除之前）**：`build-path4` 的 exe 在 32 秒内被删了三次（10:47:46、10:48:26、10:48:31），每次都是「刚构建出来就被扫到」。
+
+**实验组（加排除之后）**：
+
+| 路径 | 动作 | 等待 | 结果 |
+|---|---|---|---|
+| `D:\Coding\NeteaseExclusive\build-path7`（全新目录、全新构建） | 启动客户端 → 注入 `nexsink.dll` → 注入界面脚本，全链路跑通 | 90 s | exe 存活（327680 字节，mtime 未变） |
+| `%LOCALAPPDATA%\NexExclusive`（`--install` 装出来的副本） | 同上 | 120 s | exe 存活；`Uninstall\NexExclusive`、`Run\NexExclusive`、开始菜单 `.lnk` **全部存活** |
+
+`Get-MpThreatDetection` 最新一条仍是 **10:48:31**，之后零新增。也就是说：**排除项确实生效了，而且是路径级的**——同一份源码，之前被判三次，现在连跑带注入都没事。
+
+**两个必须记住的限制**：
+
+1. **只保护这两个路径**。构建目录换到别处（`C:\temp`、`%TEMP%`）会重新中招。新建 `build-path8` 之类没问题，因为它们都在 `D:\Coding\NeteaseExclusive` 下面。
+2. **只保护这台机器**。别的用户装上，一分钟内 exe 还是会被隔离——所以「Release 出去别人能不能用」这个问题的答案目前是**不能**，除非他们自己也加排除项。
+
+**分发路径已经写清**：新增 `docs/defender-false-positive.md`，含 WDSI 提交入口、可整段粘贴的英文说明（程序做什么、为什么要注入、明确不做什么、为什么 `DefenseEvasion` 这个分类名不成立、复现步骤、请求的处置）、文件哈希，以及被打回后的三条退路（换代理 DLL 注入 / 代码签名 / 公开仓库与构建）。提交这一步需要用户本人操作，我不代劳。
