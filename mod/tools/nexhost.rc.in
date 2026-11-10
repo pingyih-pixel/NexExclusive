@@ -1,0 +1,45 @@
+/* 宿主 exe 的资源：版本信息 + 清单。
+ *
+ * 为什么要有：1.0.0 之前是个「裸 PE」——没有版本资源、没有清单、没有图标。
+ * 文件属性里一片空白，任务管理器只显示文件名。这既不好用，也是行为型
+ * 检测里一个负分项（同类的开源项目 AMExclusive 是带完整 VERSIONINFO 的）。
+ *
+ * 版本号由 build.sh 从 nexhost.c 的 APP_VERSION 填进来，避免两处不一致。
+ * 编译：zig rc nexhost.rc nexhost.res，然后把 .res 一起交给 zig cc。
+ */
+
+#include <winver.h>
+
+1 VERSIONINFO
+ FILEVERSION @V1@,@V2@,@V3@,0
+ PRODUCTVERSION @V1@,@V2@,@V3@,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    /* 0409 = en-US, 04B0 = Unicode。描述用英文，避免非中文系统上乱码。 */
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName",      "NeteaseExclusive"
+      VALUE "FileDescription",  "NexExclusive - WASAPI exclusive audio host"
+      VALUE "FileVersion",      "@V1@.@V2@.@V3@.0"
+      VALUE "InternalName",     "NexExclusive"
+      VALUE "OriginalFilename", "NexExclusive.exe"
+      VALUE "ProductName",      "NexExclusive"
+      VALUE "ProductVersion",   "@V1@.@V2@.@V3@.0"
+      VALUE "LegalCopyright",   "No warranty. Use at your own risk."
+      VALUE "Comments",         "Loads nexsink.dll into the music player process to enable WASAPI exclusive output."
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
+
+/* 清单：asInvoker + per-monitor DPI + 公共控件 v6。 */
+1 24 "nexhost.manifest"

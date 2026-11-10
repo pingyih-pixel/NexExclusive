@@ -64,10 +64,32 @@ build_host() {
     #   shell32/user32: 托盘图标与菜单
     #   version: 读客户端 exe 的版本资源，判断是否为已验证版本
     #   comdlg32: 找不到客户端时弹文件选择框
+
+    # 版本资源 + 清单。版本号从 nexhost.c 的 APP_VERSION 取，只在这里定义一次。
+    local ver v1 v2 v3 rc res
+    ver=$(sed -n 's/^#define APP_VERSION L"\([^"]*\)".*/\1/p' "$MOD_DIR/tools/nexhost.c" | head -1)
+    if [[ ! "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf '读不出 APP_VERSION（得到 [%s]）\n' "$ver" >&2
+        exit 2
+    fi
+    IFS=. read -r v1 v2 v3 <<< "$ver"
+    rc="$OUT_DIR/.nexhost.rc"
+    res="$OUT_DIR/.nexhost.res"
+    # manifest 必须和 .rc 同目录、且文件名与 .rc 里写的一致。
+    # 版本占位符在 manifest 里也有（assemblyIdentity 的 version），两边都要替换——
+    # 只换 .rc 会得到一个 version="@V1@.@V2@.@V3@.0" 的清单，Windows 直接拒绝加载，
+    # 报「应用程序的并行配置不正确」，事件日志里才看得到真实原因。
+    cp -- "$MOD_DIR/tools/nexhost.manifest" "$OUT_DIR/nexhost.manifest"
+    sed -i -e "s/@V1@/$v1/g" -e "s/@V2@/$v2/g" -e "s/@V3@/$v3/g" "$OUT_DIR/nexhost.manifest"
+    sed -e "s/@V1@/$v1/g" -e "s/@V2@/$v2/g" -e "s/@V3@/$v3/g" \
+        "$MOD_DIR/tools/nexhost.rc.in" > "$rc"
+    "$CC" rc "$rc" "$res"
+
     "$CC" cc "${FLAGS[@]}" -Wl,--subsystem,windows \
-        -o "$OUT_DIR/NexExclusive.exe" "$MOD_DIR/tools/nexhost.c" \
+        -o "$OUT_DIR/NexExclusive.exe" "$MOD_DIR/tools/nexhost.c" "$res" \
         -lws2_32 -lole32 -loleaut32 -ladvapi32 -lshell32 -luser32 -lgdi32 \
         -lversion -lcomdlg32
+    rm -f -- "$rc" "$res" "$OUT_DIR/nexhost.manifest"
     # 配置只在缺失时复制——用户可能改过；界面脚本是代码，每次都覆盖。
     local f
     for f in hook.cfg ui.json; do
