@@ -955,7 +955,7 @@ HANDLE thread = CreateRemoteThread(process, nullptr, 0, loadLibrary, remote, 0, 
 |---|---|---|
 | 版本资源 | `VersionInfo.rc.in`：CompanyName / FileDescription / FileVersion / InternalName / OriginalFilename 全齐 | **全空**，文件属性里一片空白 |
 | 清单 | `/MANIFESTDEPENDENCY` 声明公共控件 v6 | **没有** |
-| 图标 | 有 | 只有 `IDI_APPLICATION` 默认图标 |
+| 图标 | **没有**（仓库里只有 `assets/ame-logo.svg`，CMake 和 rc 都没引用 `.ico`；这一行最初写成「有」，查证后改正） | 只有 `IDI_APPLICATION` 默认图标 |
 | 代码签名 | 没找到签名步骤 | 无 |
 | 普及度 | Release 被大量下载，云保护有信誉分 | 从未见过的哈希 |
 
