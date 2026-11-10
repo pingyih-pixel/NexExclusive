@@ -1,11 +1,21 @@
 @echo off
-rem 一键启动：客户端带 DevTools 端口，本地配置服务，界面脚本监听注入。
-rem 客户端没开时先开；已开着但没带端口时需要先退出再运行本脚本。
+rem 旧的一键启动流程：客户端带 DevTools 端口 + 本地配置服务 + 界面脚本监听注入。
+rem 现在日常用 NexExclusive.exe 就够了，这个脚本只在调试界面脚本时用。
+rem
+rem 客户端路径不再写死：优先用环境变量 NEX_CLIENT，其次用 nexlaunch.exe 探测。
 setlocal
+chcp 65001 >nul
 set "TOOLS=%~dp0"
 set "UI=%TOOLS%..\ui"
 
-start "" "D:\Installed_Program\CloudMusic\cloudmusic.exe" --remote-debugging-port=9333
+if defined NEX_CLIENT goto :launch
+echo 没设置 NEX_CLIENT 环境变量。
+echo 请先：set NEX_CLIENT=D:\你的\cloudmusic.exe
+pause
+exit /b 2
+
+:launch
+start "" "%NEX_CLIENT%" --remote-debugging-port=9333
 echo 等待客户端启动...
 timeout /t 10 /nobreak >nul
 
