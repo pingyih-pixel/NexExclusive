@@ -63,11 +63,14 @@ build_host() {
 }
 
 build_tools() {
-    # 诊断与验证工具：端点枚举、默认端点切换、会话音量 vs 端点音量
-    "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/list_eps.exe" "$MOD_DIR/tools/list_eps.c" "${LIBS[@]}"
-    "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/set_ep.exe"   "$MOD_DIR/tools/set_ep.c"   "${LIBS[@]}" -lshell32
-    "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/sess_vol.exe" "$MOD_DIR/tools/sess_vol.c" "${LIBS[@]}" -lshell32
-    printf '已构建到 %s：list_eps.exe set_ep.exe sess_vol.exe\n' "$OUT_DIR"
+    # 诊断与验证工具：端点枚举、默认端点切换、会话音量 vs 端点音量、
+    # 独占格式矩阵（共享 vs 独占对照）、端点自己声明的格式白名单
+    "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/list_eps.exe"   "$MOD_DIR/tools/list_eps.c"   "${LIBS[@]}"
+    "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/set_ep.exe"     "$MOD_DIR/tools/set_ep.c"     "${LIBS[@]}" -lshell32
+    "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/sess_vol.exe"   "$MOD_DIR/tools/sess_vol.c"   "${LIBS[@]}" -lshell32
+    "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/probe_excl.exe" "$MOD_DIR/tools/probe_excl.c" "${LIBS[@]}"
+    "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/ep_formats.exe" "$MOD_DIR/tools/ep_formats.c" "${LIBS[@]}" -lpropsys
+    printf '已构建到 %s：list_eps.exe set_ep.exe sess_vol.exe probe_excl.exe ep_formats.exe\n' "$OUT_DIR"
 }
 
 build_test() {
