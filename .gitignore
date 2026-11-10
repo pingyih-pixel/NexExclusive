@@ -48,3 +48,7 @@ analysis/ui-shots/
 .idea/
 Thumbs.db
 desktop.ini
+
+# 本机 zig 路径（build.sh 会 source 它）。写的是开发机绝对路径，
+# 不进仓库——换机器时自己建一个。
+mod/zig.path

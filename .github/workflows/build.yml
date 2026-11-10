@@ -1,0 +1,70 @@
+name: build
+
+# 公开构建：任何人 push 都能看到产物，tag 推上来自动发 Release。
+# 用和本地完全相同的 release.sh —— CI 只是换了个地方跑同一条命令，
+# 不做任何 CI 专属的分支逻辑，避免「本地能出包、CI 出不来」。
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Zig
+        shell: pwsh
+        run: |
+          $ver = '0.17.1'
+          $url = "https://ziglang.org/download/$ver/zig-x86_64-windows-$ver.zip"
+          # 固定哈希：工具链被替换时宁可失败，也不要悄悄用别的编译器出包
+          $sha = 'b03f477a1943673e02aca0f570e8030dffd536ce1f45cbc4d3326ec31159562e'
+          Invoke-WebRequest -Uri $url -OutFile zig.zip
+          $got = (Get-FileHash zig.zip -Algorithm SHA256).Hash
+          if ($got -ne $sha.ToUpper()) { throw "zig 校验失败：$got" }
+          Expand-Archive zig.zip -DestinationPath "$env:RUNNER_TEMP\zig"
+          "$env:RUNNER_TEMP\zig\zig-x86_64-windows-$ver" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: 回归测试
+        shell: bash
+        run: bash mod/build.sh test
+
+      - name: 构建并打包
+        shell: bash
+        run: bash release.sh
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: NexExclusive-package
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+            dist/RELEASE-NOTES.md
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: NexExclusive-package
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: dist/RELEASE-NOTES.md
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt

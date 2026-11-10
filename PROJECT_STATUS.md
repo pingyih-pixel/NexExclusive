@@ -1,7 +1,7 @@
 # NeteaseExclusive 项目进度与后续任务
 
 > 更新日期：2026-11-10 10:59（北京时间）  
-> 工程目录：`D:/Coding/NeteaseExclusive`  
+> 工程目录：`<项目目录>`  
 > 当前阶段：一键化已落地，端点迁移已落地，`Sink` 按代持有已落地，`nexsink.c` 已按职责拆分。双击 `mod/启动.cmd` 即可完成「启动客户端 → 注入音频模块 → 起配置服务 → 注入界面脚本」，并常驻看护客户端重启、页面重载、模块掉出。音频侧独占接管、位深设置、切歌、拖动进度条、默认输出切换均已实测正常，**切歌与切端点都不再有 join 超时或共享回退**；设置页会按当前端点标明独占下音量是否还能调。音量侧只做端点诊断，**明确不做模块侧数字增益**（用户 2026-11-10 决定：不拿比特换音量）。  
 > 本文件是项目进度的主记录。每完成一个可验证任务，以及每轮工作结束时，都更新这里；未完成项保留实际状态。
 
@@ -26,7 +26,7 @@
 | 项目 | 本次核验结果 |
 |---|---|
 | 网易云客户端 | `3.1.42.205594`，来自可执行文件版本信息 |
-| 安装位置 | `D:/Installed_Program/CloudMusic` |
+| 安装位置 | `<客户端目录>` |
 | 当前音频端点 | 既有探测使用 MOONDROP MM3A；端点能力以本机驱动实测为准 |
 | 已测独占格式 | 44.1 / 48 / 88.2 / 96 kHz，16 / 24 位整数 |
 | 已测拒绝格式 | 176.4 / 192 kHz；32 位浮点输出 |
@@ -91,7 +91,7 @@
 
 ### 4.1 静态资源已经定位
 
-`D:/Installed_Program/CloudMusic/package/orpheus.ntpk` 是 100 字节前缀加 ZIP，含 1411 项资源。仅提取指定文件至工程副本，没有修改安装包。
+`<客户端目录>/package/orpheus.ntpk` 是 100 字节前缀加 ZIP，含 1411 项资源。仅提取指定文件至工程副本，没有修改安装包。
 
 工程副本位置：`analysis/ui-probe/pub/`。
 
@@ -180,7 +180,7 @@
 - 原函数按 vtable 记录已完成；但代码路径中的未登记 vtable 仍可能走 `g_ac_orig` 全局回退，内部 `dev_activate()` 返回的未 patch 客户端是否总与已登记 vtable 相同尚未证实。
 - ~~`g_control` 保护 proxy 的 Get/Release/clock 调用，但 `sink_engage()`、`sink_teardown()`、`H_Start()`、`H_Stop()` 并未统一在同一生命周期锁下串行化。~~ 01:41 已处理：上述入口全部持 `g_control`，释放与重新初始化改走 `sink_teardown_controlled()` / `sink_engage_controlled()`；桩测试覆盖入口等待、teardown 竞态与 300 次生命周期压测。剩余的是实机与多流并发场景，不是锁覆盖本身。
 
-本地 SDK 核验位置：`D:/Installed_Program/zig/zig-x86_64-windows-0.17.1/lib/libc/include/any-windows-any/audioclient.h:643–647,755–760`。
+本地 SDK 核验位置：`<zig>/lib/libc/include/any-windows-any/audioclient.h:643–647,755–760`。
 
 注意：10 MHz 作为自定义时钟频率本身并非错误；核心在于位置必须与频率一致、持续递增并对应播放进度。不能笼统地说位置只能用帧。
 
@@ -313,16 +313,16 @@ P0/P1 的音频正确性（AU-01…AU-08）已完成编码与桩测试，下一�
 ### 复用命令
 
 ```text
-OUT_DIR=D:/Coding/NeteaseExclusive/mod/build-check bash D:/Coding/NeteaseExclusive/mod/build.sh all
-OUT_DIR=D:/Coding/NeteaseExclusive/mod/build-check bash D:/Coding/NeteaseExclusive/mod/build.sh test
-D:/Coding/NeteaseExclusive/mod/test/regression.exe
-python D:/Coding/NeteaseExclusive/analysis/unpack_ntpk.py D:/Installed_Program/CloudMusic/package/orpheus.ntpk --list "setting|manifest|\.html$"
+OUT_DIR=<项目目录>/mod/build-check bash <项目目录>/mod/build.sh all
+OUT_DIR=<项目目录>/mod/build-check bash <项目目录>/mod/build.sh test
+<项目目录>/mod/test/regression.exe
+python <项目目录>/analysis/unpack_ntpk.py <客户端目录>/package/orpheus.ntpk --list "setting|manifest|\.html$"
 ```
 
 部署（需先确保客户端由用户正常启动且 PID 明确）：
 
 ```text
-OUT_DIR=D:/Coding/NeteaseExclusive/mod/build-check bash D:/Coding/NeteaseExclusive/mod/deploy.sh <cloudmusic PID>
+OUT_DIR=<项目目录>/mod/build-check bash <项目目录>/mod/deploy.sh <cloudmusic PID>
 ```
 
 02:55 复测：注入全链路 `err=0 ok`，此前记录的 `ERROR_ACCESS_DENIED (5)` 不再复现。
@@ -360,7 +360,7 @@ OUT_DIR=D:/Coding/NeteaseExclusive/mod/build-check bash D:/Coding/NeteaseExclusi
 
 ### 2026-11-10 01:16 — 重启/注入尝试与 C 性能审查
 
-- 按用户授权结束旧版客户端并启动 `D:/Installed_Program/CloudMusic/cloudmusic.exe`；通过 `WaitForInputIdle`，短暂观察到主进程和两个 CEF 子进程。
+- 按用户授权结束旧版客户端并启动 `<客户端目录>/cloudmusic.exe`；通过 `WaitForInputIdle`，短暂观察到主进程和两个 CEF 子进程。
 - 对 PID 102036 调用既有 `deploy.sh`/`inject2.exe`。`OpenProcess(0x43A)` 成功，目标完整性 `0x2000`；诊断分配与 DLL 路径分配的 `VirtualAllocEx` 均返回 `ERROR_ACCESS_DENIED (5)`。远程线程和 `LoadLibraryW` 未执行；新版没有被注入。
 - 后续工具调用中 PID 已消失；本轮未绕过拒绝，也未尝试提权或替代注入方式。
 - 复跑已有独立 `bench_speed.exe 192000 96000 10` 两次：10 秒音频/960,000 输出帧分别用时 0.194 s 和 0.206 s，约 52×/49× 实时、单核 1.9%/2.1%。仅代表离线重采样吞吐，不代表实际设备稳定性或完整客户端开销。
@@ -774,7 +774,7 @@ sink: new stream while gen 5 is still running
 
 **提交**：`cf05b20` 初始提交（45 files, +10595）、`2c7ef03` build.sh 提示。仓库身份是**仓库级**的 `Pingyi <pingyi@local>`，没有动全局配置，不影响机器上其他项目。**未设远端**——这是注入网易云客户端的代码，公开有风险，等明确决定再说。
 
-**仍然存在的环境绑定（本次未动，明确列出）**：`mod/tools/nexhost.c:32-40` 有 7 处绝对路径（`kClientExe`/`kClientDir` 指向 `D:\Installed_Program\CloudMusic`，`kSinkDll`/`kHookCfg`/`kUiJson`/`kSinkLog`/`kHostLog`/`kPanelJs`/`kSimplifyJs` 指向 `D:\Coding\NeteaseExclusive\mod`），`mod/tools/launch.c:9-11` 与 `mod/tools/nexui.cmd:8` 同样写死了客户端安装位置。这些不影响构建（REL-01 的标准是「空构建目录可产出」），但影响**别人拿到就能跑**。宿主侧的文件路径可由 exe 所在目录推导，客户端路径需要探测或让用户配——这是一项独立工作，不在 REL-01 范围内，留作后续。
+**仍然存在的环境绑定（本次未动，明确列出）**：`mod/tools/nexhost.c:32-40` 有 7 处绝对路径（`kClientExe`/`kClientDir` 指向 `<客户端目录>`，`kSinkDll`/`kHookCfg`/`kUiJson`/`kSinkLog`/`kHostLog`/`kPanelJs`/`kSimplifyJs` 指向 `<项目目录>\mod`），`mod/tools/launch.c:9-11` 与 `mod/tools/nexui.cmd:8` 同样写死了客户端安装位置。这些不影响构建（REL-01 的标准是「空构建目录可产出」），但影响**别人拿到就能跑**。宿主侧的文件路径可由 exe 所在目录推导，客户端路径需要探测或让用户配——这是一项独立工作，不在 REL-01 范围内，留作后续。
 
 ### 2026-11-10 10:25 — 「音箱支持 96，88.2 为什么也被挡」：查清了，是耳机不是音箱
 
@@ -851,7 +851,7 @@ dist/RELEASE-NOTES.md
 
 **客户端探测补了两级**（原来 5 级 → 现在 7 级）：
 
-- **桌面 / 开始菜单快捷方式**：解析 `.lnk` 的目标路径。绿色版、装在自定义目录的客户端不写注册表，但安装时几乎一定留快捷方式。只认目标文件名是 `cloudmusic.exe` 的，避免误认。扫 `%APPDATA%\...\Start Menu\Programs`（含一层子目录）、用户桌面、公共桌面。实测：本机客户端在 `D:\Installed_Program\CloudMusic`（注册表里没有），靠这一级探到了，日志 `来源：桌面/开始菜单快捷方式`
+- **桌面 / 开始菜单快捷方式**：解析 `.lnk` 的目标路径。绿色版、装在自定义目录的客户端不写注册表，但安装时几乎一定留快捷方式。只认目标文件名是 `cloudmusic.exe` 的，避免误认。扫 `%APPDATA%\...\Start Menu\Programs`（含一层子目录）、用户桌面、公共桌面。实测：本机客户端在 `<客户端目录>`（注册表里没有），靠这一级探到了，日志 `来源：桌面/开始菜单快捷方式`
 - **文件选择框**：全都找不到时弹 `GetOpenFileNameW` 让用户点一下 `cloudmusic.exe`，选完写回 `host.cfg`。原来只说「请用记事本打开 AppData 里那个文件加一行」——这是把开发者的耐心当成用户的耐心
 
 **装完发现的一个真问题**：从 zip 里 `--install` 之后，`host.cfg` 的 `client=` 是空的（安装时客户端没在跑、注册表也没有），运行时同样探不到，直接退出。也就是说「装完就能用」对非常规安装位置的用户是假的。上面两级探测 + 选择框就是补这个洞。现在 `--install --client <路径>` 也能显式指定，装完 `host.cfg` 里就有值。
@@ -887,7 +887,7 @@ dist/RELEASE-NOTES.md
 
 ### 2026-11-10 11:15 — 排除项实测有效：本机开发与安装都不再被删
 
-**用户以管理员加了两条排除路径**（`D:\Coding\NeteaseExclusive` 与 `%LOCALAPPDATA%\NexExclusive`）。当前会话非管理员，`Get-MpPreference` 仍读不出列表（`Must be an administrator to view exclusions`），所以只能**用行为验证**——造全新 exe、跑完整注入、等它两分钟。
+**用户以管理员加了两条排除路径**（`<项目目录>` 与 `%LOCALAPPDATA%\NexExclusive`）。当前会话非管理员，`Get-MpPreference` 仍读不出列表（`Must be an administrator to view exclusions`），所以只能**用行为验证**——造全新 exe、跑完整注入、等它两分钟。
 
 **对照组（加排除之前）**：`build-path4` 的 exe 在 32 秒内被删了三次（10:47:46、10:48:26、10:48:31），每次都是「刚构建出来就被扫到」。
 
@@ -895,14 +895,14 @@ dist/RELEASE-NOTES.md
 
 | 路径 | 动作 | 等待 | 结果 |
 |---|---|---|---|
-| `D:\Coding\NeteaseExclusive\build-path7`（全新目录、全新构建） | 启动客户端 → 注入 `nexsink.dll` → 注入界面脚本，全链路跑通 | 90 s | exe 存活（327680 字节，mtime 未变） |
+| `<项目目录>\build-path7`（全新目录、全新构建） | 启动客户端 → 注入 `nexsink.dll` → 注入界面脚本，全链路跑通 | 90 s | exe 存活（327680 字节，mtime 未变） |
 | `%LOCALAPPDATA%\NexExclusive`（`--install` 装出来的副本） | 同上 | 120 s | exe 存活；`Uninstall\NexExclusive`、`Run\NexExclusive`、开始菜单 `.lnk` **全部存活** |
 
 `Get-MpThreatDetection` 最新一条仍是 **10:48:31**，之后零新增。也就是说：**排除项确实生效了，而且是路径级的**——同一份源码，之前被判三次，现在连跑带注入都没事。
 
 **两个必须记住的限制**：
 
-1. **只保护这两个路径**。构建目录换到别处（`C:\temp`、`%TEMP%`）会重新中招。新建 `build-path8` 之类没问题，因为它们都在 `D:\Coding\NeteaseExclusive` 下面。
+1. **只保护这两个路径**。构建目录换到别处（`C:\temp`、`%TEMP%`）会重新中招。新建 `build-path8` 之类没问题，因为它们都在 `<项目目录>` 下面。
 2. **只保护这台机器**。别的用户装上，一分钟内 exe 还是会被隔离——所以「Release 出去别人能不能用」这个问题的答案目前是**不能**，除非他们自己也加排除项。
 
 **分发路径已经写清**：新增 `docs/defender-false-positive.md`，含 WDSI 提交入口、可整段粘贴的英文说明（程序做什么、为什么要注入、明确不做什么、为什么 `DefenseEvasion` 这个分类名不成立、复现步骤、请求的处置）、文件哈希，以及被打回后的三条退路（换代理 DLL 注入 / 代码签名 / 公开仓库与构建）。提交这一步需要用户本人操作，我不代劳。
