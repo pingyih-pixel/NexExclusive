@@ -1,17 +1,43 @@
 #!/usr/bin/env bash
-# 使用现有 Zig 工具链构建；OUT_DIR 必须是绝对目录，默认本脚本所在的 mod。
-# Zig 的位置默认取下面的开发机路径，换机器时用 ZIG=/path/to/zig 覆盖。
+# 用 Zig 构建；OUT_DIR 必须是绝对目录，默认本脚本所在的 mod。
+#
+# Zig 的位置按这个顺序找：
+#   1. 环境变量 ZIG（指向 zig 安装目录，或直接指向 zig 可执行文件）
+#   2. PATH 里的 zig
+#   3. mod/zig.path —— 本机路径写在这里（已 gitignore，不会进仓库）
+# 这样仓库里不出现任何开发机的绝对路径，本机也不用每次都传 ZIG=。
 set -euo pipefail
 MOD_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-ZIG=${ZIG:-/d/Installed_Program/zig/zig-x86_64-windows-0.17.1}
-export ZIG_LIB_DIR="$ZIG/lib"
-CC="$ZIG/zig.exe"
 
-# 工具链缺失时给出一句能照着做的提示，而不是让 zig.exe 的 ENOENT 冒上来。
+# 本机覆盖文件：内容形如 ZIG=/d/path/to/zig-x86_64-windows-0.17.1
+if [[ -f "$MOD_DIR/zig.path" ]]; then
+    # shellcheck disable=SC1091
+    . "$MOD_DIR/zig.path"
+fi
+
+ZIG=${ZIG:-}
+if [[ -z "$ZIG" ]] && command -v zig >/dev/null 2>&1; then
+    ZIG=$(command -v zig)
+fi
+if [[ -z "$ZIG" ]]; then
+    printf '找不到 zig。三选一：\n' >&2
+    printf '  · 把 zig 放进 PATH\n' >&2
+    printf '  · 传环境变量：ZIG=/c/zig/zig-x86_64-windows-0.17.1 %s all\n' "$0" >&2
+    printf '  · 写进 %s（内容：ZIG=/c/zig/zig-x86_64-windows-0.17.1）\n' "$MOD_DIR/zig.path" >&2
+    exit 2
+fi
+
+# ZIG 可能指目录（内含 zig.exe + lib/），也可能直接指可执行文件
+if [[ -d "$ZIG" ]]; then
+    CC="$ZIG/zig.exe"
+    export ZIG_LIB_DIR="$ZIG/lib"
+else
+    CC="$ZIG"
+fi
+
 if [[ ! -x "$CC" ]]; then
-    printf '找不到 zig 工具链：%s\n' "$CC" >&2
-    printf '请设置 ZIG 指向 zig 安装目录（内含 zig.exe 与 lib/），例如：\n' >&2
-    printf '  ZIG=/c/zig/zig-x86_64-windows-0.17.1 %s all\n' "$0" >&2
+    printf 'zig 不可执行：%s\n' "$CC" >&2
+    printf '请确认 ZIG 指向 zig 安装目录（内含 zig.exe 与 lib/）或 zig 可执行文件本身。\n' >&2
     exit 2
 fi
 
