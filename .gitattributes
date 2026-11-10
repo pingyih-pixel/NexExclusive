@@ -1,0 +1,20 @@
+# 行尾策略。
+#
+# 本机 core.autocrlf=true（Windows 默认），若不加约束，checkout 时会把
+# build.sh / deploy.sh 转成 CRLF。shebang 变成 "#!/usr/bin/env bash\r"，
+# bash 找不到解释器，构建入口直接失效。所以源码与脚本一律锁 LF。
+#
+# 例外是 Windows 批处理：cmd.exe 在纯 LF 下解析 goto/label 会出问题，
+# 这两个扩展名保持 CRLF。
+
+* text=auto eol=lf
+
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制：不参与行尾转换，也不做文本 diff。
+*.exe   binary
+*.dll   binary
+*.lib   binary
+*.pdb   binary
+*.png   binary
