@@ -96,7 +96,7 @@ Windows SDK（资源编译用 `zig rc`）。
 
 ```bash
 bash mod/build.sh all        # 产物落在 mod/
-bash mod/build.sh test       # 18 组回归测试
+bash mod/build.sh test       # 19 组回归测试
 bash release.sh              # 打包：dist/NexExclusive-x.y.z.zip + 校验和 + Release 说明
 ```
 

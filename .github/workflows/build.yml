@@ -27,10 +27,13 @@ jobs:
           $url = "https://ziglang.org/download/$ver/zig-x86_64-windows-$ver.zip"
           # 固定哈希：工具链被替换时宁可失败，也不要悄悄用别的编译器出包
           $sha = 'b03f477a1943673e02aca0f570e8030dffd536ce1f45cbc4d3326ec31159562e'
-          Invoke-WebRequest -Uri $url -OutFile zig.zip
+          # 用系统自带的 curl.exe / tar.exe（bsdtar）：比 Invoke-WebRequest +
+          # Expand-Archive 快一个量级（后者解 100 MB 小文件包能磨几分钟）
+          curl.exe -fsSL $url -o zig.zip
           $got = (Get-FileHash zig.zip -Algorithm SHA256).Hash
           if ($got -ne $sha.ToUpper()) { throw "zig 校验失败：$got" }
-          Expand-Archive zig.zip -DestinationPath "$env:RUNNER_TEMP\zig"
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\zig" | Out-Null
+          tar.exe -xf zig.zip -C "$env:RUNNER_TEMP\zig"
           "$env:RUNNER_TEMP\zig\zig-x86_64-windows-$ver" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
 
       - name: 回归测试
