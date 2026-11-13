@@ -2,7 +2,7 @@
 // one native-style entry point and a modal for optional visibility rules.
 (function () {
   'use strict';
-  var SCRIPT_VERSION = 'header-modal-v13';
+  var SCRIPT_VERSION = 'header-modal-v14';
   if (window.__nexSimpleLoaded === SCRIPT_VERSION) return;
   window.__nexSimpleLoaded = SCRIPT_VERSION;
 
@@ -10,6 +10,7 @@
   var PANEL_ID = 'nex-simple-panel';
   var TOOLBAR_ID = 'nex-simple-toolbar';
   var HEADER_ENTRY_ID = 'nex-simple-header-entry';
+  var NEX_BUTTON_ID = 'nex-simple-nex-button';
   var EDIT_BUTTON_ID = 'nex-simple-edit-toggle';
   var MODAL_ID = 'nex-simple-modal';
   var STORE = 'nexsink.ui.mirror';
@@ -113,9 +114,9 @@
       '#nex-simple-panel .nex-open{height:28px;padding:0 12px;border:1px solid rgba(40,50,72,.1);border-radius:14px;background:transparent;color:rgba(40,50,72,.9);font:inherit;font-size:14px;line-height:18px;cursor:pointer;}',
       '#nex-simple-panel .nex-open:hover{border-color:rgba(255,58,58,.55);background:rgba(255,255,255,.65);color:#d73535;}',
       '#' + TOOLBAR_ID + '{display:none;}',
-      '#' + HEADER_ENTRY_ID + '{display:inline-flex;align-items:center;flex:0 0 auto;width:auto;height:36px;margin-right:8px;}',
-      '#' + EDIT_BUTTON_ID + '{display:inline-flex;align-items:center;justify-content:center;gap:5px;width:auto;height:28px;padding:0 12px;border:1px solid rgba(40,50,72,.1);border-radius:14px;background:rgba(40,50,72,.03);color:rgba(40,50,72,.9);font:inherit;font-size:14px;line-height:18px;white-space:nowrap;cursor:pointer;}',
-      '#' + EDIT_BUTTON_ID + ':hover,#' + EDIT_BUTTON_ID + ':focus-visible{border-color:rgba(255,58,58,.55);background:rgba(255,255,255,.65);color:#d73535;outline:0;}',
+      '#' + HEADER_ENTRY_ID + '{display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;width:auto;height:36px;margin-right:8px;}',
+      '#' + NEX_BUTTON_ID + ',#' + EDIT_BUTTON_ID + '{display:inline-flex;align-items:center;justify-content:center;gap:5px;width:auto;height:28px;padding:0 12px;border:1px solid rgba(40,50,72,.1);border-radius:14px;background:rgba(40,50,72,.03);color:rgba(40,50,72,.9);font:inherit;font-size:14px;line-height:18px;white-space:nowrap;cursor:pointer;}',
+      '#' + NEX_BUTTON_ID + ':hover,#' + NEX_BUTTON_ID + ':focus-visible,#' + EDIT_BUTTON_ID + ':hover,#' + EDIT_BUTTON_ID + ':focus-visible{border-color:rgba(255,58,58,.55);background:rgba(255,255,255,.65);color:#d73535;outline:0;}',
       '#' + EDIT_BUTTON_ID + '::before{content:"✎";font-size:14px;line-height:1;}',
       '#' + MODAL_ID + '{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;background:rgba(40,50,72,.18);}',
       '#' + MODAL_ID + ' .nex-dialog{width:min(560px,calc(100vw - 36px));max-height:min(680px,calc(100vh - 48px));display:flex;flex-direction:column;background:rgb(247,249,252);border:1px solid rgba(40,50,72,.08);border-radius:6px;box-shadow:0 12px 32px rgba(40,50,72,.16);overflow:hidden;color:rgba(40,50,72,.9);}',
@@ -324,6 +325,29 @@
     renderModal();
   }
 
+  function openNexSettings() {
+    if (typeof window.__nexOpenNexSettings === 'function' && window.__nexOpenNexSettings()) return;
+    var launcher = document.getElementById('nex-settings-launcher');
+    if (launcher) {
+      launcher.click();
+      return;
+    }
+    var setting = testId('tid_header_setting_btn');
+    if (!setting) return;
+    setting.click();
+    var attempts = 0;
+    var retry = setInterval(function () {
+      attempts += 1;
+      var next = document.getElementById('nex-settings-launcher');
+      if (next) {
+        clearInterval(retry);
+        next.click();
+      } else if (attempts >= 12) {
+        clearInterval(retry);
+      }
+    }, 250);
+  }
+
   function mountEditorButton() {
     var anchor = testId('tid_useravatar_click') || testId('tid_pc_nav_bar_account');
     if (!anchor) return false;
@@ -333,6 +357,14 @@
     styleOnce();
     var entry = document.createElement('div');
     entry.id = HEADER_ENTRY_ID;
+    var nexButton = document.createElement('button');
+    nexButton.id = NEX_BUTTON_ID;
+    nexButton.type = 'button';
+    nexButton.textContent = 'NexExclusive';
+    nexButton.setAttribute('aria-label', '打开 NexExclusive 设置');
+    nexButton.title = 'NexExclusive';
+    nexButton.addEventListener('click', function (event) { event.preventDefault(); event.stopPropagation(); openNexSettings(); });
+    entry.appendChild(nexButton);
     var button = document.createElement('button');
     button.id = EDIT_BUTTON_ID;
     button.type = 'button';

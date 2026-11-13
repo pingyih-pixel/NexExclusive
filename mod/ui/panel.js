@@ -4,7 +4,7 @@
 (function () {
   'use strict';
 
-  var PANEL_VERSION = 'settings-v21';
+  var PANEL_VERSION = 'settings-v23';
   if (window.__nexPanelLoaded === PANEL_VERSION) return;
   window.__nexPanelLoaded = PANEL_VERSION;
 
@@ -108,7 +108,7 @@
     if (document.getElementById('nex-quality-override-style')) return;
     var style = document.createElement('style');
     style.id = 'nex-quality-override-style';
-    style.textContent = '#nex-quality-card{border-color:rgba(40,50,72,.08)!important;background:rgba(247,249,252,.72)!important;color:rgba(40,50,72,.9)!important;}#nex-quality-card:hover,#nex-quality-card:focus-visible,#nex-quality-card[data-open="true"]{border-color:rgba(255,58,58,.45)!important;background:rgba(255,255,255,.72)!important;}';
+    style.textContent = '#nex-quality-card{width:172px!important;min-width:156px!important;max-width:196px!important;height:28px!important;padding:0 11px!important;border-radius:14px!important;border-color:rgba(40,50,72,.08)!important;background:rgba(247,249,252,.72)!important;color:rgba(40,50,72,.9)!important;}#nex-quality-card .nex-quality-title{font-size:13px!important;}#nex-quality-card:hover,#nex-quality-card:focus-visible,#nex-quality-card[data-open="true"]{border-color:rgba(255,58,58,.45)!important;background:rgba(255,255,255,.72)!important;}#nex-settings-module .nex-item{grid-template-columns:minmax(0,1fr) 210px!important;}#nex-settings-module .nex-control{width:210px!important;}#nex-settings-module .nex-select{width:190px!important;font-size:13px!important;}';
     document.head.appendChild(style);
   }
 
@@ -128,18 +128,18 @@
       '.nex-panel .nex-recovery:hover{border-color:#ff3a3a;background:#fff0f0;}',
       '.nex-panel .nex-section{margin:16px 0 0;}',
       '.nex-panel .nex-section-title{margin:0 0 2px;font-size:14px;font-weight:700;line-height:22px;color:rgba(40,50,72,.9);}',
-      '.nex-panel .nex-item{display:grid;grid-template-columns:minmax(0,1fr) 180px;align-items:center;gap:18px;min-height:52px;padding:8px 0;border-bottom:1px solid rgba(40,50,72,.06);}',
+      '.nex-panel .nex-item{display:grid;grid-template-columns:minmax(0,1fr) 210px;align-items:center;gap:18px;min-height:52px;padding:8px 0;border-bottom:1px solid rgba(40,50,72,.06);}',
       '.nex-panel .nex-item:last-child{border-bottom:0;}',
       '.nex-panel .nex-item[aria-disabled="true"]{opacity:.48;}',
       '.nex-panel .nex-copy{min-width:0;flex:1;}',
       '.nex-panel .nex-label{font-size:14px;line-height:20px;color:rgba(40,50,72,.9);}',
       '.nex-panel .nex-description{font-size:12px;line-height:18px;color:rgba(40,50,72,.48);margin-top:2px;white-space:normal;}',
-      '.nex-panel .nex-control{display:flex;align-items:center;justify-content:flex-end;width:180px;min-width:0;}',
+      '.nex-panel .nex-control{display:flex;align-items:center;justify-content:flex-end;width:210px;min-width:0;}',
       '.nex-panel .nex-switch{position:relative;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;padding:0;border:1px solid rgba(40,50,72,.24);border-radius:4px;background:rgba(40,50,72,.02);color:transparent;font:inherit;cursor:pointer;}',
       '.nex-panel .nex-switch[aria-checked="true"]{border-color:var(--colorPrimary1,#ff3a4a);background:var(--colorPrimary1,#ff3a4a);color:#fff;}',
       '.nex-panel .nex-switch:disabled{cursor:default;}',
       '.nex-panel .nex-switch::after{content:"✓";font-size:13px;line-height:18px;}',
-      '.nex-panel .nex-select{box-sizing:border-box;width:154px;height:30px;border:1px solid rgba(40,50,72,.06);border-radius:24px;background:rgba(40,50,72,.03);color:rgba(40,50,72,.9);font:inherit;font-size:14px;line-height:28px;padding:0 28px 0 12px;outline:0;cursor:pointer;}',
+      '.nex-panel .nex-select{box-sizing:border-box;width:190px;height:30px;border:1px solid rgba(40,50,72,.06);border-radius:24px;background:rgba(40,50,72,.03);color:rgba(40,50,72,.9);font:inherit;font-size:13px;line-height:28px;padding:0 28px 0 12px;outline:0;cursor:pointer;white-space:nowrap;text-overflow:ellipsis;overflow:hidden;}',
       '.nex-panel .nex-select:hover,.nex-panel .nex-select:focus{border-color:var(--colorPrimary1,#ff3a4a);box-shadow:0 0 0 2px rgba(255,58,58,.08);background:#fff;}',
       '.nex-panel .nex-select:disabled{cursor:default;}',
       '.nex-settings-title-host{position:relative;}',
@@ -148,7 +148,7 @@
       '#nex-settings-launcher[data-open="true"]{display:none;}',
       '#nex-settings-module{box-sizing:border-box;display:none;position:fixed;top:106px;right:0;bottom:78px;z-index:1200;width:min(560px,42vw);min-width:420px;overflow:auto;padding:22px 26px 30px;background:rgba(247,249,252,.98);border-left:1px solid rgba(40,50,72,.1);box-shadow:-8px 0 24px rgba(40,50,72,.08);}',
       '#nex-settings-module[data-open="true"]{display:block;}',
-      '#nex-settings-module .nex-module-head{display:flex;align-items:center;justify-content:space-between;margin:0 0 18px;padding-bottom:14px;border-bottom:1px solid rgba(40,50,72,.08);}',
+      '#nex-settings-module .nex-module-head{display:flex;align-items:center;justify-content:space-between;margin:0 0 18px;padding-bottom:14px;border-bottom:1px solid rgba(40,50,72,.08);cursor:move;user-select:none;}',
       '#nex-settings-module .nex-module-title{margin:0;font-size:16px;line-height:22px;font-weight:700;color:rgba(40,50,72,.92);}',
       '#nex-settings-module .nex-module-content{min-width:0;}',
       '#nex-settings-module .nex-module-close{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:0;border:0;border-radius:50%;background:transparent;color:#8a8f99;font:inherit;font-size:22px;line-height:1;cursor:pointer;}',
@@ -156,15 +156,15 @@
       '.nex-panel .nex-section{display:grid;grid-template-columns:84px minmax(0,1fr);column-gap:30px;margin:22px 0 0;}',
       '.nex-panel .nex-section-title{grid-column:1;grid-row:1;margin:0;font-size:14px;line-height:18px;font-weight:700;color:rgba(40,50,72,.9);}',
       '.nex-panel .nex-section .nex-item{grid-column:2;}',
-      '.nex-quality-card{position:relative;display:inline-flex;flex:0 0 auto;flex-direction:row;align-items:center;gap:6px;vertical-align:middle;box-sizing:border-box;min-width:184px;max-width:260px;height:28px;margin:0 8px 0 0;padding:0 10px;border:1px solid rgba(40,50,72,.08);border-radius:4px;background:rgba(247,249,252,.72);color:rgba(40,50,72,.9);font:inherit;font-size:12px;line-height:26px;cursor:pointer;white-space:nowrap;}',
+      '.nex-quality-card{position:relative;display:inline-flex;flex:0 0 172px;flex-direction:row;align-items:center;gap:5px;vertical-align:middle;box-sizing:border-box;width:172px;min-width:156px;max-width:196px;height:28px;margin:0 8px 0 0;padding:0 11px;border:1px solid rgba(40,50,72,.08);border-radius:14px;background:rgba(247,249,252,.72);color:rgba(40,50,72,.9);font:inherit;font-size:12px;line-height:26px;cursor:pointer;white-space:nowrap;}',
       '.nex-quality-card:hover,.nex-quality-card:focus-visible,.nex-quality-card[data-open="true"]{border-color:rgba(255,58,58,.45);background:rgba(255,255,255,.72);outline:0;}',
       '#nex-quality-card{border-color:rgba(40,50,72,.08);background:rgba(247,249,252,.72);color:rgba(40,50,72,.9);}',
       '#nex-quality-card:hover,#nex-quality-card:focus-visible,#nex-quality-card[data-open="true"]{border-color:rgba(255,58,58,.45);background:rgba(255,255,255,.72);}',
-      '.nex-quality-title{font-size:12px;line-height:26px;color:rgba(40,50,72,.88);}',
+      '.nex-quality-title{flex:0 0 auto;font-size:13px;line-height:26px;color:rgba(40,50,72,.9);}',
       '.nex-quality-summary{min-width:0;overflow:hidden;text-overflow:ellipsis;font-size:11px;line-height:26px;color:rgba(40,50,72,.58);}',
       '.nex-quality-tooltip{position:absolute;right:0;bottom:calc(100% + 8px);z-index:1000;display:none;width:276px;padding:10px 12px;border:1px solid rgba(40,50,72,.12);border-radius:5px;background:#fff;color:rgba(40,50,72,.82);box-shadow:0 8px 24px rgba(40,50,72,.16);font-size:12px;line-height:18px;text-align:left;white-space:pre-line;pointer-events:none;}',
       '.nex-quality-card:hover .nex-quality-tooltip,.nex-quality-card:focus-visible .nex-quality-tooltip,.nex-quality-card[data-open="true"] .nex-quality-tooltip{display:block;}',
-      '@media (max-width:760px){#nex-settings-module{top:74px;bottom:72px;width:min(560px,calc(100vw - 18px));min-width:0;padding:18px 18px 24px;}.nex-panel .nex-section{grid-template-columns:72px minmax(0,1fr);column-gap:18px;}.nex-panel .nex-item{grid-template-columns:minmax(0,1fr) 122px;align-items:start;gap:10px;}.nex-panel .nex-control{width:122px;}.nex-panel .nex-select{width:116px;}.nex-quality-card{min-width:0;max-width:240px;}.nex-quality-tooltip{right:0;}}'
+      '@media (max-width:760px){#nex-settings-module{top:74px;bottom:72px;width:min(560px,calc(100vw - 18px));min-width:0;padding:18px 18px 24px;}.nex-panel .nex-section{grid-template-columns:72px minmax(0,1fr);column-gap:18px;}.nex-panel .nex-item{grid-template-columns:minmax(0,1fr) 142px;align-items:start;gap:10px;}.nex-panel .nex-control{width:142px;}.nex-panel .nex-select{width:136px;}.nex-quality-card{min-width:0;max-width:196px;}.nex-quality-tooltip{right:0;}}'
     ].join('');
     var style = document.createElement('style');
     style.id = 'nex-panel-style';
@@ -226,7 +226,15 @@
       item.textContent = option[1];
       select.appendChild(item);
     });
-    select.addEventListener('change', function () { writeValue(field, select.value); });
+    function updateTitle() {
+      var option = select.options[select.selectedIndex];
+      select.title = option ? option.textContent : field.label;
+    }
+    select.addEventListener('change', function () {
+      updateTitle();
+      writeValue(field, select.value);
+    });
+    updateTitle();
     return { root: select, input: select, kind: 'select' };
   }
 
@@ -335,6 +343,8 @@
         input.setAttribute('aria-checked', readValue(field) ? 'true' : 'false');
       } else {
         input.value = String(readValue(field));
+        var selected = input.options && input.options[input.selectedIndex];
+        input.title = selected ? selected.textContent : field.label;
       }
     });
     var badge = target.querySelector('#nex-badge');
@@ -393,6 +403,99 @@
     }
   }
 
+  function makeModuleDraggable(module) {
+    if (!module || module.getAttribute('data-drag-ready') === 'true') return;
+    var head = module.querySelector('.nex-module-head');
+    if (!head) return;
+    module.setAttribute('data-drag-ready', 'true');
+    head.addEventListener('mousedown', function (event) {
+      if (event.button !== 0 || (event.target.closest && event.target.closest('.nex-module-close'))) return;
+      var rect = module.getBoundingClientRect();
+      var startX = event.clientX;
+      var startY = event.clientY;
+      var startLeft = rect.left;
+      var startTop = rect.top;
+      module.style.left = startLeft + 'px';
+      module.style.top = startTop + 'px';
+      module.style.right = 'auto';
+      module.style.bottom = 'auto';
+      function move(moveEvent) {
+        var width = module.offsetWidth;
+        var height = module.offsetHeight;
+        var left = Math.max(8, Math.min(window.innerWidth - width - 8, startLeft + moveEvent.clientX - startX));
+        var top = Math.max(8, Math.min(window.innerHeight - height - 8, startTop + moveEvent.clientY - startY));
+        module.style.left = left + 'px';
+        module.style.top = top + 'px';
+      }
+      function stop() {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', stop);
+      }
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', stop);
+      event.preventDefault();
+    });
+  }
+
+  function createSettingsModule(parent) {
+    var module = document.getElementById('nex-settings-module');
+    if (!module) {
+      module = document.createElement('section');
+      module.id = 'nex-settings-module';
+      module.setAttribute('data-nex-section', 'nexexclusive');
+      if (parent) parent.appendChild(module);
+    }
+    var head = module.querySelector('.nex-module-head');
+    if (!head) {
+      var legacyTitle = null;
+      Array.prototype.slice.call(module.children).forEach(function (child) {
+        if (child.classList && child.classList.contains('nex-module-title')) legacyTitle = child;
+      });
+      if (legacyTitle) legacyTitle.remove();
+      head = document.createElement('div');
+      head.className = 'nex-module-head';
+      var title = document.createElement('h4');
+      title.className = 'nex-module-title';
+      title.textContent = 'NexExclusive';
+      head.appendChild(title);
+      var close = document.createElement('button');
+      close.className = 'nex-module-close';
+      close.type = 'button';
+      close.textContent = '×';
+      close.setAttribute('aria-label', '关闭 NexExclusive 设置');
+      close.addEventListener('click', function () { setSettingsOpen(false); });
+      head.appendChild(close);
+      module.insertBefore(head, module.firstChild);
+    }
+    var content = module.querySelector('.nex-module-content');
+    if (!content) {
+      content = document.createElement('div');
+      content.className = 'nex-module-content';
+      Array.prototype.slice.call(module.children).forEach(function (child) {
+        if (child !== head) content.appendChild(child);
+      });
+      module.appendChild(content);
+    }
+    makeModuleDraggable(module);
+    return module;
+  }
+
+  function openNexSettings() {
+    var root = settingsRoot();
+    var module = createSettingsModule(root || document.body);
+    var panel = document.getElementById(SETTINGS_PANEL_ID);
+    if (!panel) {
+      panel = build(SETTINGS_PANEL_ID);
+      panel.setAttribute('data-nex-page', root ? 'settings' : 'header');
+      var content = module.querySelector('.nex-module-content') || module;
+      content.appendChild(panel);
+    }
+    setSettingsOpen(true);
+    applyVisualState(panel);
+    refreshStatus();
+    return true;
+  }
+
   function mountSettingsLauncher(root) {
     var title = root && document.querySelector('h1');
     if (!title || !visible(title) || !title.parentElement) return false;
@@ -434,6 +537,7 @@
     var module = document.getElementById('nex-settings-module');
     var existing = document.getElementById(SETTINGS_PANEL_ID);
     if (module && module.isConnected && existing && existing.isConnected) {
+      createSettingsModule(root);
       applyVisualState(existing);
       return true;
     }
@@ -441,31 +545,7 @@
     if (playbackPanel) playbackPanel.remove();
     var panel = build(SETTINGS_PANEL_ID);
     panel.setAttribute('data-nex-page', 'settings');
-    if (!module || !module.isConnected) {
-      module = document.createElement('section');
-      module.id = 'nex-settings-module';
-      module.setAttribute('data-nex-section', 'nexexclusive');
-      var moduleHead = document.createElement('div');
-      moduleHead.className = 'nex-module-head';
-      var moduleTitle = document.createElement('h4');
-      moduleTitle.className = 'nex-module-title';
-      moduleTitle.textContent = 'NexExclusive';
-      moduleHead.appendChild(moduleTitle);
-      var moduleClose = document.createElement('button');
-      moduleClose.className = 'nex-module-close';
-      moduleClose.type = 'button';
-      moduleClose.textContent = '×';
-      moduleClose.setAttribute('aria-label', '关闭 NexExclusive 设置');
-      moduleClose.addEventListener('click', function () {
-        setSettingsOpen(false);
-      });
-      moduleHead.appendChild(moduleClose);
-      module.appendChild(moduleHead);
-      var moduleContent = document.createElement('div');
-      moduleContent.className = 'nex-module-content';
-      module.appendChild(moduleContent);
-      root.appendChild(module);
-    }
+    module = createSettingsModule(root);
     var content = module.querySelector('.nex-module-content') || module;
     content.appendChild(panel);
     return true;
@@ -474,6 +554,8 @@
   function mount() {
     return mountSettings() || mountPlayback();
   }
+
+  window.__nexOpenNexSettings = openNexSettings;
 
   function renderCurrentPanel() {
     var panel = document.getElementById(SETTINGS_PANEL_ID)

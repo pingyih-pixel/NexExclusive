@@ -55,9 +55,15 @@ check(simplify.includes("nex-editor-cancel"), 'interface editor needs an explici
 check(!simplify.includes("点击右侧眼睛切换显示状态"), 'interface editor must not show the old top instruction sentence');
 check(simplify.includes("nex-settings-module"), 'settings page needs a dedicated NexExclusive module');
 check(simplify.includes("var module = document.getElementById('nex-settings-module')"), 'interface editor must join the shared NexExclusive module');
-check(source.includes("PANEL_VERSION = 'settings-v21'"), 'settings panel needs a new replay version after playback button priority fix');
+check(source.includes("PANEL_VERSION = 'settings-v23'"), 'settings panel needs a new replay version after geometry compatibility overrides');
 check(source.includes("nex-quality-override-style"), 'audio specification needs a compatibility style override');
-check(simplify.includes("SCRIPT_VERSION = 'header-modal-v13'"), 'interface editor needs a new replay version after header button alignment');
+check(source.includes("border-radius:14px!important"), 'audio specification needs an oval compatibility shape');
+check(source.includes("width:172px!important"), 'audio specification needs a compact compatibility width');
+check(source.includes("function makeModuleDraggable"), 'NexExclusive settings window needs draggable behavior');
+check(source.includes("data-drag-ready"), 'draggable settings window needs an idempotent mount guard');
+check(simplify.includes("SCRIPT_VERSION = 'header-modal-v14'"), 'interface editor needs a new replay version after the NexExclusive header entry');
+check(simplify.includes("NEX_BUTTON_ID"), 'header needs a NexExclusive entry beside the editor entry');
+check(simplify.includes("function openNexSettings"), 'header NexExclusive entry needs to open the shared settings window');
 check(source.includes("SETTINGS_LAUNCHER_ID"), 'settings page needs a standalone NexExclusive launcher');
 check(source.includes("nex-settings-launcher"), 'standalone launcher needs a dedicated element');
 check(source.includes("function mountSettingsLauncher"), 'standalone launcher needs a title-area mount path');
