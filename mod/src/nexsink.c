@@ -74,6 +74,7 @@
 #include "sink_core.inc"        /* config, logging, state, vtable bookkeeping */
 #include "sink_dsp.inc"         /* ring buffer, sample conversion, resampler  */
 #include "sink_device.inc"      /* drain thread, faults, fake client objects  */
+#include "sink_audiohost.inc"   /* optional shared-memory out-of-process sink */
 #include "sink_lifecycle.inc"   /* device generations, stop and teardown      */
 #include "sink_endpoint.inc"    /* format negotiation, migration, engage      */
 #include "sink_hooks.inc"       /* IAudioClient/IMMDevice hooks, watchdog     */

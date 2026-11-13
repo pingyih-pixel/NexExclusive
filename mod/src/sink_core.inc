@@ -7,6 +7,13 @@ static int g_compat      = 1;   /* allow rate/depth conversion when the device r
 static int g_dither      = 2;   /* 0 off, 1 on, 2 auto */
 static int g_fade_ms     = 5;   /* explicit processing; 0 disables sample changes */
 static int g_shared_fallback = 0; /* strict exclusive by default */
+static int g_hifi        = 0;   /* strict native client-format exclusive path */
+static int g_audiohost   = 0;   /* optional out-of-process exclusive renderer */
+/* Which rate to prefer when the device refuses the source rate.
+     0 = bandwidth: nearest higher first, then lower from high to low.
+     1 = simplicity: integer conversion ratios first, then bandwidth order.
+   The source rate always stays first; this setting only orders conversions. */
+static int g_src_prefer  = 0;
 static FILETIME g_cfg_mtime;
 static int g_cfg_loaded  = 0;
 
@@ -92,6 +99,7 @@ typedef struct SinkGen {
     UINT64              submitted;
     volatile LONG       last_submit;    /* GetTickCount of the last ReleaseBuffer */
     volatile LONG       stage;          /* where the thread is, for diagnosis */
+    int                 remote;         /* audiohost owns the endpoint */
 } SinkGen;
 
 /* ---- sink state --------------------------------------------------------- */
@@ -110,11 +118,23 @@ typedef struct {
 
     /* what we actually push to the device */
     int            out_rate;
-    int            out_bits;
+    int            out_bits;            /* valid bits: what quantisation targets */
+    int            out_container_bits;  /* bits actually written; 0 = same as out_bits */
+    int            out_valid_bits;      /* 0 = same as out_bits */
     int            out_is_float;
     int            out_block;           /* bytes per output frame */
     int            resample;            /* out_rate != in_rate */
     int            dither;              /* TPDF on the final quantize */
+    int            hifi_map;             /* 0 off, 1 client-native, 2 converted */
+    UINT64         hifi_verified_frames;
+    UINT64         hifi_changed_bytes;
+    UINT64         hifi_converted_frames;
+    UINT64         hifi_client_frames;
+    UINT64         hifi_endpoint_frames;
+    UINT64         hifi_first_mismatch_frame;
+    UINT32         hifi_first_mismatch_byte;
+    UINT64         hifi_client_hash;
+    UINT64         hifi_endpoint_hash;
 
     UINT64              clock_last;
     UINT64              clock_base;      /* position played before the current device */
@@ -144,6 +164,21 @@ typedef struct {
 } Sink;
 
 static Sink g_sink;
+
+/* Container and valid depth of the output stream.
+   A device may accept 24-bit data packed into three bytes, or left-justified in
+   a 32-bit container with the low eight bits unused. Those are two different
+   WAVEFORMATEXTENSIBLE declarations and drivers differ in which one they take:
+   most USB DACs want the 32-bit container, some pro interfaces only the packed
+   form. out_bits carries the valid depth (what quantisation targets) and
+   out_container_bits the container. Zero means "same as valid", which is also
+   what the device-free regression tests assume when they set only out_bits. */
+static int out_container(void) {
+    return g_sink.out_container_bits ? g_sink.out_container_bits : g_sink.out_bits;
+}
+static int out_valid(void) {
+    return g_sink.out_valid_bits ? g_sink.out_valid_bits : g_sink.out_bits;
+}
 static _Thread_local IMMDevice *g_activation_dev; /* borrowed only during Activate */
 static _Thread_local LONG g_internal; /* never hides other threads' client calls */
 typedef struct { void *client; IMMDevice *dev; } EndpointBinding;
@@ -187,6 +222,9 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
 static HRESULT sink_engage_controlled(IAudioClient *self, const WAVEFORMATEX *fmt,
                                       REFERENCE_TIME dur, int *was_engaged);
 static HRESULT dev_activate(IMMDevice *dev, const GUID *iid, void **out);
+static HRESULT remote_drain_once(SinkGen *g);
+static UINT64 endpoint_hash(IMMDevice *dev);
+static HANDLE g_remote_space;
 
 /* The vtable is shared by every IAudioClient in the process, including the one
    backing our own exclusive stream. So the real stream must never be driven
@@ -261,24 +299,27 @@ static void describe(const char *tag, const WAVEFORMATEX *w, char *out, size_t n
              w->nChannels, w->wFormatTag, sub);
 }
 
-static void build_fmt(WAVEFORMATEXTENSIBLE *we, int rate, int bits, int ch, DWORD mask) {
+/* container is the byte width declared to the driver, valid is the precision
+   inside it. They differ only for 24-in-32 (container 32, valid 24), which is a
+   distinct format from packed 24 as far as the audio engine is concerned. */
+static void build_fmt_cv(WAVEFORMATEXTENSIBLE *we, int rate, int container, int valid,
+                         int is_float, int ch, DWORD mask) {
     memset(we, 0, sizeof(*we));
     we->Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
     we->Format.nChannels       = (WORD)ch;
     we->Format.nSamplesPerSec  = (DWORD)rate;
-    we->Format.wBitsPerSample  = (WORD)bits;
-    we->Format.nBlockAlign     = (WORD)(ch * bits / 8);
+    we->Format.wBitsPerSample  = (WORD)container;
+    we->Format.nBlockAlign     = (WORD)(ch * container / 8);
     we->Format.nAvgBytesPerSec = (DWORD)rate * we->Format.nBlockAlign;
     we->Format.cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-    we->Samples.wValidBitsPerSample = (WORD)bits;
+    we->Samples.wValidBitsPerSample = (WORD)valid;
     we->dwChannelMask          = mask;
-    we->SubFormat              = SUB_PCM;
+    we->SubFormat              = is_float ? SUB_FLOAT : SUB_PCM;
 }
 
-static void build_fmt_ex(WAVEFORMATEXTENSIBLE *we, int rate, int bits, int is_float,
-                         int ch, DWORD mask) {
-    build_fmt(we, rate, bits, ch, mask);
-    if (is_float) we->SubFormat = SUB_FLOAT;
+static void __attribute__((unused)) build_fmt_ex(WAVEFORMATEXTENSIBLE *we, int rate, int bits,
+                                                 int is_float, int ch, DWORD mask) {
+    build_fmt_cv(we, rate, bits, bits, is_float, ch, mask);
 }
 
 static DWORD mask_for(int ch) {
@@ -323,14 +364,39 @@ static void load_config(void) {
         else if (_strnicmp(p, "dither=", 7) == 0) g_dither     = atoi(p + 7);
         else if (_strnicmp(p, "fade_ms=", 8) == 0) g_fade_ms = atoi(p + 8);
         else if (_strnicmp(p, "shared_fallback=", 16) == 0) g_shared_fallback = atoi(p + 16) != 0;
+        else if (_strnicmp(p, "hifi=", 5) == 0) g_hifi = atoi(p + 5) != 0;
+        else if (_strnicmp(p, "audiohost=", 10) == 0) g_audiohost = atoi(p + 10) != 0;
+        else if (_strnicmp(p, "src_prefer=", 11) == 0) {
+            char v[32];
+            snprintf(v, sizeof(v), "%s", p + 11);
+            for (char *q = v; *q; q++) if (*q == '\r' || *q == '\n' || *q == ' ') { *q = 0; break; }
+            /* Numeric form is what the panel and nexhost write; the word form
+               stays accepted so a hand-edited file still reads naturally. */
+            if (_stricmp(v, "simplicity") == 0)      g_src_prefer = 1;
+            else if (_stricmp(v, "bandwidth") == 0)  g_src_prefer = 0;
+            else                                     g_src_prefer = atoi(v) ? 1 : 0;
+        }
     }
     fclose(f);
+    if (g_src_prefer != 0 && g_src_prefer != 1) g_src_prefer = 0;
     if (g_out_bits != 16 && g_out_bits != 24 && g_out_bits != 32) g_out_bits = 24;
     if (g_out_frames < 0 || g_out_frames > 32768) g_out_frames = 0;
     if (g_force_rate < 0 || g_force_rate > 384000) g_force_rate = 0;
     if (g_dither < 0 || g_dither > 2) g_dither = 2;
     if (g_fade_ms < 0 || g_fade_ms > 100) g_fade_ms = 5;
-    log_line("config: enable=%d bits=%d rate=%d buffer=%d compat=%d dither=%d fade_ms=%d shared_fallback=%d",
-             g_enable, g_out_bits, g_force_rate, g_out_frames, g_compat, g_dither, g_fade_ms, g_shared_fallback);
+    if (g_hifi) {
+        /* Strict native mode follows the client's format and refuses processing
+           that would make the output differ from the client PCM. */
+        g_force_rate = 0;
+        g_compat = 0;
+        g_dither = 0;
+        g_fade_ms = 0;
+    }
+    /* Shared output is never a product path. Keep reading the legacy key so old
+       configs remain parseable, then force the invariant here. */
+    g_shared_fallback = 0;
+    log_line("config: enable=%d bits=%d rate=%d buffer=%d compat=%d dither=%d fade_ms=%d shared_fallback=%d src_prefer=%s hifi=%d audiohost=%d",
+             g_enable, g_out_bits, g_force_rate, g_out_frames, g_compat, g_dither, g_fade_ms,
+             g_shared_fallback, g_src_prefer ? "simplicity" : "bandwidth", g_hifi, g_audiohost);
 }
 

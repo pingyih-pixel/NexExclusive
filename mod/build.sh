@@ -43,12 +43,12 @@ FLAGS=(-target x86_64-windows-gnu -O2 -Wall)
 LIBS=(-lole32 -loleaut32 -luuid)
 TARGET=${1:-all}
 if (( $# > 1 )); then
-    printf '用法：%s [sink|host|all|test]\n' "$0" >&2
+    printf '用法：%s [sink|host|audiohost|all|test]\n' "$0" >&2
     exit 2
 fi
 case "$TARGET" in
-    sink|host|all|test) ;;
-    *) printf '用法：%s [sink|host|all|test]\n' "$0" >&2; exit 2 ;;
+    sink|host|audiohost|all|test) ;;
+    *) printf '用法：%s [sink|host|audiohost|all|test]\n' "$0" >&2; exit 2 ;;
 esac
 
 OUT_DIR=${OUT_DIR-$MOD_DIR}
@@ -118,6 +118,14 @@ build_host() {
     printf '已构建到 %s：NexExclusive.exe（含 hook.cfg / ui.json / ui/）\n' "$OUT_DIR"
 }
 
+build_audiohost() {
+    # 可选的独立 WASAPI 端点进程。它通过共享内存环形缓冲读取客户端 PCM，
+    # 默认不启用；只有 hook.cfg 的 audiohost=1 才会由 DLL 拉起。
+    "$CC" cc "${FLAGS[@]}" -municode -Wl,--subsystem,console \
+        -o "$OUT_DIR/NexAudioHost.exe" "$MOD_DIR/tools/nexaudiohost.c" "${LIBS[@]}"
+    printf '已构建到 %s：NexAudioHost.exe\n' "$OUT_DIR"
+}
+
 build_test() {
     "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/regression.exe" "$MOD_DIR/test/regression.c" "${LIBS[@]}"
     "$OUT_DIR/regression.exe"
@@ -126,6 +134,7 @@ build_test() {
 case "$TARGET" in
     sink) build_sink ;;
     host) build_host ;;
-    all)  build_sink; build_host ;;
+    audiohost) build_audiohost ;;
+    all)  build_sink; build_host; build_audiohost ;;
     test) build_test ;;
 esac

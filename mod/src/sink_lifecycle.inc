@@ -50,6 +50,7 @@ static HRESULT sink_stop(void) {
         InterlockedExchange(&g->running, 0);
         if (g_sink.h_data) SetEvent(g_sink.h_data);
         if (g_sink.h_space) SetEvent(g_sink.h_space);
+        if (g->real_evt) SetEvent(g->real_evt);
 
         DWORD t0 = GetTickCount();
         DWORD wait = g->h_thread ? WaitForSingleObject(g->h_thread, 300) : WAIT_OBJECT_0;
@@ -112,6 +113,7 @@ static void proxy_release_owned(void) {
     g_sink.proxy_render=NULL;g_sink.proxy_clock=NULL;
 }
 static HRESULT sink_teardown(void) {
+    int was_remote = g_sink.gen && g_sink.gen->remote;
     HRESULT stop=sink_stop();
     /* A generation that survived the stop is the normal case: Stop/Start is how
        a client pauses. Teardown is where it actually goes away. */
@@ -131,6 +133,23 @@ static HRESULT sink_teardown(void) {
         ((IUnknown *)g_sink.owner)->lpVtbl->Release((IUnknown *)g_sink.owner);
     }
     src_free();scratch_free();
+    if (was_remote) remote_close();
+    if (g_sink.hifi_map) {
+        log_line("hifi verifier: map=%s client_frames=%llu endpoint_frames=%llu "
+                 "verified_frames=%llu changed_bytes=%llu converted_frames=%llu "
+                 "first_mismatch=%s%llu+%lu client_hash=%016llX endpoint_hash=%016llX",
+                 g_sink.hifi_map == 1 ? "client-native" : "converted",
+                 (unsigned long long)g_sink.hifi_client_frames,
+                 (unsigned long long)g_sink.hifi_endpoint_frames,
+                 (unsigned long long)g_sink.hifi_verified_frames,
+                 (unsigned long long)g_sink.hifi_changed_bytes,
+                 (unsigned long long)g_sink.hifi_converted_frames,
+                 g_sink.hifi_first_mismatch_frame == ~(UINT64)0 ? "none:" : "",
+                 g_sink.hifi_first_mismatch_frame == ~(UINT64)0 ? 0 : g_sink.hifi_first_mismatch_frame,
+                 (unsigned long)g_sink.hifi_first_mismatch_byte,
+                 (unsigned long long)g_sink.hifi_client_hash,
+                 (unsigned long long)g_sink.hifi_endpoint_hash);
+    }
     memset(&g_sink,0,sizeof(g_sink));
     log_line("sink: torn down (all references and partial allocations released)");
     return stop;

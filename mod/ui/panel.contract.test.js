@@ -1,0 +1,76 @@
+/* Lightweight contract checks for the injected settings panel. */
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const source = fs.readFileSync(path.join(__dirname, 'panel.js'), 'utf8');
+const simplify = fs.readFileSync(path.join(__dirname, 'simplify.js'), 'utf8');
+
+function check(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+check(source.includes("data-nex-section"), 'panel sections must expose data-nex-section');
+check(source.includes("className = 'nex-item'"), 'settings rows must use the native-style item structure');
+check(source.includes("className = 'nex-control'"), 'settings controls need a dedicated control column');
+check(source.includes("className = 'nex-summary'"), 'status summary must have a dedicated top region');
+check(source.includes('function fieldDisabled'), 'controls need a central disabled-state policy');
+check(source.includes('if (!strictHiFi()) return false'), 'strict native mode must participate in disabled-state policy');
+check(source.includes("'rate', 'compat', 'src_prefer'"), 'strict native policy must cover processing controls');
+check(source.includes("setAttribute('aria-disabled'"), 'disabled rows must expose aria-disabled');
+check(source.includes("role', 'checkbox'"), 'check controls must retain checkbox accessibility semantics');
+check(source.includes("data-nex-section"), 'output policy must be inside a named section');
+check(source.includes("function mountSettings"), 'settings page needs a dedicated NexExclusive mount path');
+check(source.includes("nex-settings-panel"), 'settings page needs its own panel id');
+check(source.includes("#page_pc_setting, #setting, #settings"), 'settings mount must support the current client settings container');
+check(source.includes("PANEL_VERSION"), 'panel injection needs a versioned replay guard');
+check(!source.includes("if (module) module.remove();"), 'settings mount must preserve the shared NexExclusive module');
+check(source.includes("mount();\n      if (connected) refreshStatus();"), 'settings mount must retry after the client reveals the settings container');
+check(source.includes("NexExclusive"), 'settings navigation must expose the NexExclusive module');
+check(!source.includes("key: 'bits', label: '输出位深'"), 'bit depth must follow the client format instead of a UI selector');
+check(source.includes("'严格原样'"), 'native-only mode must use unambiguous user-facing wording');
+check(source.includes("'原率优先（推荐）'"), 'default mode must be exposed as source-rate-first');
+check(source.includes("独占转换"), 'status wording must distinguish exclusive conversion from native output');
+check(source.includes("切换到原率优先"), 'native-only rejection must tell the user how to recover playback');
+check(source.includes("nex-recovery"), 'native-only rejection needs a direct recovery action');
+check(source.includes("nex-quality-card"), 'audio specification needs a separate boxed card beside the client lossless selector');
+check(source.includes("formatAudioSpec"), 'lossless badge must format negotiated audio specifications');
+check(source.includes("音频规格"), 'lossless badge tooltip must name the audio specification');
+check(simplify.includes("className = 'nex-open'"), 'settings page needs a single entry to the editor');
+check(simplify.includes("EDIT_BUTTON_ID"), 'interface cleanup needs a dedicated edit-mode button');
+check(simplify.includes("HEADER_ENTRY_ID"), 'edit entry must live in the client header');
+check(simplify.includes("nex-simple-modal"), 'interface cleanup needs a modal editor');
+check(simplify.includes("activeGroup"), 'modal editor needs a selected category');
+check(simplify.includes("key: 'sidebar_recommend'"), 'left navigation needs per-item rules');
+check(simplify.includes("key: 'main_recommend'"), 'main page needs per-block rules');
+check(simplify.includes("key: 'header_message'"), 'top buttons need per-item rules');
+check(simplify.includes("className = 'nex-group'"), 'modal categories need expandable groups');
+check(simplify.includes("nex-visibility"), 'visibility controls need a shared switch control');
+check(simplify.includes("data-hidden=\"false\""), 'visibility switch needs an enabled state');
+check(simplify.includes("nex-visibility::after"), 'visibility switch needs a movable thumb');
+check(simplify.includes("tid_createplaylist_section"), 'created playlists must be excluded explicitly');
+check(simplify.includes("tid_collectingplaylist_title"), 'collected playlists must be excluded explicitly');
+check(simplify.includes("nex-editor-save"), 'interface editor needs an explicit save action');
+check(simplify.includes("nex-editor-cancel"), 'interface editor needs an explicit cancel action');
+check(!simplify.includes("点击右侧眼睛切换显示状态"), 'interface editor must not show the old top instruction sentence');
+check(simplify.includes("nex-settings-module"), 'settings page needs a dedicated NexExclusive module');
+check(simplify.includes("var module = document.getElementById('nex-settings-module')"), 'interface editor must join the shared NexExclusive module');
+check(source.includes("PANEL_VERSION = 'settings-v21'"), 'settings panel needs a new replay version after playback button priority fix');
+check(source.includes("nex-quality-override-style"), 'audio specification needs a compatibility style override');
+check(simplify.includes("SCRIPT_VERSION = 'header-modal-v13'"), 'interface editor needs a new replay version after header button alignment');
+check(source.includes("SETTINGS_LAUNCHER_ID"), 'settings page needs a standalone NexExclusive launcher');
+check(source.includes("nex-settings-launcher"), 'standalone launcher needs a dedicated element');
+check(source.includes("function mountSettingsLauncher"), 'standalone launcher needs a title-area mount path');
+check(!source.includes("nav.appendChild(entry)"), 'NexExclusive must not be appended to the native settings navigation');
+check(source.includes("setAttribute('aria-expanded', value)"), 'standalone launcher must expose drawer state');
+check(source.includes("data-open"), 'settings entry must toggle the right-side NexExclusive drawer');
+check(source.includes("nex-module-close"), 'settings drawer needs a close control');
+check(source.includes("nex-quality-card"), 'audio specification must be separate from the client lossless selector');
+check(source.includes("nex-quality-summary"), 'audio specification card needs a compact negotiated summary');
+check(source.includes("setAttribute('aria-expanded'"), 'audio specification card must expose expandable details');
+check(source.includes("客户端 PCM → 独占端点"), 'audio specification details must expose verifier scope');
+check(source.includes("Bit-perfect"), 'native output must be labelled bit-perfect in the specification card');
+check(source.includes("height:30px"), 'select controls must match the client control height');
+check(simplify.includes("rgba(40,50,72,.1)"), 'interface editor controls must use the client border color');
+check(simplify.includes("height:34px"), 'interface editor buttons must match the client control height');
+console.log('PASS panel contract: grouped native-style rows and Hi-Fi state semantics');

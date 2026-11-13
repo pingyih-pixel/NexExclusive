@@ -18,7 +18,10 @@ static void ring_compact(void) {
     g_sink.r = 0;
 }
 
-// Reserve n contiguous input frames. Blocks until room appears.
+// Reserve n contiguous input frames without waiting. The client already saw
+// the reported buffer size, so a full ring means the generation is not able to
+// accept this write; the caller restarts the stream instead of parking its
+// audio thread behind the drain thread.
 static BYTE *ring_reserve(UINT32 n) {
     if (n > g_sink.cap) {
         /* Cannot fit by definition. Waiting here would spin forever, because
@@ -29,65 +32,65 @@ static BYTE *ring_reserve(UINT32 n) {
                  (unsigned long)n, (unsigned long)g_sink.cap);
         return NULL;
     }
-    int waits = 0;
-    for (;;) {
-        EnterCriticalSection(&g_lock);
-        if (!g_sink.engaged) { LeaveCriticalSection(&g_lock); return NULL; }
-        UINT32 used = g_sink.w - g_sink.r;
-        if (g_sink.cap - used >= n) {
-            if ((g_sink.w % g_sink.cap) + n > g_sink.cap) ring_compact();
-            if ((g_sink.w % g_sink.cap) + n <= g_sink.cap) {
-                BYTE *p = g_sink.ring + (size_t)(g_sink.w % g_sink.cap) * g_sink.in_block;
-                LeaveCriticalSection(&g_lock);
-                return p;
-            }
-        }
+    if (!TryEnterCriticalSection(&g_lock)) return NULL;
+    if (!g_sink.engaged) { LeaveCriticalSection(&g_lock); return NULL; }
+    UINT32 used = g_sink.w - g_sink.r;
+    if (g_sink.cap - used < n) { LeaveCriticalSection(&g_lock); return NULL; }
+    if ((g_sink.w % g_sink.cap) + n > g_sink.cap) ring_compact();
+    if ((g_sink.w % g_sink.cap) + n > g_sink.cap) {
         LeaveCriticalSection(&g_lock);
-        if (!g_sink.engaged) return NULL;
-        if (++waits > 50) {          /* ~1 s with no room: the drain is wedged */
-            log_line("ring: no room for %lu frames after 1 s (w=%lu r=%lu cap=%lu)",
-                     (unsigned long)n, (unsigned long)g_sink.w,
-                     (unsigned long)g_sink.r, (unsigned long)g_sink.cap);
-            return NULL;
-        }
-        WaitForSingleObject(g_sink.h_space, 20);
+        return NULL;
     }
+    BYTE *p = g_sink.ring + (size_t)(g_sink.w % g_sink.cap) * g_sink.in_block;
+    LeaveCriticalSection(&g_lock);
+    return p;
 }
 
 /* ---- sample conversion -------------------------------------------------- */
 static double rnd01(void);
-static double sample_read(const BYTE *p, int bits, int is_float) {
+/* container is the byte width, valid the precision inside it. They differ only
+   for 24-in-32, where the sample is left-justified in an int32 and the low
+   eight bits carry nothing. Reading such a stream as full-scale int32 would
+   make it 48 dB quiet, which sounds like a broken channel rather than a format
+   mismatch. */
+static double sample_read(const BYTE *p, int container, int valid, int is_float) {
     if (is_float) { float f; memcpy(&f,p,4); return isfinite(f) ? f : 0.0; }
-    if (bits == 16) { short x; memcpy(&x,p,2); return (double)x / 32768.0; }
-    if (bits == 24) {
+    if (container == 16) { short x; memcpy(&x,p,2); return (double)x / 32768.0; }
+    if (container == 24) {
         int x = p[0] | (p[1]<<8) | (p[2]<<16);
         if (x & 0x800000) x |= ~0xFFFFFF;
         return (double)x / 8388608.0;
     }
-    int x; memcpy(&x,p,4); return (double)x / 2147483648.0;
+    int x; memcpy(&x,p,4);
+    if (valid == 24) return (double)(x >> 8) / 8388608.0;
+    return (double)x / 2147483648.0;
 }
-static void sample_write(double v, BYTE *p, int bits, int is_float, int dither) {
+static void sample_write(double v, BYTE *p, int container, int valid, int is_float, int dither) {
     if (!isfinite(v)) v = 0.0;
     if (is_float) { float f = (float)v; memcpy(p,&f,4); return; }
-    double scale = ldexp(1.0,bits-1);
+    double scale = ldexp(1.0,valid-1);
     v *= scale;
     if (dither) v += rnd01()-rnd01();
     if (v > scale-1) v = scale-1;
     if (v < -scale) v = -scale;
     INT64 q = (INT64)llrint(v);
-    if (bits == 16) { short x=(short)q; memcpy(p,&x,2); }
-    else if (bits == 24) { p[0]=(BYTE)q; p[1]=(BYTE)(q>>8); p[2]=(BYTE)(q>>16); }
+    if (container == 16) { short x=(short)q; memcpy(p,&x,2); }
+    else if (container == 24) { p[0]=(BYTE)q; p[1]=(BYTE)(q>>8); p[2]=(BYTE)(q>>16); }
+    else if (valid == 24) { /* left-justified in 32 bits; unsigned shift is defined
+                               for negative values, signed left shift is not */
+                            int x=(int)((UINT32)q << 8); memcpy(p,&x,4); }
     else { int x=(int)q; memcpy(p,&x,4); }
 }
 static void convert(const BYTE *src, BYTE *dst, UINT32 frames) {
     size_t n = (size_t)frames * g_sink.in_channels;
-    int ib = g_sink.in_container_bits, ob = g_sink.out_bits;
-    if (ib == ob && g_sink.in_is_float == g_sink.out_is_float && !g_sink.dither) {
+    int ib = g_sink.in_container_bits, iv = g_sink.in_valid_bits;
+    int ob = out_container(), ov = out_valid();
+    if (ib == ob && iv == ov && g_sink.in_is_float == g_sink.out_is_float && !g_sink.dither) {
         memcpy(dst,src,n*(ib/8)); return;
     }
     for (size_t i=0; i<n; i++)
-        sample_write(sample_read(src+i*(ib/8),ib,g_sink.in_is_float),
-                     dst+i*(ob/8),ob,g_sink.out_is_float,g_sink.dither);
+        sample_write(sample_read(src+i*(ib/8),ib,iv,g_sink.in_is_float),
+                     dst+i*(ob/8),ob,ov,g_sink.out_is_float,g_sink.dither);
 }
 
 /* ---- float pipeline: rate conversion + dithered quantisation ------------ */
@@ -343,7 +346,13 @@ static void to_float(const BYTE *src, float *dst, UINT32 frames) {
     int ib = g_sink.in_container_bits;
     if (ib == 32) {
         const int *s = (const int *)src;
-        for (UINT32 i = 0; i < n; i++) dst[i] = (float)((double)s[i] / 2147483648.0);
+        if (g_sink.in_valid_bits == 24) {
+            /* 24-in-32 from the client: same left-justified layout the device
+               side may hand back. */
+            for (UINT32 i = 0; i < n; i++) dst[i] = (float)((double)(s[i] >> 8) / 8388608.0);
+        } else {
+            for (UINT32 i = 0; i < n; i++) dst[i] = (float)((double)s[i] / 2147483648.0);
+        }
     } else if (ib == 24) {
         for (UINT32 i = 0; i < n; i++) {
             int v = src[i * 3] | (src[i * 3 + 1] << 8) | (src[i * 3 + 2] << 16);
@@ -366,14 +375,14 @@ static double rnd01(void) {
 static void quantize(const float *in, UINT32 frames, BYTE *dst) {
     const int ch = g_sink.in_channels;
     const UINT32 n = frames * (UINT32)ch;
-    const int bits = g_sink.out_bits;
+    const int cont = out_container(), valid = out_valid();
 
     if (g_sink.out_is_float) {
         memcpy(dst, in, (size_t)n * sizeof(float));
         return;
     }
     for (UINT32 i = 0; i < n; i++)
-        sample_write(in[i], dst + (size_t)i * (bits/8), bits, 0, g_sink.dither);
+        sample_write(in[i], dst + (size_t)i * (cont/8), cont, valid, 0, g_sink.dither);
 }
 
 /* ---- drain thread ------------------------------------------------------- */
@@ -383,7 +392,7 @@ static void quantize(const float *in, UINT32 frames, BYTE *dst) {
 static void apply_fade(BYTE *dst, UINT32 frames) {
     if (!g_sink.fade_left) return;
     const int ch = g_sink.in_channels;
-    const int bytes = g_sink.out_bits / 8;
+    const int bytes = out_container() / 8;
     if (!ch || !bytes) return;
 
     for (UINT32 f = 0; f < frames && g_sink.fade_left; f++) {

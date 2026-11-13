@@ -21,8 +21,7 @@ static HRESULT STDMETHODCALLTYPE H_Initialize(void *self, AUDCLNT_SHAREMODE mode
            hear happening. A second stream in the same process is different -
            it is not ours to fail, so it always gets a real stream. */
         if (!g_shared_fallback && !was_engaged) {
-            log_line("sink failed 0x%08lX, strict mode: reporting the failure instead of "
-                     "opening a shared stream (shared_fallback=1 to allow it)",
+            log_line("sink failed 0x%08lX, exclusive output rejected; shared fallback is disabled",
                      (unsigned long)hs);
             return hs;
         }

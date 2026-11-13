@@ -25,6 +25,9 @@ dist/
 *.orig
 *~
 
+# 本地截图、注入脚本与调试记录
+work/
+
 # 第三方参考与解包资源
 analysis/ame-ref/
 analysis/ui-probe/

@@ -6,6 +6,7 @@ static void sink_fault(SinkGen *g, HRESULT hr, const char *operation) {
     if (g_sink.h_data) SetEvent(g_sink.h_data);
     if (g_sink.h_space) SetEvent(g_sink.h_space);
     if (g_sink.h_client) SetEvent(g_sink.h_client);
+    if (g && g->real_evt) SetEvent(g->real_evt);
     LeaveCriticalSection(&g_lock);
     log_line("sink fault: %s 0x%08lX; client will receive failure",operation,(unsigned long)hr);
 }
@@ -21,6 +22,7 @@ static void sink_device_lost(SinkGen *g, const char *where) {
     if (g) InterlockedExchange(&g->running, 0);
     if (g_sink.h_data) SetEvent(g_sink.h_data);
     if (g_sink.h_space) SetEvent(g_sink.h_space);
+    if (g && g->real_evt) SetEvent(g->real_evt);
     LeaveCriticalSection(&g_lock);
     if (g_h_wake) SetEvent(g_h_wake);
     log_line("sink: device lost during %s; looking for a new default endpoint", where);
@@ -52,8 +54,8 @@ static void dump_frames(const BYTE *p, UINT32 frames) {
                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             if (g_dump != INVALID_HANDLE_VALUE) {
                 g_dump_state = 1;
-                log_line("dump: device frames -> %s (%d bit, %d ch)",
-                         path, g_sink.out_bits, g_sink.in_channels);
+                log_line("dump: device frames -> %s (%d.%d bit, %d ch)",
+                         path, out_container(), out_valid(), g_sink.in_channels);
             } else {
                 log_line("dump: cannot open %s (%lu)", path, GetLastError());
             }
@@ -73,12 +75,50 @@ static void dump_frames(const BYTE *p, UINT32 frames) {
 static UINT32 g_writes, g_starve, g_max_gap;
 static DWORD  g_last_write;
 
+static UINT64 hifi_changed_bytes(const BYTE *a, const BYTE *b, size_t n) {
+    UINT64 changed = 0;
+    for (size_t i = 0; i < n; i++) if (a[i] != b[i]) changed++;
+    return changed;
+}
+
+static UINT64 hifi_hash_bytes(const BYTE *p, size_t n, UINT64 hash) {
+    for (size_t i = 0; i < n; i++) hash = (hash ^ p[i]) * 1099511628211ull;
+    return hash;
+}
+
+static void hifi_record_native(const BYTE *client, const BYTE *endpoint,
+                               UINT32 frames, UINT32 block) {
+    const UINT64 bytes = (UINT64)frames * block;
+    const UINT64 base_frame = g_sink.hifi_endpoint_frames;
+    const UINT64 changed = hifi_changed_bytes(client, endpoint, (size_t)bytes);
+    if (!g_sink.hifi_client_hash) g_sink.hifi_client_hash = 1469598103934665603ull;
+    if (!g_sink.hifi_endpoint_hash) g_sink.hifi_endpoint_hash = 1469598103934665603ull;
+    g_sink.hifi_client_hash = hifi_hash_bytes(client, (size_t)bytes, g_sink.hifi_client_hash);
+    g_sink.hifi_endpoint_hash = hifi_hash_bytes(endpoint, (size_t)bytes, g_sink.hifi_endpoint_hash);
+    g_sink.hifi_client_frames += frames;
+    g_sink.hifi_endpoint_frames += frames;
+    if (changed) {
+        g_sink.hifi_changed_bytes += changed;
+        if (g_sink.hifi_first_mismatch_frame == ~(UINT64)0) {
+            for (UINT64 i = 0; i < bytes; i++) {
+                if (client[i] == endpoint[i]) continue;
+                g_sink.hifi_first_mismatch_frame = base_frame + i / block;
+                g_sink.hifi_first_mismatch_byte = (UINT32)(i % block);
+                break;
+            }
+        }
+    } else {
+        g_sink.hifi_verified_frames += frames;
+    }
+}
+
 /* One timer-driven exclusive submission. GetBuffer and ReleaseBuffer agree on
    size, no fabricated silence, and data already buffered in SRC is not skipped.
    Every blocking call is followed by a retired check: once the control path has
    let go of this generation, the thread must not touch the ring, the resampler
    or the negotiated format again - they may already belong to the next stream. */
 static HRESULT drain_once(SinkGen *g) {
+    if (g->remote) return remote_drain_once(g);
     UINT32 pad=0;
     g->stage=STAGE_PADDING;
     HRESULT hr=O_GETPADDING(g->real,&pad);
@@ -135,6 +175,11 @@ static HRESULT drain_once(SinkGen *g) {
             return E_UNEXPECTED;
         }
         convert(g_inb,dst,n);
+        if (g_sink.hifi_map == 1) {
+            hifi_record_native(g_inb, dst, n, (UINT32)g_sink.in_block);
+        } else if (g_sink.hifi_map == 2) {
+            g_sink.hifi_converted_frames += n;
+        }
     }
     apply_fade(dst,n);
     dump_frames(dst,n);
@@ -175,8 +220,8 @@ static DWORD WINAPI drain_thread(LPVOID param) {
     SinkGen *g=(SinkGen *)param;
     HRESULT co=CoInitializeEx(NULL,COINIT_MULTITHREADED);
     g->stage=STAGE_IDLE;
-    log_line("drain: thread up (gen %llu), out=%d Hz/%d bit",
-             (unsigned long long)g->id,g_sink.out_rate,g_sink.out_bits);
+    log_line("drain: thread up (gen %llu), out=%d Hz/%d.%d bit",
+             (unsigned long long)g->id,g_sink.out_rate,out_container(),out_valid());
     while(g->running && !g->retired) {
         HRESULT hr=drain_once(g);
         if(g->retired) break;
@@ -186,11 +231,18 @@ static DWORD WINAPI drain_thread(LPVOID param) {
            would poison a sink that is being rebuilt on purpose. */
         if(FAILED(hr)) { if(!g->running) break; sink_fault(g,hr,"device submission"); break; }
         if(hr==S_FALSE) {
-            if(g_sink.h_data)WaitForSingleObject(g_sink.h_data,3);
-            else Sleep(2);
+            HANDLE waiters[3]; DWORD count = 0;
+            if (g->real_evt) waiters[count++] = g->real_evt;
+            if (g_sink.h_data) waiters[count++] = g_sink.h_data;
+            if (g->remote && g_remote_space) waiters[count++] = g_remote_space;
+            if (g_h_wake) waiters[count++] = g_h_wake;
+            if (count) {
+                DWORD timeout = g->real_evt ? 100 : 3;
+                (void)WaitForMultipleObjects(count, waiters, FALSE, timeout);
+            } else Sleep(2);
         }
     }
-    if(FAILED(g_sink.fault)&&g->device_started) {
+    if(FAILED(g_sink.fault)&&g->device_started && g->real) {
         O_STOP(g->real); g->device_started=0;
     }
     log_line("drain: thread exit (gen %llu, running=%ld, retired=%ld, fault=0x%08lX)",
@@ -249,17 +301,12 @@ static HRESULT STDMETHODCALLTYPE fr_GetBuffer(void *s, UINT32 frames, BYTE **pp)
     if(!pp)return E_POINTER;
     *pp=NULL;
     FakeObj *obj=s ? s : &g_fake_render;
-    /* Wait out an endpoint migration before touching the control lock: the
-       migration itself needs that lock, so waiting inside it would deadlock.
-       Without this the client would see DEVICE_INVALIDATED the instant a
-       device is unplugged and abandon a track that is about to be resumed. */
+    /* Do not park the client audio thread while an endpoint generation is
+       being replaced. Returning invalidated lets the client rebuild against
+       the successor generation without a Sleep loop. */
     if (g_h_migrating &&
         (g_sink.device_lost || WaitForSingleObject(g_h_migrating, 0) == WAIT_OBJECT_0)) {
-        for (int i = 0; i < 200; i++) {          /* at most ~1 s */
-            if (WaitForSingleObject(g_h_migrating, 0) != WAIT_OBJECT_0 && !g_sink.device_lost)
-                break;
-            Sleep(5);
-        }
+        return AUDCLNT_E_DEVICE_INVALIDATED;
     }
     EnterCriticalSection(&g_control);
     HRESULT hr=S_OK;
@@ -274,11 +321,7 @@ static HRESULT STDMETHODCALLTYPE fr_GetBuffer(void *s, UINT32 frames, BYTE **pp)
         LeaveCriticalSection(&g_lock);
         if(frames>free_frames) hr=AUDCLNT_E_BUFFER_TOO_LARGE;
         else {
-            if(obj->capacity<frames) {
-                BYTE *p=realloc(obj->staging,(size_t)frames*g_sink.in_block);
-                if(!p)hr=E_OUTOFMEMORY;
-                else { obj->staging=p;obj->capacity=frames; }
-            }
+            if(frames > obj->capacity) hr=AUDCLNT_E_BUFFER_TOO_LARGE;
             if(SUCCEEDED(hr)) {
                 obj->reserved=frames;obj->writer_tid=GetCurrentThreadId();obj->discarded=0;
                 *pp=obj->staging;
@@ -319,7 +362,12 @@ static HRESULT STDMETHODCALLTYPE fr_ReleaseBuffer(void *s, UINT32 written, DWORD
     else if(written>obj->reserved) hr=AUDCLNT_E_INVALID_SIZE;
     else if(written) {
         BYTE *dst=ring_reserve(written);
-        if(!dst)hr=AUDCLNT_E_DEVICE_INVALIDATED;
+        if(!dst) {
+            hr=AUDCLNT_E_DEVICE_INVALIDATED;
+            obj->reserved=0;
+            obj->writer_tid=0;
+            obj->discarded=1;
+        }
         else {
             if(flags&AUDCLNT_BUFFERFLAGS_SILENT) memset(dst,0,(size_t)written*g_sink.in_block);
             else memcpy(dst,obj->staging,(size_t)written*g_sink.in_block);

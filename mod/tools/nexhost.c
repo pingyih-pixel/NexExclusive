@@ -55,6 +55,7 @@ static char kHostCfg[MAX_PATH];
 static wchar_t kClientExe[MAX_PATH];
 static wchar_t kClientDir[MAX_PATH];
 static const char *g_client_src = "(未找到)";
+static int g_client_verified;
 
 static void module_dir(char *out, size_t n) {
     out[0] = 0;
@@ -221,11 +222,11 @@ static int json_get_int(const char *json, const char *key, int *out) {
 
 /* ---- 配置：hook.cfg <-> JSON ------------------------------------------- */
 /* 顺序固定，面板与日志都依赖这个顺序 */
-static const char *kCfgKeys[] = {"enable","bits","rate","buffer","compat","dither","fade_ms","shared_fallback"};
+static const char *kCfgKeys[] = {"enable","bits","rate","buffer","compat","dither","fade_ms","shared_fallback","src_prefer","hifi","audiohost"};
 #define CFG_N ((int)(sizeof(kCfgKeys)/sizeof(kCfgKeys[0])))
 
 static void cfg_defaults(int *v) {
-    v[0]=1; v[1]=24; v[2]=0; v[3]=0; v[4]=1; v[5]=2; v[6]=5; v[7]=0;
+    v[0]=1; v[1]=24; v[2]=0; v[3]=0; v[4]=1; v[5]=2; v[6]=5; v[7]=0; v[8]=0; v[9]=0; v[10]=0;
 }
 
 static void cfg_read(int *v) {
@@ -242,20 +243,46 @@ static void cfg_read(int *v) {
             char *k = line;
             while (*k == ' ' || *k == '\t') k++;
             char *val = eq + 1;
-            for (int i = 0; i < CFG_N; i++)
-                if (strcmp(k, kCfgKeys[i]) == 0) v[i] = atoi(val);
+            size_t val_len = strlen(val);
+            while (val_len && (val[val_len - 1] == '\r' || val[val_len - 1] == '\n' ||
+                               val[val_len - 1] == ' ' || val[val_len - 1] == '\t'))
+                val[--val_len] = 0;
+            for (int i = 0; i < CFG_N; i++) {
+                if (strcmp(k, kCfgKeys[i]) != 0) continue;
+                if (i == 8) {
+                    if (_stricmp(val, "simplicity") == 0) v[i] = 1;
+                    else if (_stricmp(val, "bandwidth") == 0) v[i] = 0;
+                    else v[i] = atoi(val) ? 1 : 0;
+                } else v[i] = atoi(val);
+            }
         }
         if (!nl) break;
         line = nl + 1;
     }
     free(txt);
+    /* Shared output is no longer exposed as a product mode. Keep the legacy
+       field readable, but normalize it before it reaches the UI. */
+    v[7] = 0;
 }
 
-static void cfg_write(const int *v) {
-    FILE *f = fopen(kHookCfg, "w");
-    if (!f) { host_log("cfg: 写入失败 %s", kHookCfg); return; }
-    for (int i = 0; i < CFG_N; i++) fprintf(f, "%s=%d\n", kCfgKeys[i], v[i]);
-    fclose(f);
+static int cfg_write(const int *v) {
+    char temp[MAX_PATH];
+    int n = snprintf(temp, sizeof(temp), "%s.tmp", kHookCfg);
+    if (n < 0 || (size_t)n >= sizeof(temp)) return 0;
+    FILE *f = fopen(temp, "wb");
+    if (!f) { host_log("cfg: temporary file open failed %s", temp); return 0; }
+    for (int i = 0; i < CFG_N; i++) {
+        if (i == 8) fprintf(f, "%s=%s\n", kCfgKeys[i], v[i] ? "simplicity" : "bandwidth");
+        else fprintf(f, "%s=%d\n", kCfgKeys[i], v[i]);
+    }
+    int ok = fflush(f) == 0 && !ferror(f);
+    if (fclose(f) != 0) ok = 0;
+    if (!ok || !MoveFileExA(temp, kHookCfg, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        host_log("cfg: atomic update failed %s (%lu)", kHookCfg, GetLastError());
+        DeleteFileA(temp);
+        return 0;
+    }
+    return 1;
 }
 
 static void cfg_to_json(const int *v, char *out, size_t n) {
@@ -268,7 +295,16 @@ static void cfg_to_json(const int *v, char *out, size_t n) {
 }
 
 /* ---- 配置：ui.json <-> JSON -------------------------------------------- */
-static const char *kUiKeys[] = {"banner","charts","daily","podcast","choice","skin","pet"};
+static const char *kUiKeys[] = {
+    "banner","charts","daily","podcast","choice","skin","pet",
+    "sidebar_recommend","sidebar_featured","sidebar_podcast","sidebar_fm",
+    "sidebar_community","sidebar_heartbeat","sidebar_more",
+    "main_recommend","main_featured","main_charts","main_recent",
+    "main_liked","main_radar","main_blackvinyl","main_context",
+    "main_daily","main_podcast","main_books",
+    "header_message","header_soundbound","header_skin","header_pet",
+    "header_mini","header_setting"
+};
 #define UI_N ((int)(sizeof(kUiKeys)/sizeof(kUiKeys[0])))
 
 static void ui_read(int *v) {
@@ -424,6 +460,36 @@ static int ep_from_line(const char *line, char *name, size_t n, int *hw) {
     return 1;
 }
 
+static unsigned long long line_ull(const char *line, const char *key) {
+    const char *p = strstr(line ? line : "", key);
+    if (!p) return 0;
+    p += strlen(key);
+    return _strtoui64(p, NULL, 10);
+}
+
+static void verification_json(char *out, size_t n, const char *line) {
+    char *escaped = json_escape(line ? line : "");
+    const char *map = strstr(line ? line : "", "map=");
+    char map_name[32] = "";
+    if (map) sscanf(map + 4, "%31s", map_name);
+    unsigned long long client_frames = line_ull(line, "client_frames=");
+    unsigned long long endpoint_frames = line_ull(line, "endpoint_frames=");
+    unsigned long long verified_frames = line_ull(line, "verified_frames=");
+    unsigned long long changed_bytes = line_ull(line, "changed_bytes=");
+    int exact = map_name[0] && strcmp(map_name, "client-native") == 0
+             && client_frames == endpoint_frames
+             && verified_frames == client_frames
+             && changed_bytes == 0;
+    const char *state = exact ? "bit-perfect" :
+                        (strcmp(map_name, "converted") == 0 ? "converted" : "unverified");
+    snprintf(out, n,
+             "\"verification\":{\"source\":\"unverified\",\"clientToEndpoint\":\"%s\",\"clientFrames\":%llu,\"endpointFrames\":%llu,\"verifiedFrames\":%llu,\"changedBytes\":%llu,\"line\":\"%s\"}",
+             state,
+             client_frames, endpoint_frames, verified_frames, changed_bytes,
+             escaped ? escaped : "");
+    free(escaped);
+}
+
 /* ---- 状态：解析 sink.log 末段 ------------------------------------------ */
 static void status_json(char *out, size_t n) {
     char *tail = read_tail(kSinkLog, 12288);
@@ -431,6 +497,7 @@ static void status_json(char *out, size_t n) {
     char engaged[512] = "";
     char lastline[256] = "";
     char fault[512] = "";
+    char verifier[1024] = "";
     char log_ep[256] = "";
     int  log_hw = -1;
 
@@ -448,6 +515,9 @@ static void status_json(char *out, size_t n) {
         }
         if (strstr(line, "sink failed")) {
             snprintf(fault, sizeof(fault), "%s", line);
+        }
+        if (strstr(line, "hifi verifier:")) {
+            snprintf(verifier, sizeof(verifier), "%s", line);
         }
         if (*line) snprintf(lastline, sizeof(lastline), "%s", line);
         if (!nl) break;
@@ -480,13 +550,57 @@ static void status_json(char *out, size_t n) {
     char *e = json_escape(engaged);
     char *l = json_escape(lastline);
     char *f = json_escape(fault);
-    snprintf(out, n, "{\"loaded\":%s,\"lastEngaged\":\"%s\",\"lastLine\":\"%s\",\"fault\":\"%s\",%s}",
+    char verification[1800];
+    verification_json(verification, sizeof(verification), verifier);
+    snprintf(out, n, "{\"loaded\":%s,\"lastEngaged\":\"%s\",\"lastLine\":\"%s\",\"fault\":\"%s\",%s,%s}",
              engaged[0] || lastline[0] ? "true" : "false",
-             e ? e : "", l ? l : "", f ? f : "", ep);
+             e ? e : "", l ? l : "", f ? f : "", ep, verification);
     free(e); free(l); free(f);
 }
 
 /* ---- 进程 --------------------------------------------------------------- */
+typedef struct {
+    DWORD pid;
+    HWND first;
+    HWND visible;
+} client_window_probe;
+
+static BOOL CALLBACK probe_client_window(HWND hwnd, LPARAM param) {
+    client_window_probe *probe = (client_window_probe *)param;
+    DWORD owner = 0;
+    GetWindowThreadProcessId(hwnd, &owner);
+    if (owner != probe->pid) return TRUE;
+    if (!probe->first) probe->first = hwnd;
+    if (IsWindowVisible(hwnd)) {
+        probe->visible = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static HWND client_window(DWORD pid, int visible_only) {
+    client_window_probe probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.pid = pid;
+    EnumWindows(probe_client_window, (LPARAM)&probe);
+    return visible_only ? probe.visible : (probe.visible ? probe.visible : probe.first);
+}
+
+static int client_window_visible(DWORD pid) {
+    return client_window(pid, 1) != NULL;
+}
+
+static int reveal_client_window(DWORD pid) {
+    HWND hwnd = client_window(pid, 0);
+    if (!hwnd) return 0;
+    ShowWindow(hwnd, SW_RESTORE);
+    ShowWindow(hwnd, SW_SHOWNORMAL);
+    ShowWindowAsync(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    host_log("已请求显示网易云窗口 pid=%lu hwnd=0x%p", (unsigned long)pid, (void *)hwnd);
+    return client_window_visible(pid);
+}
+
 static DWORD find_main_client(void) {
     DWORD pids[64], ppids[64];
     int n = 0;
@@ -503,6 +617,12 @@ static DWORD find_main_client(void) {
     CloseHandle(snap);
     if (!n) return 0;
 
+    /* 网易云的 Shell 启动流程会先留下一个无窗口的启动进程，再创建
+       持有主窗口的 cloudmusic.exe。优先选有可见顶层窗口的实例，避免把
+       DLL 加到启动器或后台子进程里。 */
+    for (int i = 0; i < n; i++)
+        if (client_window_visible(pids[i])) return pids[i];
+
     /* 主进程是唯一一个"父进程不是 cloudmusic.exe"的：渲染、GPU、音频子进程
        的父进程都是主进程。早先按内存挑，页面重载时渲染进程内存暴涨，会把
        模块注入到错误的进程，所以改成看父子关系。 */
@@ -514,8 +634,6 @@ static DWORD find_main_client(void) {
     }
     return pids[0]; /* 只剩子进程：主进程刚退出，交给上层去重启 */
 }
-
-static int client_running(void) { return find_main_client() != 0; }
 
 /* ---- 客户端路径探测 ----------------------------------------------------- */
 /* 优先级：环境变量 > host.cfg > 正在运行的客户端 > 注册表 > 常见安装位置。
@@ -824,24 +942,90 @@ static int resolve_client(void) {
 }
 
 static int launch_client(void) {
-    wchar_t cmd[1024];
-    _snwprintf(cmd, 1024, L"\"%ls\" --remote-debugging-port=%d", kClientExe, CDP_PORT);
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    memset(&si, 0, sizeof(si));
-    si.cb = sizeof(si);
-    memset(&pi, 0, sizeof(pi));
-    if (!CreateProcessW(kClientExe, cmd, NULL, NULL, FALSE, 0, NULL, kClientDir, &si, &pi)) {
+    WCHAR params[256];
+    _snwprintf(params, sizeof(params) / sizeof(params[0]),
+               L"--remote-debugging-port=%d", CDP_PORT);
+    params[(sizeof(params) / sizeof(params[0])) - 1] = 0;
+
+    /* ShellExecuteExW 走网易云正常的启动引导，同时保留 CEF 调试端口。
+       当前版本实测这条路径既创建可见主窗口，也让 9333 监听；窗口显示
+       与页面脚本注入因此回到同一条启动链。 */
+    SHELLEXECUTEINFOW sei;
+    memset(&sei, 0, sizeof(sei));
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"open";
+    sei.lpFile = kClientExe;
+    sei.lpParameters = params;
+    sei.lpDirectory = kClientDir;
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) {
         host_log("启动客户端失败 %lu", GetLastError());
         return 0;
     }
-    host_log("已启动客户端 pid=%lu", (unsigned long)pi.dwProcessId);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
+    DWORD launched = sei.hProcess ? GetProcessId(sei.hProcess) : 0;
+    host_log("已启动客户端 pid=%lu（Shell 启动）", (unsigned long)launched);
+    if (sei.hProcess) CloseHandle(sei.hProcess);
     return 1;
 }
 
+/* 入口命令和托盘菜单都走这里：先把已有的后台实例尝试显示出来，
+   没有可用窗口时才启动一份新的客户端。这样后台 cloudmusic.exe 不会
+   把“打开网易云音乐”这件事挡住。 */
+static int open_client_window(void) {
+    DWORD pid = find_main_client();
+    if (pid) {
+        if (reveal_client_window(pid)) {
+            host_log("复用现有网易云主进程 pid=%lu", (unsigned long)pid);
+            return 1;
+        }
+        host_log("已有网易云主进程但没有可枚举窗口，尝试一次客户端启动");
+        if (!launch_client()) return 0;
+        for (int i = 0; i < 16; i++) {
+            Sleep(500);
+            pid = find_main_client();
+            if (pid && reveal_client_window(pid)) return 1;
+        }
+        return 1;
+    }
+    if (!launch_client()) return 0;
+    for (int i = 0; i < 16; i++) {
+        Sleep(500);
+        pid = find_main_client();
+        if (pid) {
+            reveal_client_window(pid);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* ---- 注入 --------------------------------------------------------------- */
+static int enable_debug_privilege(void) {
+    HANDLE token = NULL;
+    TOKEN_PRIVILEGES privileges;
+    LUID luid;
+    int ok = 0;
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        host_log("SeDebugPrivilege: OpenProcessToken 失败 %lu", GetLastError());
+        return 0;
+    }
+    if (LookupPrivilegeValueW(NULL, L"SeDebugPrivilege", &luid)) {
+        memset(&privileges, 0, sizeof(privileges));
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Luid = luid;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        if (AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges),
+                                  NULL, NULL) && GetLastError() == ERROR_SUCCESS)
+            ok = 1;
+    }
+    if (!ok) host_log("SeDebugPrivilege 未启用，错误 %lu", GetLastError());
+    else host_log("SeDebugPrivilege 已启用");
+    CloseHandle(token);
+    return ok;
+}
+
 static int inject_dll(DWORD pid, const char *dll) {
     size_t len = strlen(dll) + 1;
     HANDLE h = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
@@ -1233,9 +1417,13 @@ static DWORD WINAPI http_thread(LPVOID unused) {
             if (v[1] != 16 && v[1] != 24 && v[1] != 32) v[1] = 24;
             if (v[5] < 0 || v[5] > 2) v[5] = 2;
             if (v[6] < 0 || v[6] > 100) v[6] = 5;
-            cfg_write(v);
-            cfg_to_json(v, out, sizeof(out));
-            http_reply(c, 200, out);
+            if (v[8] != 0 && v[8] != 1) v[8] = 0;
+            if (v[9] != 0 && v[9] != 1) v[9] = 0;
+            if (!cfg_write(v)) http_reply(c, 500, "{\"error\":\"config write failed\"}");
+            else {
+                cfg_to_json(v, out, sizeof(out));
+                http_reply(c, 200, out);
+            }
         } else if (strcmp(path, "/api/ui") == 0 && strcmp(method, "GET") == 0) {
             int v[UI_N];
             ui_read(v);
@@ -1496,6 +1684,7 @@ static int do_install(const wchar_t *client_override) {
 
     int ok = 1;
     ok &= copy_into(src, dst, L"NexExclusive.exe");
+    ok &= copy_into(src, dst, L"NexAudioHost.exe");
     ok &= copy_into(src, dst, L"nexsink.dll");
     ok &= copy_into(src, dst, L"hook.cfg");
     ok &= copy_into(src, dst, L"ui.json");
@@ -1580,7 +1769,7 @@ static int do_uninstall(void) {
 
     /* 删文件。自己正在运行，删不掉，标记重启后删。 */
     static const wchar_t *files[] = {
-        L"nexsink.dll", L"hook.cfg", L"ui.json", L"host.cfg",
+        L"nexsink.dll", L"NexAudioHost.exe", L"hook.cfg", L"ui.json", L"host.cfg",
         L"ui\\panel.js", L"ui\\simplify.js",
         L"host.log", L"sink.log", L"sink.prev.log",
     };
@@ -1626,7 +1815,6 @@ static int do_uninstall(void) {
 static const wchar_t *kVerified[] = {
     L"3.1.42.205594",
 };
-
 static void client_version(wchar_t *out, size_t n) {
     out[0] = 0;
     DWORD dummy = 0;
@@ -1678,6 +1866,7 @@ static void check_client_version(void) {
     if (known) host_log("客户端版本 %s（已验证）", v8);
     else host_log("客户端版本 %s 未经验证——注入可能失效。若出现没声音/没效果，"
                   "先怀疑版本差异，而不是设备或配置。", v8);
+    g_client_verified = known;
 }
 
 /* 程序编成 WINDOWS 子系统，日常运行不弹控制台。但安装、卸载、帮助这些
@@ -1704,6 +1893,7 @@ static void usage(void) {
     printf("NexExclusive %ls - 给网易云客户端加上 WASAPI 独占输出\n\n", APP_VERSION);
     printf("  双击运行                              首次会问要不要安装，装完即用\n");
     printf("  NexExclusive.exe                      启动客户端并注入（默认）\n");
+    printf("  NexExclusive.exe --show               显示/呼出网易云窗口并继续注入\n");
     printf("  NexExclusive.exe --install            安装到 %%LOCALAPPDATA%%\\NexExclusive\n");
     printf("  NexExclusive.exe --install --client <路径>\n");
     printf("                                        安装时指定 cloudmusic.exe\n");
@@ -1739,6 +1929,7 @@ static DWORD g_last_ui_time;
 
 static void watchdog_tick(void) {
     DWORD pid = find_main_client();
+    DWORD now = GetTickCount();
 
     if (!pid) {
         /* 客户端退出了：等它彻底退出再重启，避免反复拉起 */
@@ -1746,7 +1937,7 @@ static void watchdog_tick(void) {
         pid = find_main_client();
         if (!pid) {
             host_log("客户端已退出，重新启动");
-            launch_client();
+            open_client_window();
             g_injected_pid = 0;
             g_ui_injected = 0;
             g_last_page[0] = 0;
@@ -1754,6 +1945,8 @@ static void watchdog_tick(void) {
         }
         return;
     }
+
+    if (!client_window_visible(pid)) reveal_client_window(pid);
 
     if (pid != g_injected_pid || !module_loaded(pid, L"nexsink.dll")) {
         if (inject_dll(pid, kSinkDll)) {
@@ -1766,7 +1959,6 @@ static void watchdog_tick(void) {
 
     /* 页面重载会让 id 变化，界面脚本必须跟着重新注入 */
     char page[128];
-    DWORD now = GetTickCount();
     if (cdp_page_id(page, sizeof(page))) {
         /* 重载后 CEF 的 target id 不变，所以除了 id 变化，还留一道
            5 秒兜底：CEF 的 addScriptToEvaluateOnNewDocument 时灵时不灵，
@@ -1841,13 +2033,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TRAY_EVENT:
         if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) tray_menu(hwnd);
         else if (lp == WM_LBUTTONDBLCLK) {
-            if (!client_running()) launch_client();
+            open_client_window();
         }
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case MENU_CLIENT:
-            if (!client_running()) launch_client();
+            open_client_window();
             break;
         case MENU_LOGS:
             open_logs();
@@ -1878,7 +2070,7 @@ int main(int argc, char **argv) {
 
     WCHAR client_arg[MAX_PATH];
     client_arg[0] = 0;
-    int want_install = 0, want_uninstall = 0, want_help = 0, want_console = 0;
+    int want_install = 0, want_uninstall = 0, want_help = 0, want_console = 0, want_show = 0;
     const char *bad = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -1886,6 +2078,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--uninstall")) want_uninstall = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) want_help = 1;
         else if (!strcmp(argv[i], "--console"))   want_console = 1;
+        else if (!strcmp(argv[i], "--show") || !strcmp(argv[i], "--open")) want_show = 1;
         else if (!strcmp(argv[i], "--client") && i + 1 < argc) {
             MultiByteToWideChar(CP_ACP, 0, argv[++i], -1, client_arg, MAX_PATH);
             client_arg[MAX_PATH - 1] = 0;
@@ -1893,7 +2086,7 @@ int main(int argc, char **argv) {
     }
 
     /* 这些模式是用户在命令行主动发起的，输出必须看得见 */
-    if (want_console || want_install || want_uninstall || want_help) ensure_console();
+    if (want_console || want_show || want_install || want_uninstall || want_help) ensure_console();
 
     if (bad) { fprintf(stderr, "未知参数：%s（试试 --help）\n", bad); return 2; }
     if (want_help) { usage(); return 0; }
@@ -1926,7 +2119,10 @@ int main(int argc, char **argv) {
        别再起一份，直接把装好的那份拉起来。 */
     {
         WCHAR inst[MAX_PATH], self[MAX_PATH], selfdir[MAX_PATH];
-        if (installed_dir(inst, MAX_PATH)) {
+        WCHAR no_redirect[8];
+        int dev_no_redirect = GetEnvironmentVariableW(L"NEX_NO_REDIRECT", no_redirect,
+                                                      sizeof(no_redirect) / sizeof(no_redirect[0])) > 0;
+        if (!dev_no_redirect && installed_dir(inst, MAX_PATH)) {
             self_path(self, MAX_PATH);
             dir_of(self, selfdir, MAX_PATH);
             if (!same_dir(inst, selfdir)) {
@@ -2026,16 +2222,18 @@ int main(int argc, char **argv) {
         host_log("客户端 %s（来源：%s）", cl, g_client_src);
     }
     check_client_version();
+    enable_debug_privilege();
 
     /* 配置服务先起，面板随时可以连上来 */
     CreateThread(NULL, 0, http_thread, NULL, 0, NULL);
 
-    if (!client_running()) {
-        host_log("客户端未运行，开始启动");
-        launch_client();
-        Sleep(4000);
+    DWORD initial_pid = find_main_client();
+    if (want_show || !initial_pid || !client_window_visible(initial_pid)) {
+        host_log(want_show ? "收到呼出网易云窗口命令" : "客户端没有可见窗口，开始呼出");
+        if (!open_client_window())
+            host_log("未能确认网易云可见窗口，继续看护并等待客户端完成启动");
     } else {
-        host_log("客户端已在运行 pid=%lu", (unsigned long)find_main_client());
+        host_log("客户端已在运行 pid=%lu", (unsigned long)initial_pid);
     }
 
     /* 隐藏窗口 + 托盘 + 定时器。看护逻辑在 watchdog_tick 里，由 WM_TIMER 驱动。 */

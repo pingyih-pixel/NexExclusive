@@ -119,6 +119,8 @@ static void prepare_ring(void) {
     g_fake_render.vtbl = g_fake_render_vtbl;
     g_fake_render.ref = 1;
     g_fake_render.generation = g_sink.generation;
+    g_fake_render.capacity = g_sink.reported_frames;
+    g_fake_render.staging = (BYTE *)malloc((size_t)g_fake_render.capacity * g_sink.in_block);
     g_sink.proxy_render = &g_fake_render;
 }
 static void free_ring(void) {
@@ -285,6 +287,11 @@ static void test_valid_format(void) {
     CHECK(valid_pcm_format((WAVEFORMATEX *)&we));
     build_fmt_ex(&we, 96000, 32, 1, 2, mask_for(2));
     CHECK(valid_pcm_format((WAVEFORMATEX *)&we));
+    build_fmt_cv(&we, 96000, 32, 24, 0, 6, 0x3F);
+    CHECK(we.Format.nChannels == 6);
+    CHECK(we.Samples.wValidBitsPerSample == 24);
+    CHECK(we.dwChannelMask == 0x3F);
+    CHECK(valid_pcm_format((WAVEFORMATEX *)&we));
 
     build_fmt_ex(&we, 44100, 16, 0, 2, mask_for(2));
     we.Format.wFormatTag = WAVE_FORMAT_ALAW;
@@ -305,7 +312,86 @@ static void test_valid_format(void) {
     build_fmt_ex(&we, 44100, 16, 0, 2, mask_for(2));
     we.Format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT; /* float must be 32-bit */
     CHECK(!valid_pcm_format((WAVEFORMATEX *)&we));
-    printf("PASS valid_pcm_format: rejects tag/geometry/valid-bit mismatches\n");
+    build_fmt_ex(&we, 44100, 16, 0, 2, mask_for(2));
+    we.dwChannelMask = 0x4;                 /* one speaker bit for two channels */
+    CHECK(!valid_pcm_format((WAVEFORMATEX *)&we));
+
+    build_fmt_ex(&we, 44100, 24, 0, 2, mask_for(2));
+    we.Samples.wValidBitsPerSample = 20;
+    CHECK(valid_pcm_format((WAVEFORMATEX *)&we));
+    printf("PASS valid_pcm_format: validates valid bits and channel-mask geometry\n");
+}
+
+static void test_src_prefer_order(void) {
+    int rates[] = {88200, 96000, 44100, 176400, 48000};
+    prefer_integer_ratios(rates, 5, 88200);
+    CHECK(rates[0] == 88200);
+    CHECK(rates[1] == 44100);
+    CHECK(rates[2] == 176400);
+    CHECK(rates[3] == 96000);
+    CHECK(rates[4] == 48000);
+    printf("PASS src_prefer: integer-ratio candidates precede bandwidth candidates\n");
+}
+
+static void test_dither_policy(void) {
+    CHECK(dither_selected(0, 24, 0, 16, 2, 0));
+    CHECK(!dither_selected(0, 24, 0, 16, 2, 5));
+    CHECK(!dither_selected(0, 24, 0, 24, 2, 0));
+    CHECK(!dither_selected(0, 24, 1, 16, 2, 0));
+    CHECK(dither_selected(0, 24, 0, 24, 1, 5));
+    CHECK(!dither_selected(0, 24, 0, 16, 0, 0));
+    CHECK(!dither_selected(1, 32, 0, 24, 2, 0));
+    CHECK(dither_selected(1, 32, 0, 16, 2, 0));
+    printf("PASS dither policy: auto requires integer depth reduction and fade off\n");
+}
+
+static void test_hifi_config_policy(void) {
+    WCHAR temp[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, temp)) { printf("SKIP hifi policy: no temp path\n"); return; }
+    WCHAR path[MAX_PATH];
+    _snwprintf(path, MAX_PATH, L"%lsNexExclusive-hifi-%lu.cfg", temp,
+               (unsigned long)GetCurrentProcessId());
+    FILE *f = _wfopen(path, L"wb");
+    if (!f) { printf("SKIP hifi policy: cannot create config\n"); return; }
+    fputs("hifi=1\nrate=96000\ncompat=1\ndither=2\nfade_ms=5\nshared_fallback=1\n", f);
+    fclose(f);
+    char utf8[MAX_PATH];
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL);
+    _putenv_s("NEX_CFG", utf8);
+    g_cfg_loaded = 0;
+    load_config();
+    CHECK(g_force_rate == 0);
+    CHECK(g_compat == 0);
+    CHECK(g_dither == 0);
+    CHECK(g_fade_ms == 0);
+    CHECK(g_shared_fallback == 0);
+    DeleteFileW(path);
+    _putenv_s("NEX_CFG", "");
+    g_cfg_loaded = 0;
+    f = _wfopen(path, L"wb");
+    if (!f) { printf("SKIP hifi policy: cannot create compatibility config\n"); return; }
+    fputs("hifi=0\ncompat=1\nshared_fallback=1\n", f);
+    fclose(f);
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL);
+    _putenv_s("NEX_CFG", utf8);
+    g_cfg_loaded = 0;
+    load_config();
+    CHECK(g_hifi == 0);
+    CHECK(g_compat == 1);
+    CHECK(g_shared_fallback == 0);
+    DeleteFileW(path);
+    _putenv_s("NEX_CFG", "");
+    g_cfg_loaded = 0;
+    printf("PASS output policy: strict native disables processing; shared fallback stays off\n");
+}
+
+static void test_hifi_verifier(void) {
+    BYTE source[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    BYTE same[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    BYTE changed[8] = {0, 1, 2, 9, 4, 5, 6, 7};
+    CHECK(hifi_changed_bytes(source, same, sizeof(source)) == 0);
+    CHECK(hifi_changed_bytes(source, changed, sizeof(source)) == 1);
+    printf("PASS hifi verifier: native client PCM comparison counts changed bytes\n");
 }
 
 /* ---- IAudioClient3 ABI -------------------------------------------------- */
@@ -737,6 +823,8 @@ static void test_teardown_with_outstanding_proxy_buffer(void) {
     proxy->vtbl = g_fake_render_vtbl;
     proxy->ref = 2; /* sink-owned plus the simulated client's service reference */
     proxy->generation = g_sink.generation;
+    proxy->capacity = 16;
+    proxy->staging = (BYTE *)malloc((size_t)proxy->capacity * g_sink.in_block);
     g_sink.proxy_render = proxy;
 
     OutstandingBufferThread ctx = { proxy,
@@ -914,8 +1002,11 @@ static DWORD WINAPI stress_producer(LPVOID arg) {
             memset(p, 0, 8);
             SwitchToThread(); /* let Reset/Stop interleave with outstanding data */
             hr = fr_ReleaseBuffer(stress_render, 1, AUDCLNT_BUFFERFLAGS_SILENT);
-            if (hr != S_OK) InterlockedIncrement(&stress_errors);
-        } else if (hr != AUDCLNT_E_BUFFER_TOO_LARGE) {
+            if (hr != S_OK && hr != AUDCLNT_E_DEVICE_INVALIDATED) {
+                InterlockedIncrement(&stress_errors);
+            }
+        } else if (hr != AUDCLNT_E_BUFFER_TOO_LARGE &&
+                   hr != AUDCLNT_E_DEVICE_INVALIDATED) {
             InterlockedIncrement(&stress_errors);
         }
         if ((i & 31) == 0) SwitchToThread();
@@ -929,12 +1020,15 @@ static DWORD WINAPI stress_clock_reader(LPVOID arg) {
         UINT64 pos = 0, qpc = 0;
         UINT32 frames = 0;
         void *service = NULL;
-        if (fc_GetPosition(stress_clock, &pos, &qpc) != S_OK)
+        if (fc_GetPosition(stress_clock, &pos, &qpc) != S_OK) {
             InterlockedIncrement(&stress_errors);
-        if (H_GetBufferSize(stress_owner, &frames) != S_OK || frames != 16)
+        }
+        if (H_GetBufferSize(stress_owner, &frames) != S_OK || frames != 16) {
             InterlockedIncrement(&stress_errors);
-        if (H_GetService(stress_owner, &IID_IAudioRenderClient_l, &service) != S_OK)
+        }
+        if (H_GetService(stress_owner, &IID_IAudioRenderClient_l, &service) != S_OK) {
             InterlockedIncrement(&stress_errors);
+        }
         else fr_Release(service);
         if ((i & 31) == 0) SwitchToThread();
     }
@@ -1374,6 +1468,10 @@ int main(void) {
     test_ring_reserve_limit();
     test_clock();
     test_valid_format();
+    test_src_prefer_order();
+    test_dither_policy();
+    test_hifi_config_policy();
+    test_hifi_verifier();
     test_unregistered_vtable_and_internal_activate();
     test_patch_records();
     test_drain();

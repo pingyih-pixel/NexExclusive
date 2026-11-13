@@ -17,11 +17,11 @@
 | Product | NexExclusive 1.0.0 |
 | Publisher | 无签名（unsigned，个人项目） |
 
-文件哈希（1.0.0 构建）：
+文件哈希：**必须填你实际上传的那两个文件**，不要照抄旧值。Zig 的产物换一个输出路径哈希就会变
+（PDB 绝对路径写进了 PE 调试目录），重新编译一次就对不上了。在安装目录里取：
 
-```
-NexExclusive.exe  6516c6c6f56bf9e568e8b633663a7bbff05418a46f9a6d185f6f227698acfff3
-nexsink.dll       9421376be2b0d6014b182c30208336d31251389db3ea019234943cc94d486a75
+```powershell
+Get-FileHash .\NexExclusive.exe, .\nexsink.dll -Algorithm SHA256
 ```
 
 ## 可直接粘贴的英文正文
@@ -35,8 +35,11 @@ Windows shared-mode audio engine, which resamples everything to the system mix
 format. NexExclusive makes the player open its output device in WASAPI exclusive
 mode instead, so the original sample rate reaches the DAC unmodified.
 
-The application is a single 320 KB executable plus one 277 KB DLL. It has no
-installer framework, no auto-updater, no network code, and no telemetry.
+The application is a single 324 KB executable plus one 278 KB DLL. It has no
+installer framework, no auto-updater, no telemetry, and no outbound network
+access. The only sockets it opens are local: an HTTP server bound to
+127.0.0.1:9334 that serves the settings panel, and a client connection to the
+player's own Chrome DevTools port on 127.0.0.1:9333. Nothing leaves the machine.
 ```
 
 ### Why it loads a DLL into another process
@@ -51,7 +54,7 @@ IAudioClient / IMMDevice vtable entries, then answer the negotiation with the
 device's real exclusive-mode capabilities.
 
 The DLL is loaded by the launcher with the standard sequence:
-OpenProcess -> VirtualAllocEx -> WriteProcessMemory -> CreateRemoteThread(LoadLibraryW).
+OpenProcess -> VirtualAllocEx -> WriteProcessMemory -> CreateRemoteThread(LoadLibraryA).
 That is the textbook process-injection pattern, and we understand it is what
 triggers a behavior-based detection. It is used here for a legitimate purpose:
 the target process is a local music player started by our own launcher, the DLL
@@ -62,9 +65,14 @@ player's audio stream opens the sound device in exclusive mode.
 ### What the software does NOT do
 
 ```
-- No network activity of any kind (no sockets, no HTTP, no telemetry, no update check)
+- No outbound network access and no telemetry. The host opens two loopback-only
+  sockets: an HTTP server on 127.0.0.1:9334 that serves the settings panel, and a
+  client connection to the player's own DevTools port on 127.0.0.1:9333. There is
+  no Internet traffic, no update check, and no data collection
 - No defence evasion: it never touches Defender, AMSI, ETW, event logs, or any
-  security product; it does not unhook, patch, or hide anything
+  other security product, and it does not unhook or hide anything belonging to
+  the system. The only memory it modifies is the vtable of the player's own audio
+  interfaces (IMMDevice / IAudioClient), inside the player's process
 - No privilege escalation: it runs as the current user, never requests admin
 - No kernel component: no driver, no service, no boot-time component
 - No persistence beyond two standard, user-visible entries written by the
@@ -87,7 +95,7 @@ security controls. It does not. The behaviour that most likely drives the score 
 shortcut, and injects a DLL into another process". Each of those is also common in
 droppers, so the combination scores high - but in this case every step is
 performed openly, by a user-initiated installer, with a visible uninstall entry,
-and the injected code is a signed-nothing but fully inspectable 277 KB DLL that
+and the injected code is an unsigned but fully inspectable 278 KB DLL that
 only implements audio format negotiation.
 ```
 
@@ -120,13 +128,15 @@ WDSI 常见回信是「仍判定为威胁」。可以做的：
 
 1. **改注入方式**再提交一次。现在是最典型的 `VirtualAllocEx` + `CreateRemoteThread`。换成「代理 DLL」——把转发导出表的 `version.dll` / `winmm.dll` 放在客户端目录旁，客户端加载它时顺带加载 `nexsink.dll`。没有跨进程写入，没有远程线程，行为特征完全不同。代价：要写客户端安装目录，装在 `Program Files` 时没权限。
 2. **代码签名**。对 `!ml` 行为判定帮助有限（签名不能证明行为无害），但能显著降低 SmartScreen 和云查杀的分数，也更容易让分析员认真看材料。
-3. **开源仓库 + 公开构建**。分析员能看到源码和 CI 产物时，误报申诉通过率明显更高。这也是为什么「要不要公开仓库」值得单独决策。
+3. **开源仓库 + 公开构建**（已完成）。仓库 <https://github.com/pingyih-pixel/NexExclusive> 公开，
+   CI 在 `windows-latest` 上跑同一套脚本出包。分析员可以直接对照源码与产物。
 
 ## 期间的分发办法
 
 在误报解决之前，Release 页面必须写清楚：
 
-- 首次运行前把安装目录加入排除项（管理员），否则 exe 会被隔离
+- 首次运行前给 `NexExclusive.exe` 和 `nexsink.dll` 这两个文件加排除项（管理员），否则 exe 会被隔离
+- 不要给整个目录加排除：那个目录对当前用户可写，整体排除等于让放进去的任何文件都不再被扫描
 - 给出确切命令，不要只说「加个白名单」
 - 明确写「不想加排除项就别用，不要为了这个关掉实时保护」
 
