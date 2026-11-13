@@ -39,6 +39,12 @@ jobs:
         shell: bash
         run: bash mod/build.sh test
 
+      - name: 宿主与界面契约
+        shell: pwsh
+        run: |
+          node mod/tools/nexhost.contract.test.js
+          node mod/ui/panel.contract.test.js
+
       - name: 构建并打包
         shell: bash
         run: bash release.sh

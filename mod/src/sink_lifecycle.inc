@@ -136,13 +136,16 @@ static HRESULT sink_teardown(void) {
     if (was_remote) remote_close();
     if (g_sink.hifi_map) {
         log_line("hifi verifier: map=%s client_frames=%llu endpoint_frames=%llu "
-                 "verified_frames=%llu changed_bytes=%llu converted_frames=%llu "
+                 "verified_frames=%llu changed_bytes=%llu dropped_frames=%llu "
+                 "underrun_events=%llu converted_frames=%llu "
                  "first_mismatch=%s%llu+%lu client_hash=%016llX endpoint_hash=%016llX",
                  g_sink.hifi_map == 1 ? "client-native" : "converted",
                  (unsigned long long)g_sink.hifi_client_frames,
                  (unsigned long long)g_sink.hifi_endpoint_frames,
                  (unsigned long long)g_sink.hifi_verified_frames,
                  (unsigned long long)g_sink.hifi_changed_bytes,
+                 (unsigned long long)g_sink.hifi_dropped_frames,
+                 (unsigned long long)g_sink.hifi_underrun_events,
                  (unsigned long long)g_sink.hifi_converted_frames,
                  g_sink.hifi_first_mismatch_frame == ~(UINT64)0 ? "none:" : "",
                  g_sink.hifi_first_mismatch_frame == ~(UINT64)0 ? 0 : g_sink.hifi_first_mismatch_frame,

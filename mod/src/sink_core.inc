@@ -25,21 +25,28 @@ static int g_cfg_loaded  = 0;
    干净（后者在 -Wall 下会报指针类型不匹配）。 */
 extern IMAGE_DOS_HEADER __ImageBase;
 
-static void module_dir(char *out, size_t n) {
+static int module_dir(char *out, size_t n) {
+    if (!out || n == 0) return 0;
     out[0] = 0;
     HMODULE self = NULL;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             (LPCWSTR)&__ImageBase, &self))
-        return;
+        return 0;
     WCHAR wpath[MAX_PATH];
     DWORD len = GetModuleFileNameW(self, wpath, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) return;
+    if (len == 0 || len >= MAX_PATH) return 0;
     WCHAR *slash = wcsrchr(wpath, L'\\');
-    if (!slash) return;
+    if (!slash) return 0;
     slash[1] = L'\0';
-    if (WideCharToMultiByte(CP_ACP, 0, wpath, -1, out, (int)n, NULL, NULL) <= 0)
+    BOOL used_default = FALSE;
+    int converted = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wpath, -1,
+                                        out, (int)n, NULL, &used_default);
+    if (converted <= 0 || used_default || (size_t)converted > n) {
         out[0] = 0;
+        return 0;
+    }
+    return 1;
 }
 
 /* ---- logging ------------------------------------------------------------ */
@@ -131,6 +138,8 @@ typedef struct {
     UINT64         hifi_converted_frames;
     UINT64         hifi_client_frames;
     UINT64         hifi_endpoint_frames;
+    UINT64         hifi_dropped_frames;
+    UINT64         hifi_underrun_events;
     UINT64         hifi_first_mismatch_frame;
     UINT32         hifi_first_mismatch_byte;
     UINT64         hifi_client_hash;
@@ -337,13 +346,16 @@ static DWORD mask_for(int ch) {
 static void config_path(char *out, size_t n) {
     const char *env = getenv("NEX_CFG");
     if (env && *env) { snprintf(out, n, "%s", env); return; }
-    module_dir(out, n);
-    strncat(out, "hook.cfg", n - strlen(out) - 1);
+    if (!module_dir(out, n)) { out[0] = 0; return; }
+    size_t used = strlen(out);
+    if (used + strlen("hook.cfg") + 1 > n) out[0] = 0;
+    else memcpy(out + used, "hook.cfg", strlen("hook.cfg") + 1);
 }
 
 static void load_config(void) {
     char path[MAX_PATH];
     config_path(path, sizeof(path));
+    if (!path[0]) return;
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return;
     if (g_cfg_loaded && CompareFileTime(&fad.ftLastWriteTime, &g_cfg_mtime) == 0) return;

@@ -109,18 +109,21 @@ int wmain(int argc, wchar_t **argv) {
     const wchar_t *map_name = arg_value(argc, argv, L"--map");
     const wchar_t *data_name = arg_value(argc, argv, L"--data");
     const wchar_t *space_name = arg_value(argc, argv, L"--space");
-    if (!map_name || !data_name || !space_name) return 2;
+    const wchar_t *ready_name = arg_value(argc, argv, L"--ready");
+    if (!map_name || !data_name || !space_name || !ready_name) return 2;
     if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) return 3;
 
     HANDLE map = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, map_name);
     HANDLE data_event = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, data_name);
     HANDLE space_event = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, space_name);
+    HANDLE ready_event = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, ready_name);
     NexAudioIpc *ipc = map ? (NexAudioIpc *)MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(NexAudioIpc)) : NULL;
-    if (!ipc || !data_event || !space_event || ipc->magic != NEX_AUDIO_MAGIC) {
+    if (!ipc || !data_event || !space_event || !ready_event || ipc->magic != NEX_AUDIO_MAGIC) {
         if (ipc) UnmapViewOfFile(ipc);
         if (map) CloseHandle(map);
         if (data_event) CloseHandle(data_event);
         if (space_event) CloseHandle(space_event);
+        if (ready_event) CloseHandle(ready_event);
         CoUninitialize();
         return 4;
     }
@@ -167,7 +170,8 @@ int wmain(int argc, wchar_t **argv) {
         if (client) IAudioClient_Release(client);
         if (device) IMMDevice_Release(device);
         if (audio_event) CloseHandle(audio_event);
-        UnmapViewOfFile(ipc); CloseHandle(map); CloseHandle(data_event); CloseHandle(space_event);
+        if (ready_event) SetEvent(ready_event);
+        UnmapViewOfFile(ipc); CloseHandle(map); CloseHandle(data_event); CloseHandle(space_event); CloseHandle(ready_event);
         CoUninitialize();
         return 5;
     }
@@ -175,8 +179,10 @@ int wmain(int argc, wchar_t **argv) {
     hr = IAudioClient_Start(client);
     if (FAILED(hr)) {
         fail_link(ipc, hr);
+        SetEvent(ready_event);
     } else {
         InterlockedExchange((volatile LONG *)&ipc->state, NEX_AUDIO_READY);
+        SetEvent(ready_event);
         unsigned long long endpoint_hash = 1469598103934665603ull;
         HANDLE waits[2] = { data_event, audio_event };
         while (InterlockedCompareExchange((volatile LONG *)&ipc->state, 0, 0) != NEX_AUDIO_CLOSING) {
@@ -185,6 +191,8 @@ int wmain(int argc, wchar_t **argv) {
                 for (;;) {
                     int result = consume(ipc, render, client, device_frames, &endpoint_hash);
                     if (result <= 0) {
+                        if (result == 0 && wait == WAIT_OBJECT_0 + 1)
+                            InterlockedIncrement64((volatile LONG64 *)&ipc->underrun_events);
                         if (result < 0) {
                             fail_link(ipc, E_FAIL);
                             break;
@@ -201,6 +209,7 @@ int wmain(int argc, wchar_t **argv) {
     if (client) IAudioClient_Release(client);
     if (device) IMMDevice_Release(device);
     if (audio_event) CloseHandle(audio_event);
+    CloseHandle(ready_event);
     UnmapViewOfFile(ipc); CloseHandle(map); CloseHandle(data_event); CloseHandle(space_event);
     CoUninitialize();
     return 0;

@@ -609,8 +609,13 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         const char *env = getenv("NEX_LOG");
         if (env && *env) { strncpy(g_log, env, sizeof(g_log) - 1); g_log[sizeof(g_log) - 1] = 0; }
         else {
-            module_dir(g_log, sizeof(g_log));
-            strncat(g_log, "sink.log", sizeof(g_log) - strlen(g_log) - 1);
+            if (!module_dir(g_log, sizeof(g_log))) g_log[0] = 0;
+            else {
+                size_t used = strlen(g_log);
+                if (used + strlen("sink.log") + 1 <= sizeof(g_log))
+                    memcpy(g_log + used, "sink.log", strlen("sink.log") + 1);
+                else g_log[0] = 0;
+            }
         }
 
         g_fake_render.vtbl = g_fake_render_vtbl;

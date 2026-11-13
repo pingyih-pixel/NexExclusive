@@ -104,7 +104,7 @@ build_host() {
     "$CC" cc "${FLAGS[@]}" -Wl,--subsystem,windows \
         -o "$OUT_DIR/NexExclusive.exe" "$MOD_DIR/tools/nexhost.c" "$res" \
         -lws2_32 -lole32 -loleaut32 -ladvapi32 -lshell32 -luser32 -lgdi32 \
-        -lversion -lcomdlg32
+        -lversion -lcomdlg32 -lbcrypt
     rm -f -- "$rc" "$res" "$OUT_DIR/nexhost.manifest"
     # 配置只在缺失时复制——用户可能改过；界面脚本是代码，每次都覆盖。
     local f
@@ -113,7 +113,12 @@ build_host() {
     done
     if [[ -d "$MOD_DIR/ui" ]]; then
         mkdir -p "$OUT_DIR/ui"
-        cp -- "$MOD_DIR/ui/panel.js" "$MOD_DIR/ui/simplify.js" "$OUT_DIR/ui/"
+        if [[ "$OUT_DIR/ui/panel.js" != "$MOD_DIR/ui/panel.js" ]]; then
+            cp -- "$MOD_DIR/ui/panel.js" "$OUT_DIR/ui/panel.js"
+        fi
+        if [[ "$OUT_DIR/ui/simplify.js" != "$MOD_DIR/ui/simplify.js" ]]; then
+            cp -- "$MOD_DIR/ui/simplify.js" "$OUT_DIR/ui/simplify.js"
+        fi
     fi
     printf '已构建到 %s：NexExclusive.exe（含 hook.cfg / ui.json / ui/）\n' "$OUT_DIR"
 }

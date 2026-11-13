@@ -82,6 +82,10 @@ Start-Process `
   -WorkingDirectory "$env:LOCALAPPDATA\NexExclusive"
 ```
 
+发布包带有 `manifest.txt`。安装前宿主会校验清单，手工检查可运行
+`NexExclusive.exe --verify`。配置服务只接受网易云页面的 `orpheus://orpheus` 来源，
+POST 请求必须使用 `application/json`。
+
 宿主与网易云需要处于同一完整性级别。宿主日志出现 `OpenProcess(<pid>) 失败 5` 时，先结束普通权限宿主，再以管理员身份启动宿主；不要重复注入同一个已经加载 `nexsink.dll` 的进程。
 
 ## 日志验收
@@ -117,7 +121,7 @@ sink: hardware started ...
 
 状态栏里的“独占未接管”表示最近一次独占尝试失败，播放仍由客户端当前路径提供。常见错误码：`0x8889000A` 是上一代独占流仍占用端点，`0x88890008` 是设备不接受当前原格式，严格原样下应切换到原率优先，`0x8889000F` 是端点创建失败。共享回退始终关闭。
 
-`/api/status` 里的 `verification` 对象来自最近一条 `hifi verifier` 日志，包含 `clientFrames`、`endpointFrames`、`verifiedFrames` 和 `changedBytes`。`clientToEndpoint=bit-perfect` 只代表客户端 PCM 到独占端点逐样本一致；`source=unverified` 明确保留网易云解码器入口之前没有逐样本证据这一边界。
+`/api/status` 里的 `verification` 对象来自最近一条 `hifi verifier` 日志，包含 `clientFrames`、`endpointFrames`、`verifiedFrames`、`changedBytes`、`droppedFrames` 和 `underrunEvents`。`clientToEndpoint=bit-perfect` 只代表客户端 PCM 到独占端点逐样本一致；`source=unverified` 明确保留网易云解码器入口之前没有逐样本证据这一边界。
 
 网易云从资源管理器普通启动时，通常没有 `9333` 调试端口；这时面板脚本无法从宿主注入。要同时得到面板与音频链路，应由宿主启动客户端，并确认 `host.log` 没有连续的 `CDP 端口未就绪`。
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 打发布包：编译 → 只挑出运行时要的 6 个文件 → 加安装说明 → 压 zip → 出校验和与
+# 打发布包：编译 → 只挑出运行时要的 7 个文件 → 生成包内清单 → 加安装说明 → 压 zip → 出校验和与
 # Release 说明。产物全在 dist/ 下，不碰构建目录，也不会把 .pdb / 测试工具塞进去。
 #
 #   ./release.sh              用 nexhost.c 里的 APP_VERSION
@@ -43,7 +43,7 @@ rm -rf -- "$STAGE" "$BUILD"
 mkdir -p -- "$STAGE" "$BUILD"
 OUT_DIR="$BUILD" bash "$MOD_DIR/build.sh" all
 
-# 发布包里只要这 6 个。player.exe / inject*.exe / *_eps.exe 是开发和诊断用的，
+# 发布包里只要这 7 个。player.exe / inject*.exe / *_eps.exe 是开发和诊断用的，
 # 放进去只会让用户困惑，也会让杀软多几个可疑样本。
 FILES=(NexExclusive.exe NexAudioHost.exe nexsink.dll hook.cfg ui.json ui/panel.js ui/simplify.js)
 printf '==> 收集文件\n'
@@ -58,6 +58,9 @@ for f in "${FILES[@]}"; do
     mkdir -p -- "$(dirname -- "$STAGE/$f")"
     cp -- "$BUILD/$f" "$STAGE/$f"
 done
+
+printf '==> 写包内清单\n'
+( cd "$STAGE" && sha256sum "${FILES[@]}" > manifest.txt )
 
 printf '==> 写安装说明\n'
 cat > "$STAGE/README.txt" <<EOF
@@ -74,6 +77,7 @@ NexExclusive $VER —— 给网易云音乐客户端加上 WASAPI 独占输出
   想在命令行里装：
     NexExclusive.exe --install
     NexExclusive.exe --install --client "D:\...\cloudmusic.exe"   （客户端装在非常规位置时）
+    NexExclusive.exe --verify
     NexExclusive.exe --uninstall
     NexExclusive.exe --help
 
@@ -169,7 +173,7 @@ $NAME.zip    $SIZE KB
 sha256       $SHA
 \`\`\`
 
-包内：\`NexExclusive.exe\`、\`NexAudioHost.exe\`、\`nexsink.dll\`、\`hook.cfg\`、\`ui.json\`、\`ui/\`、\`README.txt\`。
+包内：\`NexExclusive.exe\`、\`NexAudioHost.exe\`、\`nexsink.dll\`、\`hook.cfg\`、\`ui.json\`、\`ui/\`、\`manifest.txt\`、\`README.txt\`。
 
 ## 验证环境
 

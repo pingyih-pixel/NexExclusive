@@ -26,6 +26,7 @@
 #include <shlguid.h>
 #include <commdlg.h>
 #include <winver.h>
+#include <bcrypt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,38 +57,56 @@ static wchar_t kClientExe[MAX_PATH];
 static wchar_t kClientDir[MAX_PATH];
 static const char *g_client_src = "(未找到)";
 static int g_client_verified;
+static char g_panel_script_id[128];
+static char g_simplify_script_id[128];
 
-static void module_dir(char *out, size_t n) {
+static int module_dir(char *out, size_t n) {
+    if (!out || n == 0) return 0;
     out[0] = 0;
     HMODULE self = NULL;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             (LPCWSTR)&__ImageBase, &self))
-        return;
+        return 0;
     WCHAR wpath[MAX_PATH];
     DWORD len = GetModuleFileNameW(self, wpath, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) return;
+    if (len == 0 || len >= MAX_PATH) return 0;
     WCHAR *slash = wcsrchr(wpath, L'\\');
-    if (!slash) return;
+    if (!slash) return 0;
     slash[1] = L'\0';
-    if (WideCharToMultiByte(CP_ACP, 0, wpath, -1, out, (int)n, NULL, NULL) <= 0)
+    BOOL used_default = FALSE;
+    int converted = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wpath, -1,
+                                        out, (int)n, NULL, &used_default);
+    if (converted <= 0 || used_default || (size_t)converted > n) {
         out[0] = 0;
+        return 0;
+    }
+    return 1;
 }
 
-static void join_into(char *out, size_t n, const char *rel) {
-    snprintf(out, n, "%s%s", g_base, rel);
+static int join_into(char *out, size_t n, const char *rel) {
+    if (!out || n == 0 || !g_base[0] || !rel) {
+        if (out && n) out[0] = 0;
+        return 0;
+    }
+    int written = snprintf(out, n, "%s%s", g_base, rel);
+    if (written < 0 || (size_t)written >= n) {
+        out[0] = 0;
+        return 0;
+    }
+    return 1;
 }
 
-static void resolve_paths(void) {
-    module_dir(g_base, sizeof(g_base));
-    join_into(kSinkDll,    sizeof(kSinkDll),    "nexsink.dll");
-    join_into(kHookCfg,    sizeof(kHookCfg),    "hook.cfg");
-    join_into(kUiJson,     sizeof(kUiJson),     "ui.json");
-    join_into(kSinkLog,    sizeof(kSinkLog),    "sink.log");
-    join_into(kHostLog,    sizeof(kHostLog),    "host.log");
-    join_into(kPanelJs,    sizeof(kPanelJs),    "ui\\panel.js");
-    join_into(kSimplifyJs, sizeof(kSimplifyJs), "ui\\simplify.js");
-    join_into(kHostCfg,    sizeof(kHostCfg),    "host.cfg");
+static int resolve_paths(void) {
+    if (!module_dir(g_base, sizeof(g_base))) return 0;
+    return join_into(kSinkDll,    sizeof(kSinkDll),    "nexsink.dll") &&
+           join_into(kHookCfg,    sizeof(kHookCfg),    "hook.cfg") &&
+           join_into(kUiJson,     sizeof(kUiJson),     "ui.json") &&
+           join_into(kSinkLog,    sizeof(kSinkLog),    "sink.log") &&
+           join_into(kHostLog,    sizeof(kHostLog),    "host.log") &&
+           join_into(kPanelJs,    sizeof(kPanelJs),    "ui\\panel.js") &&
+           join_into(kSimplifyJs, sizeof(kSimplifyJs), "ui\\simplify.js") &&
+           join_into(kHostCfg,    sizeof(kHostCfg),    "host.cfg");
 }
 
 /* ---- 日志 --------------------------------------------------------------- */
@@ -315,14 +334,23 @@ static void ui_read(int *v) {
     free(txt);
 }
 
-static void ui_write(const int *v) {
-    FILE *f = fopen(kUiJson, "w");
-    if (!f) return;
+static int ui_write(const int *v) {
+    char temp[MAX_PATH];
+    int n = snprintf(temp, sizeof(temp), "%s.tmp", kUiJson);
+    if (n < 0 || (size_t)n >= sizeof(temp)) return 0;
+    FILE *f = fopen(temp, "wb");
+    if (!f) return 0;
     fprintf(f, "{\n");
     for (int i = 0; i < UI_N; i++)
         fprintf(f, "  \"%s\": %d%s\n", kUiKeys[i], v[i], i + 1 < UI_N ? "," : "");
     fprintf(f, "}\n");
-    fclose(f);
+    int ok = fflush(f) == 0 && !ferror(f);
+    if (fclose(f) != 0) ok = 0;
+    if (!ok || !MoveFileExA(temp, kUiJson, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(temp);
+        return 0;
+    }
+    return 1;
 }
 
 static void ui_to_json(const int *v, char *out, size_t n) {
@@ -476,6 +504,8 @@ static void verification_json(char *out, size_t n, const char *line) {
     unsigned long long endpoint_frames = line_ull(line, "endpoint_frames=");
     unsigned long long verified_frames = line_ull(line, "verified_frames=");
     unsigned long long changed_bytes = line_ull(line, "changed_bytes=");
+    unsigned long long dropped_frames = line_ull(line, "dropped_frames=");
+    unsigned long long underrun_events = line_ull(line, "underrun_events=");
     int exact = map_name[0] && strcmp(map_name, "client-native") == 0
              && client_frames == endpoint_frames
              && verified_frames == client_frames
@@ -483,9 +513,10 @@ static void verification_json(char *out, size_t n, const char *line) {
     const char *state = exact ? "bit-perfect" :
                         (strcmp(map_name, "converted") == 0 ? "converted" : "unverified");
     snprintf(out, n,
-             "\"verification\":{\"source\":\"unverified\",\"clientToEndpoint\":\"%s\",\"clientFrames\":%llu,\"endpointFrames\":%llu,\"verifiedFrames\":%llu,\"changedBytes\":%llu,\"line\":\"%s\"}",
+             "\"verification\":{\"source\":\"unverified\",\"clientToEndpoint\":\"%s\",\"clientFrames\":%llu,\"endpointFrames\":%llu,\"verifiedFrames\":%llu,\"changedBytes\":%llu,\"droppedFrames\":%llu,\"underrunEvents\":%llu,\"line\":\"%s\"}",
              state,
              client_frames, endpoint_frames, verified_frames, changed_bytes,
+             dropped_frames, underrun_events,
              escaped ? escaped : "");
     free(escaped);
 }
@@ -980,24 +1011,9 @@ static int open_client_window(void) {
             return 1;
         }
         host_log("已有网易云主进程但没有可枚举窗口，尝试一次客户端启动");
-        if (!launch_client()) return 0;
-        for (int i = 0; i < 16; i++) {
-            Sleep(500);
-            pid = find_main_client();
-            if (pid && reveal_client_window(pid)) return 1;
-        }
-        return 1;
+        return launch_client();
     }
-    if (!launch_client()) return 0;
-    for (int i = 0; i < 16; i++) {
-        Sleep(500);
-        pid = find_main_client();
-        if (pid) {
-            reveal_client_window(pid);
-            return 1;
-        }
-    }
-    return 0;
+    return launch_client();
 }
 
 /* ---- 注入 --------------------------------------------------------------- */
@@ -1026,12 +1042,48 @@ static int enable_debug_privilege(void) {
     return ok;
 }
 
+static int process_bitness_compatible(HANDLE target) {
+    typedef BOOL (WINAPI *IsWow64Process2Fn)(HANDLE, USHORT *, USHORT *);
+    IsWow64Process2Fn is_wow64_process2 = (IsWow64Process2Fn)GetProcAddress(
+        GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2");
+    if (is_wow64_process2) {
+        USHORT host_process = IMAGE_FILE_MACHINE_UNKNOWN, host_native = IMAGE_FILE_MACHINE_UNKNOWN;
+        USHORT target_process = IMAGE_FILE_MACHINE_UNKNOWN, target_native = IMAGE_FILE_MACHINE_UNKNOWN;
+        if (is_wow64_process2(GetCurrentProcess(), &host_process, &host_native) &&
+            is_wow64_process2(target, &target_process, &target_native)) {
+            if (host_native != target_native) return 0;
+            if (host_process == IMAGE_FILE_MACHINE_UNKNOWN &&
+                target_process != IMAGE_FILE_MACHINE_UNKNOWN) return 0;
+            if (host_process != IMAGE_FILE_MACHINE_UNKNOWN &&
+                target_process == IMAGE_FILE_MACHINE_UNKNOWN) return 0;
+            return 1;
+        }
+    }
+
+    BOOL host_wow64 = FALSE, target_wow64 = FALSE;
+    if (IsWow64Process(GetCurrentProcess(), &host_wow64) &&
+        IsWow64Process(target, &target_wow64)) {
+#if defined(_WIN64)
+        return !target_wow64;
+#else
+        return target_wow64;
+#endif
+    }
+    return 1;
+}
+
 static int inject_dll(DWORD pid, const char *dll) {
     size_t len = strlen(dll) + 1;
     HANDLE h = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
                            PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
                            FALSE, pid);
     if (!h) { host_log("注入: OpenProcess(%lu) 失败 %lu", (unsigned long)pid, GetLastError()); return 0; }
+
+    if (!process_bitness_compatible(h)) {
+        host_log("注入: 拒绝位数不匹配 pid=%lu", (unsigned long)pid);
+        CloseHandle(h);
+        return 0;
+    }
 
     void *remote = VirtualAllocEx(h, NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!remote) {
@@ -1269,17 +1321,49 @@ static int cdp_eval(SOCKET s, const char *js, int id) {
     return ok;
 }
 
-/* 注册成"每次文档加载都执行"。页面重载后 CEF 的 target id 不变，
-   靠比较 id 判断重载是不可靠的，交给浏览器自己重放最稳。 */
-static int cdp_add_script(SOCKET s, int id, const char *js) {
+/* 注册成"每次文档加载都执行"。保存 identifier，下一次更新前先移除旧脚本，
+   避免宿主长时间运行后在页面加载链上累积副本。 */
+static int cdp_add_script(SOCKET s, int id, const char *js,
+                          char *script_id, size_t script_id_n) {
     char *esc = json_escape(js);
     if (!esc) return 0;
     size_t cap = strlen(esc) + 64;
     char *params = (char *)malloc(cap);
     if (!params) { free(esc); return 0; }
     snprintf(params, cap, "{\"source\":\"%s\"}", esc);
-    int ok = cdp_cmd(s, id, "Page.addScriptToEvaluateOnNewDocument", params);
+    size_t msg_cap = strlen(params) + 128;
+    char *msg = (char *)malloc(msg_cap);
+    if (!msg) { free(params); free(esc); return 0; }
+    snprintf(msg, msg_cap, "{\"id\":%d,\"method\":\"Page.addScriptToEvaluateOnNewDocument\",\"params\":%s}", id, params);
+    char resp[2048];
+    int ok = ws_send_text(s, msg, resp, sizeof(resp));
+    if (ok && strstr(resp, "\"error\"")) {
+        host_log("CDP Page.addScriptToEvaluateOnNewDocument 被拒绝: %.200s", resp);
+        ok = 0;
+    }
+    if (ok && script_id && script_id_n) {
+        const char *p = strstr(resp, "\"identifier\":\"");
+        if (p) {
+            p += strlen("\"identifier\":\"");
+            size_t i = 0;
+            while (*p && *p != '\"' && i + 1 < script_id_n) script_id[i++] = *p++;
+            script_id[i] = 0;
+            if (!i) ok = 0;
+        } else ok = 0;
+    }
+    free(msg);
     free(params);
+    free(esc);
+    return ok;
+}
+
+static int cdp_remove_script(SOCKET s, int id, const char *script_id) {
+    if (!script_id || !script_id[0]) return 1;
+    char *esc = json_escape(script_id);
+    if (!esc) return 0;
+    char params[256];
+    snprintf(params, sizeof(params), "{\"identifier\":\"%s\"}", esc);
+    int ok = cdp_cmd(s, id, "Page.removeScriptToEvaluateOnNewDocument", params);
     free(esc);
     return ok;
 }
@@ -1296,16 +1380,24 @@ static int inject_ui_once(void) {
     if (s == INVALID_SOCKET) return 0;
 
     int ok = 0, id = 1;
+    if (g_panel_script_id[0]) {
+        cdp_remove_script(s, id++, g_panel_script_id);
+        g_panel_script_id[0] = 0;
+    }
+    if (g_simplify_script_id[0]) {
+        cdp_remove_script(s, id++, g_simplify_script_id);
+        g_simplify_script_id[0] = 0;
+    }
     char *panel = read_file(kPanelJs);
     if (panel) {
         if (cdp_eval(s, panel, id++)) ok = 1;
-        if (cdp_add_script(s, id++, panel)) ok = 1;
+        if (cdp_add_script(s, id++, panel, g_panel_script_id, sizeof(g_panel_script_id))) ok = 1;
         free(panel);
     }
     char *simp = read_file(kSimplifyJs);
     if (simp) {
         if (cdp_eval(s, simp, id++)) ok = 1;
-        if (cdp_add_script(s, id++, simp)) ok = 1;
+        if (cdp_add_script(s, id++, simp, g_simplify_script_id, sizeof(g_simplify_script_id))) ok = 1;
         free(simp);
     }
     closesocket(s);
@@ -1323,17 +1415,58 @@ static void send_all(SOCKET c, const char *buf, size_t n) {
     }
 }
 
+static int http_header_value(const char *req, const char *name, char *out, size_t n) {
+    size_t name_len = strlen(name);
+    const char *line = req;
+    if (!out || n == 0) return 0;
+    out[0] = 0;
+    while (line && *line) {
+        const char *end = strstr(line, "\r\n");
+        if (!end) break;
+        if ((size_t)(end - line) > name_len &&
+            _strnicmp(line, name, name_len) == 0 && line[name_len] == ':') {
+            const char *value = line + name_len + 1;
+            while (value < end && (*value == ' ' || *value == '\t')) value++;
+            size_t len = (size_t)(end - value);
+            while (len && (value[len - 1] == ' ' || value[len - 1] == '\t')) len--;
+            if (len >= n) len = n - 1;
+            memcpy(out, value, len);
+            out[len] = 0;
+            return 1;
+        }
+        line = end + 2;
+    }
+    return 0;
+}
+
+static int http_allowed_host(const char *host) {
+    return _stricmp(host, "127.0.0.1:9334") == 0 ||
+           _stricmp(host, "localhost:9334") == 0 ||
+           _stricmp(host, "127.0.0.1") == 0 ||
+           _stricmp(host, "localhost") == 0;
+}
+
+static int http_json_content_type(const char *content_type) {
+    const char *semi = strchr(content_type, ';');
+    size_t len = semi ? (size_t)(semi - content_type) : strlen(content_type);
+    while (len && (content_type[len - 1] == ' ' || content_type[len - 1] == '\t')) len--;
+    return len == strlen("application/json") &&
+           _strnicmp(content_type, "application/json", len) == 0;
+}
+
 static void http_reply(SOCKET c, int code, const char *body) {
     char head[512];
     int hl = snprintf(head, sizeof(head),
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: application/json; charset=utf-8\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Origin: orpheus://orpheus\r\n"
+        "Vary: Origin\r\n"
         "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
         "Access-Control-Allow-Headers: Content-Type\r\n"
         "Content-Length: %u\r\n"
         "Connection: close\r\n\r\n",
-        code, code == 200 ? "OK" : "Bad Request", (unsigned)strlen(body));
+        code, code == 200 ? "OK" : (code == 403 ? "Forbidden" : "Bad Request"),
+        (unsigned)strlen(body));
     send_all(c, head, (size_t)hl);
     send_all(c, body, strlen(body));
 }
@@ -1397,13 +1530,26 @@ static DWORD WINAPI http_thread(LPVOID unused) {
         char method[8] = "", path[128] = "";
         sscanf(req, "%7s %127s", method, path);
 
+        char origin[256] = "", host[256] = "", content_type[128] = "";
+        int has_origin = http_header_value(req, "Origin", origin, sizeof(origin));
+        int has_host = http_header_value(req, "Host", host, sizeof(host));
+        int has_content_type = http_header_value(req, "Content-Type", content_type, sizeof(content_type));
+        int origin_ok = !has_origin || strcmp(origin, "orpheus://orpheus") == 0;
+        int host_ok = !has_host || http_allowed_host(host);
+        int content_ok = strcmp(method, "POST") != 0 ||
+                         (has_content_type && http_json_content_type(content_type));
+
         char body_buf[65536];
         body_buf[0] = 0;
         char *hdr_end = strstr(req, "\r\n\r\n");
         if (hdr_end) snprintf(body_buf, sizeof(body_buf), "%s", hdr_end + 4);
 
         char out[65536];
-        if (strcmp(method, "OPTIONS") == 0) {
+        if (!origin_ok || !host_ok) {
+            http_reply(c, 403, "{\"error\":\"origin or host rejected\"}");
+        } else if (!content_ok) {
+            http_reply(c, 400, "{\"error\":\"POST requires application/json\"}");
+        } else if (strcmp(method, "OPTIONS") == 0) {
             http_reply(c, 200, "{}");
         } else if (strcmp(path, "/api/cfg") == 0 && strcmp(method, "GET") == 0) {
             int v[CFG_N];
@@ -1433,9 +1579,11 @@ static DWORD WINAPI http_thread(LPVOID unused) {
             int v[UI_N];
             ui_read(v);
             for (int i = 0; i < UI_N; i++) json_get_int(body_buf, kUiKeys[i], &v[i]);
-            ui_write(v);
-            ui_to_json(v, out, sizeof(out));
-            http_reply(c, 200, out);
+            if (!ui_write(v)) http_reply(c, 500, "{\"error\":\"ui write failed\"}");
+            else {
+                ui_to_json(v, out, sizeof(out));
+                http_reply(c, 200, out);
+            }
         } else if (strcmp(path, "/api/status") == 0) {
             status_json(out, sizeof(out));
             http_reply(c, 200, out);
@@ -1498,6 +1646,93 @@ static void join_dir(WCHAR *out, size_t n, const wchar_t *dir, const wchar_t *re
     int tail = (len > 0 && (dir[len - 1] == L'\\' || dir[len - 1] == L'/'));
     _snwprintf(out, n, tail ? L"%ls%ls" : L"%ls\\%ls", dir, rel);
     out[n - 1] = 0;
+}
+
+static int sha256_file_hex(const wchar_t *path, char out[65]) {
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    PUCHAR object = NULL;
+    DWORD object_len = 0, result = 0;
+    BYTE digest[32];
+    HANDLE file = INVALID_HANDLE_VALUE;
+    int ok = 0;
+    out[0] = 0;
+
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) goto done;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) != 0) goto done;
+    if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&object_len,
+                          sizeof(object_len), &result, 0) != 0 || !object_len) goto done;
+    object = (PUCHAR)HeapAlloc(GetProcessHeap(), 0, object_len);
+    if (!object) goto done;
+    if (BCryptCreateHash(alg, &hash, object, object_len, NULL, 0, 0) != 0) goto done;
+
+    BYTE buffer[64 * 1024];
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(file, buffer, sizeof(buffer), &got, NULL)) goto done;
+        if (!got) break;
+        if (BCryptHashData(hash, buffer, got, 0) != 0) goto done;
+    }
+    if (BCryptFinishHash(hash, digest, sizeof(digest), 0) != 0) goto done;
+    for (size_t i = 0; i < sizeof(digest); i++)
+        snprintf(out + i * 2, 3, "%02x", digest[i]);
+    ok = 1;
+
+done:
+    if (hash) BCryptDestroyHash(hash);
+    if (object) HeapFree(GetProcessHeap(), 0, object);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    if (!ok) out[0] = 0;
+    return ok;
+}
+
+static int verify_package_dir(const wchar_t *dir, int require_manifest) {
+    WCHAR manifest[MAX_PATH];
+    join_dir(manifest, MAX_PATH, dir, L"manifest.txt");
+    FILE *file = _wfopen(manifest, L"rb");
+    if (!file) {
+        if (require_manifest) log_w("校验失败：缺少 manifest %s", manifest);
+        return require_manifest ? 0 : 1;
+    }
+    char line[512], expected[65], rel[260];
+    int count = 0;
+    int ok = 1;
+    while (fgets(line, sizeof(line), file)) {
+        expected[0] = 0;
+        rel[0] = 0;
+        if (sscanf(line, "%64s %259[^\r\n]", expected, rel) != 2) continue;
+        char *name = rel;
+        while (*name == ' ' || *name == '\t') name++;
+        if (*name == '*') name++;
+        if (strstr(name, "..") || name[0] == '/' || name[0] == '\\') { ok = 0; break; }
+        WCHAR path[MAX_PATH];
+        int w = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, path, MAX_PATH);
+        if (w <= 0) { ok = 0; break; }
+        WCHAR full[MAX_PATH];
+        join_dir(full, MAX_PATH, dir, path);
+        char actual[65];
+        if (!sha256_file_hex(full, actual) || _stricmp(actual, expected) != 0) {
+            log_w("校验失败：文件摘要不匹配 %s", full);
+            ok = 0;
+            break;
+        }
+        count++;
+    }
+    fclose(file);
+    if (!count) ok = 0;
+    if (!ok) host_log("安装包校验失败");
+    else host_log("安装包校验通过：%d 个文件", count);
+    return ok;
+}
+
+static int do_verify(void) {
+    WCHAR dir[MAX_PATH];
+    if (MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, g_base, -1, dir, MAX_PATH) <= 0)
+        return 1;
+    return verify_package_dir(dir, 1) ? 0 : 1;
 }
 
 static int copy_into(const wchar_t *src_dir, const wchar_t *dst_dir, const wchar_t *rel) {
@@ -1637,7 +1872,9 @@ static int launch_exe(const wchar_t *exe, const wchar_t *workdir) {
    卸载要删掉它，都得先停。原来只有卸载做了这件事，于是「程序在跑的时候重装」
    会卡在 CopyFileW 的共享冲突上，报一句「有文件没复制成功」就中止。 */
 static int stop_other_hosts(void) {
+    HANDLE handles[32];
     int n = 0;
+    memset(handles, 0, sizeof(handles));
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
     PROCESSENTRY32W pe;
@@ -1646,12 +1883,115 @@ static int stop_other_hosts(void) {
         do {
             if (_wcsicmp(pe.szExeFile, L"NexExclusive.exe") != 0) continue;
             if (pe.th32ProcessID == GetCurrentProcessId()) continue;
-            HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
-            if (h) { TerminateProcess(h, 0); CloseHandle(h); n++; }
+            HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
+            if (h && n < (int)(sizeof(handles) / sizeof(handles[0]))) {
+                TerminateProcess(h, 0);
+                handles[n++] = h;
+            } else if (h) CloseHandle(h);
         } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
+    for (int i = 0; i < n; i++) {
+        WaitForSingleObject(handles[i], 3000);
+        CloseHandle(handles[i]);
+    }
     return n;
+}
+
+static int stop_client_processes(void) {
+    DWORD pid = find_main_client();
+    if (!pid) return 0;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE,
+                                 FALSE, pid);
+    if (!process) return 0;
+    HWND hwnd = client_window(pid, 0);
+    if (hwnd) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    DWORD wait = WaitForSingleObject(process, 5000);
+    if (wait != WAIT_OBJECT_0) {
+        host_log("安装: 网易云未在 5 秒内退出，终止 pid=%lu", (unsigned long)pid);
+        TerminateProcess(process, 0);
+        wait = WaitForSingleObject(process, 3000);
+    }
+    CloseHandle(process);
+    return wait == WAIT_OBJECT_0;
+}
+
+static void remove_install_tree(const wchar_t *dir) {
+    static const wchar_t *files[] = {
+        L"NexExclusive.exe", L"NexAudioHost.exe", L"nexsink.dll", L"hook.cfg",
+        L"ui.json", L"manifest.txt", L"ui\\panel.js", L"ui\\simplify.js"
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        WCHAR path[MAX_PATH];
+        join_dir(path, MAX_PATH, dir, files[i]);
+        DeleteFileW(path);
+    }
+    { WCHAR ui[MAX_PATH]; join_dir(ui, MAX_PATH, dir, L"ui"); RemoveDirectoryW(ui); }
+    RemoveDirectoryW(dir);
+}
+
+static int install_payload_atomic(const wchar_t *src, const wchar_t *dst) {
+    static const wchar_t *base_files[] = {
+        L"NexExclusive.exe", L"NexAudioHost.exe", L"nexsink.dll", L"hook.cfg",
+        L"ui.json", L"ui\\panel.js", L"ui\\simplify.js"
+    };
+    const wchar_t *files[8];
+    size_t count = sizeof(base_files) / sizeof(base_files[0]);
+    for (size_t i = 0; i < count; i++) files[i] = base_files[i];
+    WCHAR source_manifest[MAX_PATH];
+    join_dir(source_manifest, MAX_PATH, src, L"manifest.txt");
+    if (file_exists_w(source_manifest)) files[count++] = L"manifest.txt";
+
+    WCHAR stage[MAX_PATH], backup[MAX_PATH];
+    _snwprintf(stage, MAX_PATH, L"%ls.staging-%lu", dst, (unsigned long)GetCurrentProcessId());
+    _snwprintf(backup, MAX_PATH, L"%ls.backup-%lu", dst, (unsigned long)GetCurrentProcessId());
+    stage[MAX_PATH - 1] = backup[MAX_PATH - 1] = 0;
+    remove_install_tree(stage);
+    remove_install_tree(backup);
+    if (!CreateDirectoryW(stage, NULL)) return 0;
+    { WCHAR ui[MAX_PATH]; join_dir(ui, MAX_PATH, stage, L"ui"); if (!CreateDirectoryW(ui, NULL)) { remove_install_tree(stage); return 0; } }
+
+    for (size_t i = 0; i < count; i++) {
+        if (!copy_into(src, stage, files[i])) {
+            remove_install_tree(stage);
+            return 0;
+        }
+    }
+    if (!CreateDirectoryW(backup, NULL)) { remove_install_tree(stage); return 0; }
+    { WCHAR ui[MAX_PATH]; join_dir(ui, MAX_PATH, backup, L"ui"); CreateDirectoryW(ui, NULL); }
+
+    size_t moved = 0, touched = 0;
+    int had_backup[8] = {0};
+    for (size_t i = 0; i < count; i++) {
+        WCHAR dest[MAX_PATH], old[MAX_PATH], fresh[MAX_PATH];
+        join_dir(dest, MAX_PATH, dst, files[i]);
+        join_dir(old, MAX_PATH, backup, files[i]);
+        join_dir(fresh, MAX_PATH, stage, files[i]);
+        if (file_exists_w(dest)) {
+            if (!MoveFileExW(dest, old, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) goto rollback;
+            had_backup[i] = 1;
+            touched = i + 1;
+        }
+        if (!MoveFileExW(fresh, dest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) goto rollback;
+        moved = i + 1;
+    }
+    remove_install_tree(stage);
+    remove_install_tree(backup);
+    return 1;
+
+rollback:
+    if (touched < moved) touched = moved;
+    for (size_t j = touched; j > 0; j--) {
+        size_t i = j - 1;
+        WCHAR dest[MAX_PATH], old[MAX_PATH];
+        join_dir(dest, MAX_PATH, dst, files[i]);
+        join_dir(old, MAX_PATH, backup, files[i]);
+        DeleteFileW(dest);
+        if (had_backup[i]) MoveFileExW(old, dest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    }
+    remove_install_tree(stage);
+    remove_install_tree(backup);
+    return 0;
 }
 
 static int do_install(const wchar_t *client_override) {
@@ -1679,18 +2019,21 @@ static int do_install(const wchar_t *client_override) {
 
     log_w("安装到 %s", dst);
 
-    /* 覆盖正在运行的主程序会撞共享冲突，先停掉；停完等它真正退出再复制。 */
-    if (stop_other_hosts()) { host_log("已停止运行中的旧宿主"); Sleep(500); }
+    if (!verify_package_dir(src, 0)) {
+        host_log("安装中止：安装源文件校验失败");
+        if (SUCCEEDED(co)) CoUninitialize();
+        return 1;
+    }
 
-    int ok = 1;
-    ok &= copy_into(src, dst, L"NexExclusive.exe");
-    ok &= copy_into(src, dst, L"NexAudioHost.exe");
-    ok &= copy_into(src, dst, L"nexsink.dll");
-    ok &= copy_into(src, dst, L"hook.cfg");
-    ok &= copy_into(src, dst, L"ui.json");
-    ok &= copy_into(src, dst, L"ui\\panel.js");
-    ok &= copy_into(src, dst, L"ui\\simplify.js");
-    if (!ok) { host_log("安装失败：有文件没复制成功，已中止"); return 1; }
+    /* 覆盖正在运行的文件前，先让宿主和网易云真正退出。 */
+    if (stop_other_hosts()) host_log("已停止运行中的旧宿主");
+    if (stop_client_processes()) host_log("已停止运行中的网易云客户端");
+
+    if (!install_payload_atomic(src, dst)) {
+        host_log("安装失败：文件提交未完成，旧安装保持不变");
+        if (SUCCEEDED(co)) CoUninitialize();
+        return 1;
+    }
 
     /* 客户端路径：命令行给的优先，否则用探测到的，再否则留空让运行时再探 */
     WCHAR client[MAX_PATH];
@@ -1750,9 +2093,9 @@ static int do_uninstall(void) {
     self_path(self, MAX_PATH);
     if (!install_dir(dst, MAX_PATH)) return 1;
 
-    /* 先停掉正在跑的宿主（从安装目录启动的那个），否则文件删不掉 */
+    /* 先停掉正在跑的宿主和网易云，否则文件删不掉。 */
     if (stop_other_hosts()) host_log("已停止运行中的宿主");
-    Sleep(400);
+    if (stop_client_processes()) host_log("已停止运行中的网易云客户端");
 
     RegDeleteKeyW(HKEY_CURRENT_USER, UNINST_KEY);
     RegDeleteValueW(HKEY_CURRENT_USER, L"NexExclusive");
@@ -1770,6 +2113,7 @@ static int do_uninstall(void) {
     /* 删文件。自己正在运行，删不掉，标记重启后删。 */
     static const wchar_t *files[] = {
         L"nexsink.dll", L"NexAudioHost.exe", L"hook.cfg", L"ui.json", L"host.cfg",
+        L"manifest.txt",
         L"ui\\panel.js", L"ui\\simplify.js",
         L"host.log", L"sink.log", L"sink.prev.log",
     };
@@ -1897,6 +2241,7 @@ static void usage(void) {
     printf("  NexExclusive.exe --install            安装到 %%LOCALAPPDATA%%\\NexExclusive\n");
     printf("  NexExclusive.exe --install --client <路径>\n");
     printf("                                        安装时指定 cloudmusic.exe\n");
+    printf("  NexExclusive.exe --verify             校验当前目录的 manifest.txt\n");
     printf("  NexExclusive.exe --uninstall          卸载\n");
     printf("  NexExclusive.exe --help               显示本说明\n\n");
     printf("日常运行不弹控制台，程序驻留在托盘。加 --console 可以保留窗口看输出。\n\n");
@@ -1926,27 +2271,24 @@ static char  g_last_page[128];
 static int   g_ui_injected;
 static DWORD g_last_probe;
 static DWORD g_last_ui_time;
+static DWORD g_last_restart_attempt;
 
 static void watchdog_tick(void) {
     DWORD pid = find_main_client();
     DWORD now = GetTickCount();
 
     if (!pid) {
-        /* 客户端退出了：等它彻底退出再重启，避免反复拉起 */
-        Sleep(2000);
-        pid = find_main_client();
-        if (!pid) {
+        /* 客户端退出后由后续 tick 推进重启，不能在窗口消息线程里等待。 */
+        if (!g_last_restart_attempt || (DWORD)(now - g_last_restart_attempt) >= 5000) {
+            g_last_restart_attempt = now;
             host_log("客户端已退出，重新启动");
             open_client_window();
             g_injected_pid = 0;
             g_ui_injected = 0;
             g_last_page[0] = 0;
-            Sleep(5000);
         }
         return;
     }
-
-    if (!client_window_visible(pid)) reveal_client_window(pid);
 
     if (pid != g_injected_pid || !module_loaded(pid, L"nexsink.dll")) {
         if (inject_dll(pid, kSinkDll)) {
@@ -1960,12 +2302,9 @@ static void watchdog_tick(void) {
     /* 页面重载会让 id 变化，界面脚本必须跟着重新注入 */
     char page[128];
     if (cdp_page_id(page, sizeof(page))) {
-        /* 重载后 CEF 的 target id 不变，所以除了 id 变化，还留一道
-           5 秒兜底：CEF 的 addScriptToEvaluateOnNewDocument 时灵时不灵，
-           实测连续重载会漏掉一次。两个脚本都是幂等的，重放没有副作用，
-           所以用短周期兜底把最坏情况压到几秒。 */
-        int need = !g_ui_injected || strcmp(page, g_last_page) != 0
-                || (now - g_last_ui_time > 5000);
+        /* 同一页面目标只登记一次。脚本注册会随文档加载自动执行，
+           重复登记会让长时间运行的客户端累积副本。 */
+        int need = !g_ui_injected || strcmp(page, g_last_page) != 0;
         if (need) {
             int was = g_ui_injected;
             if (inject_ui_once()) {
@@ -2066,16 +2405,20 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int main(int argc, char **argv) {
     InitializeCriticalSection(&g_log_lock);
-    resolve_paths();   /* 必须早于第一个 host_log：日志路径就是从这儿来的 */
+    if (!resolve_paths()) {
+        MessageBoxW(NULL, L"无法解析 NexExclusive 自身目录，已停止启动。", L"NexExclusive", MB_ICONERROR);
+        return 1;
+    }
 
     WCHAR client_arg[MAX_PATH];
     client_arg[0] = 0;
-    int want_install = 0, want_uninstall = 0, want_help = 0, want_console = 0, want_show = 0;
+    int want_install = 0, want_uninstall = 0, want_verify = 0, want_help = 0, want_console = 0, want_show = 0;
     const char *bad = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--install"))        want_install = 1;
         else if (!strcmp(argv[i], "--uninstall")) want_uninstall = 1;
+        else if (!strcmp(argv[i], "--verify"))    want_verify = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) want_help = 1;
         else if (!strcmp(argv[i], "--console"))   want_console = 1;
         else if (!strcmp(argv[i], "--show") || !strcmp(argv[i], "--open")) want_show = 1;
@@ -2086,11 +2429,12 @@ int main(int argc, char **argv) {
     }
 
     /* 这些模式是用户在命令行主动发起的，输出必须看得见 */
-    if (want_console || want_show || want_install || want_uninstall || want_help) ensure_console();
+    if (want_console || want_show || want_install || want_uninstall || want_verify || want_help) ensure_console();
 
     if (bad) { fprintf(stderr, "未知参数：%s（试试 --help）\n", bad); return 2; }
     if (want_help) { usage(); return 0; }
     if (want_uninstall) return do_uninstall();
+    if (want_verify) return do_verify();
     if (want_install) {
         /* 装之前先探一次客户端：探到就写进 host.cfg，省得用户再配 */
         resolve_client();

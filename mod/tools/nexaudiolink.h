@@ -2,7 +2,7 @@
 #define NEX_AUDIO_LINK_H
 
 #define NEX_AUDIO_MAGIC          0x4E455841u /* NEXA */
-#define NEX_AUDIO_VERSION       1u
+#define NEX_AUDIO_VERSION       2u
 #define NEX_AUDIO_RING_FRAMES   16384u
 #define NEX_AUDIO_ENDPOINT_CHARS 256u
 
@@ -31,6 +31,8 @@ typedef struct NexAudioIpc {
     volatile unsigned long long client_frames;
     volatile unsigned long long endpoint_frames;
     volatile unsigned long long changed_bytes;
+    volatile unsigned long long dropped_frames;
+    volatile unsigned long long underrun_events;
     volatile unsigned long long client_hash;
     volatile unsigned long long endpoint_hash;
     wchar_t endpoint_id[NEX_AUDIO_ENDPOINT_CHARS];

@@ -6,17 +6,21 @@
 static HANDLE g_remote_map;
 static HANDLE g_remote_data;
 static NexAudioIpc *g_remote_ipc;
+static HANDLE g_remote_ready;
 static PROCESS_INFORMATION g_remote_process;
 static HRESULT g_remote_error = E_FAIL;
 static WCHAR g_remote_map_name[96];
 static WCHAR g_remote_data_name[96];
 static WCHAR g_remote_space_name[96];
+static WCHAR g_remote_ready_name[96];
 
 static void remote_close(void) {
     if (g_remote_ipc) {
         g_sink.hifi_client_frames = g_remote_ipc->client_frames;
         g_sink.hifi_endpoint_frames = g_remote_ipc->endpoint_frames;
         g_sink.hifi_changed_bytes = g_remote_ipc->changed_bytes;
+        g_sink.hifi_dropped_frames = g_remote_ipc->dropped_frames;
+        g_sink.hifi_underrun_events = g_remote_ipc->underrun_events;
         g_sink.hifi_client_hash = g_remote_ipc->client_hash;
         g_sink.hifi_endpoint_hash = g_remote_ipc->endpoint_hash;
         InterlockedExchange((volatile LONG *)&g_remote_ipc->state, NEX_AUDIO_CLOSING);
@@ -33,8 +37,9 @@ static void remote_close(void) {
     if (g_remote_map) CloseHandle(g_remote_map);
     if (g_remote_data) CloseHandle(g_remote_data);
     if (g_remote_space) CloseHandle(g_remote_space);
+    if (g_remote_ready) CloseHandle(g_remote_ready);
     g_remote_ipc = NULL;
-    g_remote_map = g_remote_data = g_remote_space = NULL;
+    g_remote_map = g_remote_data = g_remote_space = g_remote_ready = NULL;
 }
 
 static int remote_start(IMMDevice *dev, const WAVEFORMATEX *fmt) {
@@ -48,11 +53,14 @@ static int remote_start(IMMDevice *dev, const WAVEFORMATEX *fmt) {
                L"Local\\NexAudioData_%lu", (unsigned long)pid);
     _snwprintf(g_remote_space_name, sizeof(g_remote_space_name) / sizeof(WCHAR),
                L"Local\\NexAudioSpace_%lu", (unsigned long)pid);
+    _snwprintf(g_remote_ready_name, sizeof(g_remote_ready_name) / sizeof(WCHAR),
+               L"Local\\NexAudioReady_%lu", (unsigned long)pid);
     g_remote_map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
                                       0, (DWORD)sizeof(NexAudioIpc), g_remote_map_name);
     g_remote_data = CreateEventW(NULL, FALSE, FALSE, g_remote_data_name);
     g_remote_space = CreateEventW(NULL, FALSE, FALSE, g_remote_space_name);
-    if (!g_remote_map || !g_remote_data || !g_remote_space) {
+    g_remote_ready = CreateEventW(NULL, FALSE, FALSE, g_remote_ready_name);
+    if (!g_remote_map || !g_remote_data || !g_remote_space || !g_remote_ready) {
         if (endpoint_id) CoTaskMemFree(endpoint_id);
         remote_close();
         return 0;
@@ -89,7 +97,12 @@ static int remote_start(IMMDevice *dev, const WAVEFORMATEX *fmt) {
     }
 
     char base[MAX_PATH];
-    module_dir(base, sizeof(base));
+    if (!module_dir(base, sizeof(base))) {
+        g_remote_error = HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+        log_line("audiohost: cannot resolve module directory");
+        remote_close();
+        return 0;
+    }
     WCHAR wbase[MAX_PATH], host[MAX_PATH], cmd[1024];
     MultiByteToWideChar(CP_ACP, 0, base, -1, wbase, MAX_PATH);
     wcsncpy(host, wbase, MAX_PATH - 1);
@@ -98,8 +111,9 @@ static int remote_start(IMMDevice *dev, const WAVEFORMATEX *fmt) {
     if (slash) slash[1] = 0;
     wcsncat(host, L"NexAudioHost.exe", MAX_PATH - wcslen(host) - 1);
     _snwprintf(cmd, sizeof(cmd) / sizeof(WCHAR),
-               L"\"%ls\" --map \"%ls\" --data \"%ls\" --space \"%ls\"",
-               host, g_remote_map_name, g_remote_data_name, g_remote_space_name);
+               L"\"%ls\" --map \"%ls\" --data \"%ls\" --space \"%ls\" --ready \"%ls\"",
+               host, g_remote_map_name, g_remote_data_name, g_remote_space_name,
+               g_remote_ready_name);
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
@@ -111,17 +125,15 @@ static int remote_start(IMMDevice *dev, const WAVEFORMATEX *fmt) {
         remote_close();
         return 0;
     }
-    for (int i = 0; i < 50; i++) {
-        LONG state = InterlockedCompareExchange((volatile LONG *)&g_remote_ipc->state, 0, 0);
-        if (state == NEX_AUDIO_READY) {
-            log_line("audiohost: ready pid=%lu rate=%lu block=%lu",
-                     (unsigned long)g_remote_process.dwProcessId,
-                     (unsigned long)g_remote_ipc->rate,
-                     (unsigned long)g_remote_ipc->block);
-            return 1;
-        }
-        if (state == NEX_AUDIO_FAILED) break;
-        Sleep(100);
+    HANDLE waits[2] = {g_remote_ready, g_remote_process.hProcess};
+    DWORD wait = WaitForMultipleObjects(2, waits, FALSE, 2000);
+    LONG state = InterlockedCompareExchange((volatile LONG *)&g_remote_ipc->state, 0, 0);
+    if (wait == WAIT_OBJECT_0 && state == NEX_AUDIO_READY) {
+        log_line("audiohost: ready pid=%lu rate=%lu block=%lu",
+                 (unsigned long)g_remote_process.dwProcessId,
+                 (unsigned long)g_remote_ipc->rate,
+                 (unsigned long)g_remote_ipc->block);
+        return 1;
     }
     g_remote_error = (HRESULT)g_remote_ipc->error;
     log_line("audiohost: failed state=%ld hr=0x%08lX",
@@ -139,7 +151,11 @@ static UINT32 remote_write(const BYTE *src, UINT32 frames) {
     UINT64 used = write - read;
     UINT32 room = used >= g_remote_ipc->capacity
                     ? 0 : g_remote_ipc->capacity - (UINT32)used;
-    if (frames > room) frames = room;
+    if (frames > room) {
+        InterlockedExchangeAdd64((volatile LONG64 *)&g_remote_ipc->dropped_frames,
+                                 (LONG64)(frames - room));
+        frames = room;
+    }
     if (!frames) return 0;
     size_t bytes = (size_t)frames * g_remote_ipc->block;
     size_t start = (size_t)(write % g_remote_ipc->capacity) * g_remote_ipc->block;
@@ -173,7 +189,10 @@ static HRESULT remote_drain_once(SinkGen *g) {
     if (available > end) available = end;
     UINT32 n = available < room ? available : room;
     if (n > SCRATCH_FRAMES) n = SCRATCH_FRAMES;
-    if (!n) return S_FALSE;
+    if (!n) {
+        if (g_remote_space) WaitForSingleObject(g_remote_space, 5);
+        return S_FALSE;
+    }
     UINT32 got = ring_take(g_inb, n);
     if (got != n) return E_UNEXPECTED;
     if (remote_write(g_inb, got) != got) return E_FAIL;
