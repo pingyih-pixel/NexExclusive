@@ -55,7 +55,7 @@ static HRESULT sink_stop(void) {
         DWORD t0 = GetTickCount();
         DWORD wait = g->h_thread ? WaitForSingleObject(g->h_thread, 300) : WAIT_OBJECT_0;
         if (wait != WAIT_OBJECT_0) {
-            if (g->real && g->device_started) O_STOP(g->real);
+            if (g->real) O_STOP(g->real);
             InterlockedExchange(&g->device_started, 0);
             if (g->real) O_RESET(g->real);
             wait = WaitForSingleObject(g->h_thread, 600);
@@ -112,9 +112,85 @@ static void proxy_release_owned(void) {
     if(g_sink.proxy_clock)fc_Release(g_sink.proxy_clock);
     g_sink.proxy_render=NULL;g_sink.proxy_clock=NULL;
 }
+
+/* Rebind the client-facing objects to a successor device generation. The
+   IAudioClient owner, its event handle and every external proxy reference stay
+   in place; only the token used to reject objects from an older stream changes.
+   The visible client buffer is part of the existing Initialize contract, so a
+   policy reload must keep its capacity and staging storage as well. */
+static HRESULT sink_rebind_client_state(UINT64 generation) {
+    if (!g_sink.engaged || !generation || !g_sink.proxy_render || !g_sink.proxy_clock)
+        return E_UNEXPECTED;
+    if (!g_sink.reported_frames || !g_sink.in_block) return E_INVALIDARG;
+    size_t bytes = (size_t)g_sink.reported_frames * (size_t)g_sink.in_block;
+    if (g_sink.proxy_render->staging && g_sink.proxy_render->staging_bytes &&
+        g_sink.proxy_render->staging_bytes != bytes) {
+        /* A different client-visible buffer belongs to a new Initialize call;
+           resizing it here could free memory still held by the client. */
+        return E_INVALIDARG;
+    }
+    if (!g_sink.proxy_render->staging) {
+        g_sink.proxy_render->staging = (BYTE *)malloc(bytes);
+        if (!g_sink.proxy_render->staging) return E_OUTOFMEMORY;
+    }
+    g_sink.proxy_render->staging_bytes = bytes;
+    g_sink.proxy_render->generation = generation;
+    g_sink.proxy_render->capacity = g_sink.reported_frames;
+    g_sink.proxy_clock->generation = generation;
+    g_sink.generation = generation;
+    return S_OK;
+}
+
+/* Move the client-facing owner to a same-format successor without touching
+   the endpoint generation, ring, drain thread or proxy pair.  Keeping the
+   proxy objects is important here: the previous client may already have a
+   GetBuffer reservation when the successor calls Initialize.  Invalidating
+   and freeing that proxy drops the pending packet and creates an audible
+   hole; same-format clients can share this generation and its staging object.
+   A later format rebuild still invalidates the generation through teardown. */
+static HRESULT sink_handoff_same_format(IAudioClient *self) {
+    if (!g_sink.engaged || !self || !g_sink.owner || self == (IAudioClient *)g_sink.owner)
+        return E_INVALIDARG;
+    if (!g_sink.reported_frames || !g_sink.in_block ||
+        !g_sink.proxy_render || !g_sink.proxy_clock) return E_UNEXPECTED;
+
+    void *old_owner = g_sink.owner;
+    FakeObj *old_proxy = g_sink.proxy_render;
+    FakeObj *next_proxy = proxy_render_new(g_sink.generation,
+                                           g_sink.reported_frames,
+                                           g_sink.in_block);
+    if (!next_proxy) return E_OUTOFMEMORY;
+    ((IUnknown *)self)->lpVtbl->AddRef((IUnknown *)self);
+    g_sink.owner = (void *)self;
+    g_sink.proxy_render = next_proxy;
+    g_sink.handoff_pending_start = 1;
+    /* Keep the old proxy's reservation intact. The two clients have separate
+       staging buffers, and both belong to the same generation, so an
+       outstanding packet can finish in order while the successor starts
+       writing. Releasing the old packet is preferable to forcing the client
+       to rebuild another stream and creating a hole. */
+    fr_Release(old_proxy);
+    ((IUnknown *)old_owner)->lpVtbl->Release((IUnknown *)old_owner);
+    log_line("sink: same-format client handoff kept generation %llu and allocated a new render proxy",
+             (unsigned long long)(g_sink.gen ? g_sink.gen->id : 0));
+    return S_OK;
+}
+
 static HRESULT sink_teardown(void) {
     int was_remote = g_sink.gen && g_sink.gen->remote;
+    UINT64 remote_generation = was_remote && g_remote_ipc
+        ? g_remote_ipc->stream_generation : 0;
     HRESULT stop=sink_stop();
+    /* Final destruction is the only client-side lifecycle point that means
+       the source will not publish another packet.  Pause and Reset retain the
+       generation and therefore do not submit EOS. */
+    if (was_remote) {
+        remote_submit_eos();
+        /* Keep the Host alive until it has observed the ring empty and the
+           device clock has passed the remaining padding. Closing the mapping
+           immediately after publishing EOS turns a natural tail into a reset. */
+        remote_wait_eos_complete(remote_generation);
+    }
     /* A generation that survived the stop is the normal case: Stop/Start is how
        a client pauses. Teardown is where it actually goes away. */
     if(g_sink.gen) { gen_release(g_sink.gen); g_sink.gen=NULL; }

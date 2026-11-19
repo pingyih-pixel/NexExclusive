@@ -6,8 +6,9 @@ static HRESULT STDMETHODCALLTYPE H_Initialize(void *self, AUDCLNT_SHAREMODE mode
     load_config();
     char d[160];
     describe("fmt", fmt, d, sizeof(d));
-    log_line("Initialize mode=%d flags=0x%08lX dur=%lld %s",
-             (int)mode, (unsigned long)flags, (long long)dur, d);
+    log_line("Initialize mode=%d flags=0x%08lX dur=%lld self=%p owner=%p started=%d %s",
+             (int)mode, (unsigned long)flags, (long long)dur, self, g_sink.owner,
+             g_sink.started, d);
 
     if (g_enable && mode == AUDCLNT_SHAREMODE_SHARED && !InterlockedCompareExchange(&g_internal, 0, 0)) {
         int was_engaged = 0;
@@ -105,20 +106,90 @@ static HRESULT STDMETHODCALLTYPE H_SetEventHandle(void *self, HANDLE h) {
     if (owns(self)) {
         g_sink.h_client = h;
         LeaveCriticalSection(&g_control);
+        log_line("sink: client event handle %p", h);
         return S_OK;
     }
     LeaveCriticalSection(&g_control);
     return O_SETEVENT(self, h);
 }
 
+static int config_reload_should_defer(int policy_changed,
+                                      int client_contract_changed,
+                                      int engine_changed) {
+    (void)policy_changed;
+    return client_contract_changed || engine_changed;
+}
+
+/* A config file change cannot alter the format or buffer contract of an
+   already-open client stream. Rebuild only the device generation after the
+   client has stopped it; sink_retarget() keeps the owner, event handle, ring
+   and service proxies alive for the next Start. */
+static HRESULT reload_sink_for_config(void *self) {
+    if (!g_sink.engaged || !self || !g_sink.gen) return S_FALSE;
+    load_config();
+    if (g_sink.config_file_epoch == g_cfg_epoch) return S_FALSE;
+
+    int policy_changed = g_sink.config_epoch != g_cfg_policy_epoch;
+    int client_contract_changed = g_sink.config_enable != g_enable
+                               || g_sink.config_frames != g_out_frames;
+    int engine_changed = g_sink.config_audiohost != g_audiohost;
+    if (config_reload_should_defer(policy_changed, client_contract_changed, engine_changed)) {
+        /* These values belong to the next Initialize contract or to a
+           different engine path. Keep the live client untouched until it
+           creates that next stream. */
+        g_sink.config_file_epoch = g_cfg_epoch;
+        g_sink.config_enable = g_enable;
+        g_sink.config_frames = g_out_frames;
+        g_sink.config_audiohost = g_audiohost;
+        log_line("sink: config reload deferred client-contract/engine change");
+        return S_FALSE;
+    }
+
+    UINT64 old_epoch = g_sink.config_epoch;
+    HRESULT stop = sink_stop();
+    if (FAILED(stop)) {
+        log_line("sink: config reload stop failed 0x%08lX", (unsigned long)stop);
+        return stop;
+    }
+    HRESULT hr = sink_retarget("config changed");
+    if (SUCCEEDED(hr)) {
+        g_sink.config_epoch = g_cfg_policy_epoch;
+        g_sink.config_file_epoch = g_cfg_epoch;
+        g_sink.config_enable = g_enable;
+        g_sink.config_frames = g_out_frames;
+        g_sink.config_audiohost = g_audiohost;
+        log_line("sink: config reload rebuilt device generation epoch %llu -> %llu",
+                 (unsigned long long)old_epoch, (unsigned long long)g_cfg_policy_epoch);
+    } else {
+        log_line("sink: config reload could not rebuild device generation 0x%08lX",
+                 (unsigned long)hr);
+    }
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE H_Start(void *self) {
     EnterCriticalSection(&g_control);
-    log_line("Start (owns=%d started=%d)", owns(self), (int)g_sink.started);
     if (!owns(self)) {
         LeaveCriticalSection(&g_control);
         return O_START(self);
     }
 
+    HRESULT reloaded = reload_sink_for_config(self);
+    if (FAILED(reloaded)) {
+        LeaveCriticalSection(&g_control);
+        return reloaded;
+    }
+
+    if (g_sink.handoff_pending_start) {
+        g_sink.handoff_pending_start = 0;
+        LeaveCriticalSection(&g_control);
+        /* The successor's client contract has started successfully; the
+           generation's drain thread was already running, so starting it a
+           second time would be wrong. Returning S_FALSE makes the client
+           treat the handoff as failed and create yet another stream. */
+        log_line("Start -> S_OK (same-format handoff joined running generation)");
+        return S_OK;
+    }
     if (g_sink.started) { LeaveCriticalSection(&g_control); log_line("Start -> S_FALSE (already started)"); return S_FALSE; }
     if (FAILED(g_sink.fault)) {
         HRESULT fault = g_sink.fault;
@@ -162,6 +233,11 @@ static HRESULT STDMETHODCALLTYPE H_Stop(void *self) {
         LeaveCriticalSection(&g_control);
         return O_STOP(self);
     }
+    if (g_sink.handoff_pending_start) {
+        LeaveCriticalSection(&g_control);
+        log_line("Stop -> S_FALSE (same-format handoff not started by this client)");
+        return S_FALSE;
+    }
     if (!g_sink.started) { LeaveCriticalSection(&g_control); log_line("Stop -> S_FALSE (not started)"); return S_FALSE; }
     HRESULT hr = sink_stop();
     log_line("sink: stopped 0x%08lX", (unsigned long)hr);
@@ -178,6 +254,11 @@ static HRESULT STDMETHODCALLTYPE H_Reset(void *self) {
     /* Do not erase history under the live drain thread. Reset is a stopped
        stream operation in WASAPI; propagate failures instead of pretending. */
     if (g_sink.started) { LeaveCriticalSection(&g_control); log_line("Reset -> NOT_STOPPED"); return AUDCLNT_E_NOT_STOPPED; }
+    HRESULT reloaded = reload_sink_for_config(self);
+    if (FAILED(reloaded)) {
+        LeaveCriticalSection(&g_control);
+        return reloaded;
+    }
     HRESULT hr = g_sink.gen && g_sink.gen->real ? O_RESET(g_sink.gen->real) : S_OK;
     if (FAILED(hr)) {
         log_line("sink: real Reset failed 0x%08lX", (unsigned long)hr);
@@ -478,58 +559,36 @@ static void patch_device(void *dev) {
 }
 
 /* ---- endpoint watchdog -------------------------------------------------- */
-/* Two things invalidate the device side of a live stream: the user picks
-   another default output, or the device is unplugged. Both are handled the
-   same way - move the stream - so one poll covers both. The drain thread wakes
-   it immediately on a loss; the 400 ms timeout only bounds the case where the
-   default output moves while the old device is still alive. */
-static UINT64 current_default_hash(void) {
-    IMMDevice *dev = NULL;
-    IMMDeviceEnumerator *e = NULL;
-    UINT64 key = 0;
-    InterlockedIncrement(&g_internal);
-    if (SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
-                                   &IID_IMMDeviceEnumerator, (void **)&e)) && e) {
-        if (SUCCEEDED(e->lpVtbl->GetDefaultAudioEndpoint(e, eRender, eConsole, &dev)) && dev) {
-            key = endpoint_hash(dev);
-            dev->lpVtbl->Release(dev);
-        }
-        e->lpVtbl->Release(e);
-    }
-    InterlockedDecrement(&g_internal);
-    return key;
+/* A running stream stays with the endpoint selected by the client. The drain
+   thread wakes this watcher when that endpoint disappears; a later client
+   Initialize observes a changed system default and selects the new endpoint
+   without a second migration racing the old stream. */
+/* A running client stream is already bound to the endpoint it selected.
+   A system-default notification can arrive while that stream is still alive;
+   moving the sink here races the client's own re-initialize path and can make
+   two endpoints take turns. Device loss remains an immediate migration case;
+   a default change is observed by the next client Initialize instead. */
+static int watch_should_retarget(int lost, int moved) {
+    (void)moved;
+    return lost;
 }
 
 static DWORD WINAPI watch_thread(LPVOID unused) {
     (void)unused;
     HRESULT co = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     log_line("watch: endpoint monitor up");
-    DWORD last_attempt = 0, moved_since = 0;
+    DWORD last_attempt = 0;
     int   failures = 0;
     while (g_watch_running) {
         if (g_h_wake) WaitForSingleObject(g_h_wake, 400); else Sleep(400);
         if (!g_watch_running) break;
-        if (!g_sink.engaged) { failures = 0; moved_since = 0; continue; }
+        if (!g_sink.engaged) { failures = 0; continue; }
 
         int lost = (int)g_sink.device_lost;
-        UINT64 key = lost ? 0 : current_default_hash();
-        int moved = key && key != g_sink.endpoint_key;
-        if (!moved) moved_since = 0;
-        if (!lost && !moved) continue;
+        if (!watch_should_retarget(lost, 0)) continue;
         if (failures >= 5) continue;            /* the endpoint keeps refusing us */
 
         DWORD now = GetTickCount();
-        /* The client watches the same notification and usually rebuilds its own
-           stream within a few hundred milliseconds. Migrating at the same
-           instant makes the two fight over an endpoint the engine is still
-           reconfiguring, and our drain thread ends up stalled inside a WASAPI
-           call. Give it the grace period; if it rebuilds, the endpoint key it
-           engages on makes "moved" false and nothing happens here. A device
-           that disappeared is different: there is nothing left to fight over. */
-        if (!lost) {
-            if (!moved_since) { moved_since = now; continue; }
-            if (now - moved_since < 600) continue;
-        }
         if (now - last_attempt < 1000) continue; /* one attempt per second */
         last_attempt = now;
 
@@ -543,7 +602,7 @@ static DWORD WINAPI watch_thread(LPVOID unused) {
             LONG was_started = g_sink.started;
             sink_stop();
             g_sink.started = was_started;
-            hr = sink_retarget(lost ? "device removed" : "default output changed");
+            hr = sink_retarget("device removed");
         }
         LeaveCriticalSection(&g_control);
         if (g_h_migrating) ResetEvent(g_h_migrating);

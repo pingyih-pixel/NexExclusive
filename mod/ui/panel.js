@@ -4,11 +4,13 @@
 (function () {
   'use strict';
 
-  var PANEL_VERSION = 'settings-v28';
+  var PANEL_VERSION = 'settings-source-v9';
   if (window.__nexPanelLoaded === PANEL_VERSION) return;
   window.__nexPanelLoaded = PANEL_VERSION;
 
   var API = 'http://127.0.0.1:9334/api/cfg';
+  var SOURCE_API = 'http://127.0.0.1:9334/api/source';
+  var RESTART_API = 'http://127.0.0.1:9334/api/restart';
   var PANEL_ID = 'nexsink-panel';
   var SETTINGS_PANEL_ID = 'nex-settings-panel';
   var SETTINGS_LAUNCHER_ID = 'nex-settings-launcher';
@@ -40,7 +42,7 @@
         },
         {
           key: 'audiohost', label: '独立音频宿主', type: 'switch',
-          description: '把独占端点和实时提交移到独立进程；仅在严格原样模式下启用。'
+          description: '把独占端点和实时提交移到独立进程；原率优先时，先在 DLL 内完成转换，再发送最终 PCM。'
         }
       ]
     },
@@ -95,6 +97,11 @@
   var pendingConfig = null;
   var saveInFlight = false;
   var controls = {};
+  var sourcePlayId = '';
+  var sourceBridge = null;
+  var sourceBridgePromise = null;
+  var sourceReportedPlayId = '';
+  var sourceReportedQualityTierHint = 0;
 
   function allFields() {
     var result = [];
@@ -108,7 +115,7 @@
     if (document.getElementById('nex-quality-override-style')) return;
     var style = document.createElement('style');
     style.id = 'nex-quality-override-style';
-    style.textContent = '#nex-quality-card{width:172px!important;min-width:156px!important;max-width:196px!important;height:28px!important;padding:0 11px!important;border-radius:14px!important;justify-content:center!important;border-color:rgba(40,50,72,.08)!important;background:rgba(247,249,252,.72)!important;color:rgba(40,50,72,.9)!important;}#nex-quality-card .nex-quality-title{font-size:13px!important;}#nex-quality-card .nex-quality-summary{flex:0 1 auto!important;max-width:calc(100% - 58px)!important;text-align:center!important;}#nex-quality-card:hover,#nex-quality-card:focus-visible,#nex-quality-card[data-open="true"]{border-color:rgba(255,58,58,.45)!important;background:rgba(255,255,255,.72)!important;}#nex-settings-module .nex-item{grid-template-columns:minmax(0,1fr) 210px!important;}#nex-settings-module .nex-control{width:210px!important;}#nex-settings-module .nex-select{width:190px!important;font-size:13px!important;}';
+    style.textContent = '#nex-settings-module .nex-item{grid-template-columns:minmax(0,1fr) 210px!important;}#nex-settings-module .nex-control{width:210px!important;}#nex-settings-module .nex-select{width:190px!important;font-size:13px!important;}';
     document.head.appendChild(style);
   }
 
@@ -133,8 +140,17 @@
       '.nex-panel .nex-badge.ok{color:#0f8a4a;background:rgba(15,138,74,.1);}',
       '.nex-panel .nex-summary-line{font-size:12px;line-height:18px;color:rgba(40,50,72,.58);margin:4px 0 0;white-space:pre-line;}',
       '.nex-panel .nex-summary-line.warn{color:#b26a00;}',
+      '.nex-panel .nex-format-block{margin:12px 0 0;padding:10px 12px;border:1px solid rgba(40,50,72,.08);border-radius:6px;background:rgba(40,50,72,.025);}',
+      '.nex-panel .nex-format-title{margin:0;font-size:13px;font-weight:700;line-height:18px;color:rgba(40,50,72,.88);}',
+      '.nex-panel .nex-format-summary{margin-top:4px;font-size:12px;line-height:18px;color:rgba(40,50,72,.62);white-space:normal;overflow-wrap:anywhere;}',
       '.nex-panel .nex-recovery{display:none;margin-top:8px;height:28px;padding:0 10px;border:1px solid rgba(255,58,58,.35);border-radius:4px;background:#fff7f7;color:#c42f2f;font:inherit;font-size:12px;cursor:pointer;}',
       '.nex-panel .nex-recovery:hover{border-color:#ff3a3a;background:#fff0f0;}',
+      '.nex-panel .nex-config-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin:18px 0 2px;padding-top:14px;border-top:1px solid rgba(40,50,72,.08);}',
+      '.nex-panel .nex-config-action{height:30px;padding:0 12px;border:1px solid rgba(40,50,72,.12);border-radius:15px;background:rgba(40,50,72,.03);color:rgba(40,50,72,.82);font:inherit;font-size:12px;line-height:28px;cursor:pointer;}',
+      '.nex-panel .nex-config-action:hover:not(:disabled){border-color:rgba(255,58,58,.45);background:#fff;color:#d73535;}',
+      '.nex-panel .nex-config-action.primary{border-color:var(--colorPrimary1,#ff3a4a);background:var(--colorPrimary1,#ff3a4a);color:#fff;}',
+      '.nex-panel .nex-config-action.primary:hover:not(:disabled){background:#f23847;color:#fff;}',
+      '.nex-panel .nex-config-action:disabled{opacity:.45;cursor:default;}',
       '.nex-panel .nex-section{margin:16px 0 0;}',
       '.nex-panel .nex-section-title{margin:0 0 2px;font-size:14px;font-weight:700;line-height:22px;color:rgba(40,50,72,.9);}',
       '.nex-panel .nex-item{display:grid;grid-template-columns:minmax(0,1fr) 210px;align-items:center;gap:18px;min-height:52px;padding:8px 0;border-bottom:1px solid rgba(40,50,72,.06);}',
@@ -172,15 +188,7 @@
       '.nex-panel .nex-section{display:grid;grid-template-columns:84px minmax(0,1fr);column-gap:30px;margin:22px 0 0;}',
       '.nex-panel .nex-section-title{grid-column:1;grid-row:1;margin:0;font-size:14px;line-height:18px;font-weight:700;color:rgba(40,50,72,.9);}',
       '.nex-panel .nex-section .nex-item{grid-column:2;}',
-      '.nex-quality-card{position:relative;display:inline-flex;flex:0 0 172px;flex-direction:row;align-items:center;justify-content:center;gap:5px;vertical-align:middle;box-sizing:border-box;width:172px;min-width:156px;max-width:196px;height:28px;margin:0 8px 0 0;padding:0 11px;border:1px solid rgba(40,50,72,.08);border-radius:14px;background:rgba(247,249,252,.72);color:rgba(40,50,72,.9);font:inherit;font-size:12px;line-height:26px;cursor:pointer;white-space:nowrap;}',
-      '.nex-quality-card:hover,.nex-quality-card:focus-visible,.nex-quality-card[data-open="true"]{border-color:rgba(255,58,58,.45);background:rgba(255,255,255,.72);outline:0;}',
-      '#nex-quality-card{border-color:rgba(40,50,72,.08);background:rgba(247,249,252,.72);color:rgba(40,50,72,.9);}',
-      '#nex-quality-card:hover,#nex-quality-card:focus-visible,#nex-quality-card[data-open="true"]{border-color:rgba(255,58,58,.45);background:rgba(255,255,255,.72);}',
-      '.nex-quality-title{flex:0 0 auto;font-size:13px;line-height:26px;color:rgba(40,50,72,.9);}',
-      '.nex-quality-summary{min-width:0;flex:0 1 auto;max-width:calc(100% - 58px);overflow:hidden;text-overflow:ellipsis;font-size:11px;line-height:26px;color:rgba(40,50,72,.58);text-align:center;}',
-      '.nex-quality-tooltip{position:absolute;right:0;bottom:calc(100% + 8px);z-index:1000;display:none;width:276px;padding:10px 12px;border:1px solid rgba(40,50,72,.12);border-radius:5px;background:#fff;color:rgba(40,50,72,.82);box-shadow:0 8px 24px rgba(40,50,72,.16);font-size:12px;line-height:18px;text-align:left;white-space:pre-line;pointer-events:none;}',
-      '.nex-quality-card:hover .nex-quality-tooltip,.nex-quality-card:focus-visible .nex-quality-tooltip,.nex-quality-card[data-open="true"] .nex-quality-tooltip{display:block;}',
-      '@media (max-width:760px){#nex-settings-module{width:calc(100vw - 18px);height:calc(100vh - 48px);min-width:0;min-height:0;padding:18px 18px 24px;}#nex-settings-module .nex-module-foot{margin-left:-18px;margin-right:-18px;margin-bottom:-24px;}.nex-panel .nex-section{grid-template-columns:72px minmax(0,1fr);column-gap:18px;}.nex-panel .nex-item{grid-template-columns:minmax(0,1fr) 142px;align-items:start;gap:10px;}.nex-panel .nex-control{width:142px;}.nex-panel .nex-select{width:136px;}.nex-quality-card{min-width:0;max-width:196px;}.nex-quality-tooltip{right:0;}}'
+      '@media (max-width:760px){#nex-settings-module{width:calc(100vw - 18px);height:calc(100vh - 48px);min-width:0;min-height:0;padding:18px 18px 24px;}#nex-settings-module .nex-module-foot{margin-left:-18px;margin-right:-18px;margin-bottom:-24px;}.nex-panel .nex-section{grid-template-columns:72px minmax(0,1fr);column-gap:18px;}.nex-panel .nex-item{grid-template-columns:minmax(0,1fr) 142px;align-items:start;gap:10px;}.nex-panel .nex-control{width:142px;}.nex-panel .nex-select{width:136px;}}'
     ].join('');
     var style = document.createElement('style');
     style.id = 'nex-panel-style';
@@ -203,8 +211,7 @@
 
   function fieldDisabled(field) {
     if (!connected) return true;
-    if (field.key === 'enable' || field.key === 'hifi') return false;
-    if (field.key === 'audiohost') return !strictHiFi();
+    if (field.key === 'enable' || field.key === 'hifi' || field.key === 'audiohost') return false;
     if (!strictHiFi()) return false;
     return ['rate', 'compat', 'src_prefer', 'dither', 'fade_ms']
       .indexOf(field.key) >= 0;
@@ -216,7 +223,6 @@
     next[field.key] = value;
     pendingConfig = next;
     applyVisualState();
-    save();
   }
 
   function makeSwitch(field) {
@@ -339,7 +345,44 @@
     summary.appendChild(volume);
     panel.appendChild(summary);
 
+    var formatBlock = document.createElement('div');
+    formatBlock.className = 'nex-format-block';
+    formatBlock.setAttribute('data-nex-section', 'audio-specification');
+    var formatTitle = document.createElement('h4');
+    formatTitle.className = 'nex-format-title';
+    formatTitle.textContent = '音频规格';
+    var sourceSummary = document.createElement('div');
+    sourceSummary.id = 'nex-source-format-summary';
+    sourceSummary.className = 'nex-format-summary nex-source-format-summary';
+    sourceSummary.textContent = '源规格：未取得';
+    var formatSummary = document.createElement('div');
+    formatSummary.id = 'nex-format-summary';
+    formatSummary.className = 'nex-format-summary';
+    formatSummary.textContent = '等待音频协商';
+    formatBlock.appendChild(formatTitle);
+    formatBlock.appendChild(sourceSummary);
+    formatBlock.appendChild(formatSummary);
+    panel.appendChild(formatBlock);
+
     SECTIONS.forEach(function (section) { panel.appendChild(makeSection(section)); });
+    var actions = document.createElement('div');
+    actions.className = 'nex-config-actions';
+    actions.setAttribute('data-nex-section', 'config-actions');
+    var saveButton = document.createElement('button');
+    saveButton.id = 'nex-config-save';
+    saveButton.className = 'nex-config-action';
+    saveButton.type = 'button';
+    saveButton.textContent = '保存（下一首应用）';
+    saveButton.addEventListener('click', function () { save(false); });
+    var restartButton = document.createElement('button');
+    restartButton.id = 'nex-config-restart';
+    restartButton.className = 'nex-config-action';
+    restartButton.type = 'button';
+    restartButton.textContent = '保存（当前曲目重开应用）';
+    restartButton.addEventListener('click', function () { save(true); });
+    actions.appendChild(saveButton);
+    actions.appendChild(restartButton);
+    panel.appendChild(actions);
     applyVisualState(panel);
     return panel;
   }
@@ -368,6 +411,10 @@
       badge.textContent = connected ? '已连接' : '未连接';
       badge.classList.toggle('ok', connected);
     }
+    var saveButton = target.querySelector('#nex-config-save');
+    var restartButton = target.querySelector('#nex-config-restart');
+    if (saveButton) saveButton.disabled = !connected || !pendingConfig || saveInFlight;
+    if (restartButton) restartButton.disabled = !connected || saveInFlight;
   }
 
   function mountPlayback() {
@@ -417,6 +464,7 @@
       launcher.setAttribute('data-open', value);
       launcher.setAttribute('aria-expanded', value);
     }
+    if (open) syncSourcePlayId();
   }
 
   function makeModuleDraggable(module) {
@@ -675,15 +723,34 @@
     applyVisualState();
   }
 
-  function save() {
+  function restartCurrentTrack() {
+    if (!connected || saveInFlight) return;
+    fetch(RESTART_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    }).then(function (response) {
+      return response.ok ? response.json() : Promise.reject(response.status);
+    }).then(function () {
+      refreshStatus();
+    }).catch(function () {
+      var status = document.getElementById('nex-status');
+      if (status) status.textContent = '当前曲目无法重开，请手动切换后再播放';
+    });
+  }
+
+  function save(restart) {
     if (!connected) {
-      pendingConfig = null;
-      renderCurrentPanel();
       return;
     }
-    if (saveInFlight || !pendingConfig) return;
+    if (saveInFlight) return;
+    if (!pendingConfig) {
+      if (restart) restartCurrentTrack();
+      return;
+    }
     saveInFlight = true;
     var sent = pendingConfig;
+    applyVisualState();
     fetch(API, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -695,23 +762,162 @@
         if (pendingConfig === sent) pendingConfig = null;
         setBadge(true);
         saveInFlight = false;
-        if (pendingConfig) save();
+        if (pendingConfig) save(restart);
         else {
           renderCurrentPanel();
-          refreshStatus();
+          if (restart) restartCurrentTrack();
+          else refreshStatus();
         }
       })
       .catch(function () {
         saveInFlight = false;
-        pendingConfig = null;
         setBadge(false);
-        renderCurrentPanel();
+        applyVisualState();
       });
   }
 
   function formatRate(hz) {
     if (!hz) return '';
     return (hz % 1000 === 0 ? (hz / 1000).toFixed(1) : String(hz / 1000)) + ' kHz';
+  }
+
+  function postSourceState(payload) {
+    if (typeof fetch !== 'function') return Promise.resolve(false);
+    return fetch(SOURCE_API, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).then(function (response) { return response.ok; }).catch(function () { return false; });
+  }
+
+  // 取网易云自己的 webpack require，只复用它已经实例化的 AudioPlayer。
+  // 不能自己重新执行模块工厂：那会造出第二个 AudioPlayer，它向原生层注册的
+  // 回调会顶掉网易云自己的，播放栏进度随即停住。
+  var appRequire = null;
+  function sourceAppRequire() {
+    if (appRequire) return appRequire;
+    var chunks = window.webpackJsonp;
+    if (!chunks || typeof chunks.push !== 'function') return null;
+    var id = 'nex-source-require-' + Date.now();
+    var modules = {};
+    modules[id] = function (module, exports, req) { appRequire = req; };
+    try { chunks.push([[id], modules, [[id]]]); } catch (_) {}
+    return appRequire && appRequire.c ? appRequire : null;
+  }
+
+  function sourceWebpackPlayer() {
+    var req = sourceAppRequire();
+    if (!req) return null;
+    var cache = req.c;
+    var ids = Object.prototype.hasOwnProperty.call(cache, '4') ? ['4'] : [];
+    Object.keys(cache).forEach(function (key) { if (key !== '4') ids.push(key); });
+    for (var c = 0; c < ids.length; c++) {
+      var mod = cache[ids[c]];
+      var exports = mod && mod.exports;
+      if (!exports) continue;
+      try {
+        var player = exports.AudioPlayer || (exports.default && exports.default.AudioPlayer);
+        if (player && typeof player.getPlaybackInfo === 'function'
+            && typeof player.subscribePlayStatus === 'function') return player;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function sourceQualityTierHint() {
+    var nodes = document.querySelectorAll(
+      '[data-testid="tid_playbar_soundquality"], [data-testid*="soundquality"]');
+    var text = '';
+    for (var i = 0; i < nodes.length; i++) {
+      var rect = nodes[i].getBoundingClientRect && nodes[i].getBoundingClientRect();
+      if (rect && (rect.width === 0 || rect.height === 0)) continue;
+      text += ' ' + (nodes[i].textContent || nodes[i].getAttribute('aria-label') || '');
+    }
+    if (/vivid|臻彩/i.test(text)) return 6999;
+    if (/sky|天空/i.test(text)) return 5999;
+    if (/jymaster|母带|至臻|master/i.test(text)) return 4999;
+    if (/jyeffect|臻效/i.test(text)) return 3999;
+    if (/dolby|杜比/i.test(text)) return 2999;
+    if (/hi[\s-]?res|hires|高解析/i.test(text)) return 1999;
+    if (/无损|lossless|\bSQ\b/i.test(text)) return 999;
+    if (/极高|exhigh|高品质|high[\s-]?quality|\bHQ\b|320\s*k/i.test(text)) return 320;
+    if (/较高|higher|192\s*k/i.test(text)) return 192;
+    if (/标准|standard|128\s*k/i.test(text)) return 128;
+    if (/64aac|64\s*k/i.test(text)) return 64;
+    return 0;
+  }
+
+  // 只把当前 playId 和当前质量控件提示告诉宿主；源规格由宿主读网易云 .uc 缓存头取得。
+  // 宿主对同一 playId 去重，并在换歌后的确认窗口内自己重试，
+  // 所以这里不调用 getPlaybackInfo，也不在播放中做任何播放器查询。
+  function reportSourcePlayId(playId) {
+    if (!playId) return;
+    var qualityTierHint = sourceQualityTierHint();
+    postSourceState({ source_status: 'probe', source_play_id: playId,
+      source_quality_tier_hint: qualityTierHint }).then(function (ok) {
+      if (ok) {
+        sourceReportedPlayId = playId;
+        sourceReportedQualityTierHint = qualityTierHint;
+      }
+    });
+  }
+
+  function ensureSourceBridge() {
+    if (sourceBridge && sourceBridge.player) return Promise.resolve(sourceBridge);
+    if (sourceBridgePromise) return sourceBridgePromise;
+    sourceBridgePromise = new Promise(function (resolve) {
+      function attempt() {
+        var player = sourceWebpackPlayer();
+        if (!player) { setTimeout(attempt, 1000); return; }
+        var callback = function (event) {
+          if (!event || typeof event.playId !== 'string' || !event.playId) return;
+          sourcePlayId = event.playId;
+          if (sourcePlayId !== sourceReportedPlayId ||
+              sourceQualityTierHint() !== sourceReportedQualityTierHint) reportSourcePlayId(sourcePlayId);
+        };
+        sourceBridge = { player: player, callback: callback };
+        player.subscribePlayStatus({ type: 'playprogress', callback: callback }).catch(function () {});
+        window.addEventListener('beforeunload', function () {
+          try { if (player.unsubscribePlayStatus) player.unsubscribePlayStatus({ type: 'playprogress', callback: callback }); } catch (_) {}
+          sourceBridge = null;
+          sourceBridgePromise = null;
+        }, { once: true });
+        sourceBridgePromise = null;
+        resolve(sourceBridge);
+      }
+      attempt();
+    });
+    return sourceBridgePromise;
+  }
+
+  function snapshotField(snapshot, camel, snake) {
+    if (!snapshot) return undefined;
+    if (snapshot[camel] !== undefined && snapshot[camel] !== null) return snapshot[camel];
+    if (snapshot[snake] !== undefined && snapshot[snake] !== null) return snapshot[snake];
+    return undefined;
+  }
+
+  function formatSourceAudioSpec(snapshot) {
+    var sourceStatus = snapshotField(snapshot, 'sourceStatus', 'source_status');
+    var rate = Number(snapshotField(snapshot, 'sourceRate', 'source_rate'));
+    var valid = Number(snapshotField(snapshot, 'sourceValidBits', 'source_valid_bits'));
+    var container = Number(snapshotField(snapshot, 'sourceContainerBits', 'source_container_bits'));
+    var encoding = snapshotField(snapshot, 'sourceEncoding', 'source_encoding') || 'PCM';
+    if (sourceStatus === 'pending') return '源规格：查询中';
+    if (sourceStatus !== 'observed' || !rate) return '源规格：未取得';
+    if (!container) container = valid;
+    if (encoding === 'float' || encoding === 'float32') encoding = 'float32';
+    else if (encoding === 'integer' || encoding === 'int' || encoding === 'pcm') encoding = '整数 PCM';
+    var kbps = Number(snapshotField(snapshot, 'sourceBitrateKbps', 'source_bitrate_kbps'));
+    if (encoding === '整数 PCM' && valid <= 0) return '源规格：未取得';
+    if (encoding === 'FLAC' || encoding === 'MP3' || encoding === 'AAC' || encoding === 'ALAC' || encoding === 'APE' || encoding === 'OGG') {
+      var details = [];
+      if (valid > 0) details.push(valid + ' bit');
+      if (kbps > 0) details.push(kbps + ' kbps');
+      return '源规格　' + formatRate(rate) + ' / ' + (details.length ? details.join(' · ') + ' ' : '') + encoding;
+    }
+    if (valid <= 0) return '源规格：未取得';
+    return '源规格　' + formatRate(rate) + ' / ' + valid + ' bit ' + encoding
+      + '（' + container + ' bit 容器）';
   }
 
   function engagedSummary(text) {
@@ -743,13 +949,16 @@
     var text = snapshot && (snapshot.lastEngaged || snapshot.lastLine || '');
     var input = /in=rate:(\d+)\/cont:(\d+)\/valid:(\d+)/.exec(text);
     var output = /out=rate:(\d+)\/cont:(\d+)\.(\d+)/.exec(text);
-    var lines = ['音频规格'];
-    if (input) lines.push('客户端 PCM　' + formatRate(Number(input[1])) + ' / ' + input[3] + ' bit（' + input[2] + ' bit 容器）');
+    var inputEncoding = /sub:0x00000003/i.test(text) ? 'float32'
+      : /sub:0x00000001/i.test(text) ? '整数 PCM' : 'PCM';
+    var lines = [formatSourceAudioSpec(snapshot)];
+    if (input) lines.push('客户端 PCM　' + formatRate(Number(input[1])) + ' / ' + input[3] + ' bit ' + inputEncoding + '（' + input[2] + ' bit 容器）');
     if (output) lines.push('独占端点　' + formatRate(Number(output[1])) + ' / ' + output[3] + ' bit（' + output[2] + ' bit 容器）');
     if (/\[converted\]/.test(text)) lines.push('状态　独占转换');
+    else if (/\[depth only\]/.test(text)) lines.push('状态　仅位深转换，未标记原样');
     else if (/\[native\]/.test(text)) lines.push('状态　原样输出');
     else if (!input && !output) lines.push('等待新的音频协商');
-    if (snapshot && snapshot.verification) {
+    if (snapshot && snapshot.verification && snapshot.verification.line) {
       var verification = snapshot.verification;
       var evidence = verification.clientToEndpoint === 'bit-perfect'
         ? '客户端 PCM → 独占端点　逐样本一致'
@@ -757,7 +966,8 @@
           ? '客户端 PCM → 独占端点　已转换，未标记原样'
           : '客户端 PCM → 独占端点　暂无完整校验';
       lines.push('校验　' + evidence);
-      lines.push('源文件解码前　未提供逐样本证据');
+    } else if (input || output) {
+      lines.push('校验　本次流尚未生成逐样本校验记录');
     }
     if (snapshot && snapshot.endpoint) lines.push('设备　' + snapshot.endpoint);
     return lines.join('\n');
@@ -770,70 +980,51 @@
     if (!input || !output) return '等待音频协商';
     var converted = /\[converted\]|\[depth only\]/.test(text);
     var mode = converted ? '已转换格式' : 'Bit-perfect 原样输出';
-    return input[2] + '-bit / ' + formatRate(Number(input[1])) + ' -> '
-      + output[3] + '-bit / ' + formatRate(Number(output[1])) + ' · ' + mode;
+    return input[3] + ' bit / ' + formatRate(Number(input[1])) + ' → '
+      + output[3] + ' bit / ' + formatRate(Number(output[1])) + ' · ' + mode;
   }
 
-  function qualityAnchor() {
-    var directs = document.querySelectorAll('[data-testid="tid_playbar_soundquality"]');
-    for (var d = 0; d < directs.length; d++) {
-      if (visible(directs[d])) return directs[d];
-    }
-    var nodes = document.querySelectorAll('[aria-label*="Tag:"], button, span, div');
-    for (var i = 0; i < nodes.length; i++) {
-      if ((nodes[i].textContent || '').trim() === '无损' && nodes[i].getBoundingClientRect().width > 0) return nodes[i];
-    }
-    return null;
+  function formatSettingsAudioSpecSummary(snapshot) {
+    var summary = formatAudioSpecSummary(snapshot);
+    if (summary === '等待音频协商') return summary;
+    return '客户端 PCM ' + summary.replace(' → ', ' → 独占端点 ');
   }
 
-  function renderQualityBox(snapshot) {
-    styleOnce();
-    var anchor = qualityAnchor();
-    var existing = document.getElementById('nex-quality-card');
-    if (!anchor) {
-      if (existing) existing.remove();
+  function isPlaybackPaused() {
+    var button = document.querySelector('[data-testid="tid_playbar_play_btn"]');
+    return !!(button && button.querySelector('[aria-label="play"]'));
+  }
+
+  // 设置窗口打开时补报一次：宿主重启过、或页面刚注入还没收到 playprogress。
+  // 只有暂停且还不知道 playId 时才问一次 getPlaybackInfo({}) 来发现它。
+  function syncSourcePlayId() {
+    if (!sourceBridge || !sourceBridge.player) {
+      ensureSourceBridge().then(function () { syncSourcePlayId(); });
       return;
     }
-    if (existing && (!existing.isConnected || existing.tagName !== 'BUTTON'
-        || existing.parentElement !== anchor.parentElement)) {
-      existing.remove();
-      existing = null;
+    if (sourcePlayId) { reportSourcePlayId(sourcePlayId); return; }
+    if (!isPlaybackPaused()) return;
+    Promise.race([
+      sourceBridge.player.getPlaybackInfo({}),
+      new Promise(function (resolve) { setTimeout(function () { resolve(null); }, 2500); })
+    ]).catch(function () { return null; }).then(function (info) {
+      if (!sourcePlayId && info && typeof info.playId === 'string' && info.playId) {
+        sourcePlayId = info.playId;
+      }
+      reportSourcePlayId(sourcePlayId);
+    });
+  }
+
+  function renderAudioSpecStatus(snapshot) {
+    if (snapshot && snapshot.source_play_id && sourcePlayId && snapshot.source_play_id !== sourcePlayId) {
+      snapshot = Object.assign({}, snapshot, { source_status: 'unavailable' });
     }
-    if (!existing) {
-      existing = document.createElement('button');
-      existing.id = 'nex-quality-card';
-      existing.className = 'nex-quality-card';
-      existing.type = 'button';
-      existing.setAttribute('aria-label', '音频规格详情');
-      existing.setAttribute('aria-expanded', 'false');
-      var title = document.createElement('span');
-      title.className = 'nex-quality-title';
-      title.textContent = '音频规格';
-      existing.appendChild(title);
-      var summary = document.createElement('span');
-      summary.className = 'nex-quality-summary';
-      existing.appendChild(summary);
-      var tooltip = document.createElement('span');
-      tooltip.className = 'nex-quality-tooltip';
-      tooltip.setAttribute('role', 'tooltip');
-      existing.appendChild(tooltip);
-      existing.addEventListener('click', function () {
-        var open = existing.getAttribute('data-open') === 'true';
-        existing.setAttribute('data-open', open ? 'false' : 'true');
-        existing.setAttribute('aria-expanded', open ? 'false' : 'true');
-      });
-      existing.addEventListener('keydown', function (event) {
-        if (event.key === 'Escape') {
-          existing.setAttribute('data-open', 'false');
-          existing.setAttribute('aria-expanded', 'false');
-        }
-      });
-      if (anchor.parentElement) anchor.parentElement.insertBefore(existing, anchor);
-    }
-    var summary = existing.querySelector('.nex-quality-summary');
-    if (summary) summary.textContent = formatAudioSpecSummary(snapshot || {});
-    var tip = existing.querySelector('.nex-quality-tooltip');
-    if (tip) tip.textContent = formatAudioSpec(snapshot || {});
+    var staleQualityCard = document.getElementById('nex-quality-card');
+    if (staleQualityCard) staleQualityCard.remove();
+    var sourceSummary = document.getElementById('nex-source-format-summary');
+    if (sourceSummary) sourceSummary.textContent = formatSourceAudioSpec(snapshot || {});
+    var formatSummary = document.getElementById('nex-format-summary');
+    if (formatSummary) formatSummary.textContent = formatSettingsAudioSpecSummary(snapshot || {});
   }
 
   function switchToSourcePreferred() {
@@ -844,7 +1035,6 @@
       shared_fallback: 0
     });
     applyVisualState();
-    save();
   }
 
   function refreshStatus() {
@@ -861,7 +1051,7 @@
         var recovery = document.getElementById('nex-recovery');
         var nativeRejected = strictHiFi() && /strict native rejected|0x88890008/i.test(snapshot.fault || '');
         if (recovery) recovery.style.display = nativeRejected ? 'inline-flex' : 'none';
-        renderQualityBox(snapshot);
+        renderAudioSpecStatus(snapshot);
         if (endpoint) {
           var endpointText = snapshot.endpoint ? '播放设备　' + snapshot.endpoint : '';
           if (snapshot.fault) endpointText += (endpointText ? '　' : '') + '最近状态　' + humanFault(snapshot.fault);
@@ -888,7 +1078,7 @@
   function refreshQualityOnly() {
     fetch(API.replace('/cfg', '/status'), { method: 'GET' })
       .then(function (response) { return response.ok ? response.json() : Promise.reject(response.status); })
-      .then(renderQualityBox)
+      .then(renderAudioSpecStatus)
       .catch(function () {});
   }
 
@@ -923,7 +1113,10 @@
       mount();
       if (connected) refreshStatus(); else load();
       refreshQualityOnly();
+      var module = document.getElementById('nex-settings-module');
+      if (module && module.getAttribute('data-open') === 'true') syncSourcePlayId();
     }, 5000);
+    ensureSourceBridge();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', watch);

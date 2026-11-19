@@ -16,6 +16,18 @@ static int g_audiohost   = 0;   /* optional out-of-process exclusive renderer */
 static int g_src_prefer  = 0;
 static FILETIME g_cfg_mtime;
 static int g_cfg_loaded  = 0;
+static UINT64 g_cfg_epoch = 0;
+static UINT64 g_cfg_policy_epoch = 0;
+static int g_cfg_policy_valid = 0;
+static struct {
+    int out_bits;
+    int force_rate;
+    int compat;
+    int dither;
+    int fade_ms;
+    int src_prefer;
+    int hifi;
+} g_cfg_policy;
 
 /* ---- module location ---------------------------------------------------- */
 /* 默认的 hook.cfg 与 sink.log 都放在「本 DLL 所在目录」，不再写死开发机的
@@ -165,6 +177,12 @@ typedef struct {
     HANDLE             h_data;          /* signalled when the producer writes */
     HANDLE             h_client;        /* the client's event handle */
     volatile LONG      started;
+    int                handoff_pending_start;
+    UINT64              config_epoch;    /* config used to build this sink */
+    UINT64              config_file_epoch;
+    int                 config_enable;
+    int                 config_frames;
+    int                 config_audiohost;
 
     BYTE              *conv;            /* scratch for one conversion pass */
 
@@ -197,6 +215,7 @@ static void proxy_release_owned(void);
 static SinkGen *gen_new(void);
 static void gen_retain(SinkGen *g);
 static void gen_release(SinkGen *g);
+static FakeObj *proxy_render_new(UINT64 generation, UINT32 capacity, int block);
 
 /* Defined next to the IMMDevice hooks, which own the original Activate. Called
    from sink_engage, i.e. before the hooks file is included, hence the forward
@@ -226,14 +245,20 @@ static int owns(void *self) {
 static void patch_audio_client(void *iface, int is_v3);
 static HRESULT sink_teardown(void);
 static HRESULT sink_teardown_controlled(void);
+static HRESULT sink_retarget(const char *reason);
 static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
                            REFERENCE_TIME dur);
 static HRESULT sink_engage_controlled(IAudioClient *self, const WAVEFORMATEX *fmt,
                                       REFERENCE_TIME dur, int *was_engaged);
 static HRESULT dev_activate(IMMDevice *dev, const GUID *iid, void **out);
-static HRESULT remote_drain_once(SinkGen *g);
 static UINT64 endpoint_hash(IMMDevice *dev);
 static HANDLE g_remote_space;
+static long remote_state(void);
+static void remote_note_client(const BYTE *source, UINT32 frames);
+static UINT32 remote_write(const BYTE *client, const BYTE *converted, UINT32 frames);
+static HRESULT g_remote_error;
+static NexAudioControl *g_remote_ipc;
+static BYTE *g_remote_out;
 
 /* The vtable is shared by every IAudioClient in the process, including the one
    backing our own exclusive stream. So the real stream must never be driven
@@ -404,9 +429,31 @@ static void load_config(void) {
         g_dither = 0;
         g_fade_ms = 0;
     }
+    /* audiohost selects who owns the endpoint. It is independent of hifi:
+       converted streams use the same SRC and quantiser before entering the host. */
     /* Shared output is never a product path. Keep reading the legacy key so old
        configs remain parseable, then force the invariant here. */
     g_shared_fallback = 0;
+    g_cfg_epoch++;
+    {
+        int changed = !g_cfg_policy_valid
+                   || g_cfg_policy.out_bits != g_out_bits
+                   || g_cfg_policy.force_rate != g_force_rate
+                   || g_cfg_policy.compat != g_compat
+                   || g_cfg_policy.dither != g_dither
+                   || g_cfg_policy.fade_ms != g_fade_ms
+                   || g_cfg_policy.src_prefer != g_src_prefer
+                   || g_cfg_policy.hifi != g_hifi;
+        g_cfg_policy.out_bits = g_out_bits;
+        g_cfg_policy.force_rate = g_force_rate;
+        g_cfg_policy.compat = g_compat;
+        g_cfg_policy.dither = g_dither;
+        g_cfg_policy.fade_ms = g_fade_ms;
+        g_cfg_policy.src_prefer = g_src_prefer;
+        g_cfg_policy.hifi = g_hifi;
+        g_cfg_policy_valid = 1;
+        if (changed) g_cfg_policy_epoch++;
+    }
     log_line("config: enable=%d bits=%d rate=%d buffer=%d compat=%d dither=%d fade_ms=%d shared_fallback=%d src_prefer=%s hifi=%d audiohost=%d",
              g_enable, g_out_bits, g_force_rate, g_out_frames, g_compat, g_dither, g_fade_ms,
              g_shared_fallback, g_src_prefer ? "simplicity" : "bandwidth", g_hifi, g_audiohost);

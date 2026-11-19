@@ -117,7 +117,10 @@ A fuller list of limitations and plans is in [docs/ROADMAP.md](docs/ROADMAP.md) 
 ## Documentation
 
 - [docs/BUILDING.md](docs/BUILDING.md) — build from source, run the regression tests, package a release
-- [docs/OPENHOME_NETEASE_RESEARCH.md](docs/OPENHOME_NETEASE_RESEARCH.md) — OpenHome architecture and the NetEase local-database conclusion
+- [docs/DEVELOPMENT_RUNTIME.md](docs/DEVELOPMENT_RUNTIME.md) — injection, host supervision, logs, and test cleanup
+- [docs/AUDIO_CORRECTNESS_AUDIT_2026-11-16.md](docs/AUDIO_CORRECTNESS_AUDIT_2026-11-16.md) — PCM, clock, EOS, backpressure, and playback evidence
+- [docs/REMOTE_AUDIO_PROTOCOL_DESIGN.md](docs/REMOTE_AUDIO_PROTOCOL_DESIGN.md) — remote contract, state machine, and fallback semantics
+- [docs/RESEARCH_OPENHOME_AND_BACKENDS.md](docs/RESEARCH_OPENHOME_AND_BACKENDS.md) — OpenHome, DLNA, RAAT and ASIO research boundaries
 - [docs/ROADMAP.md](docs/ROADMAP.md) — limitations and plans
 - [docs/defender-false-positive.md](docs/defender-false-positive.md) — material for the Microsoft false-positive submission
 

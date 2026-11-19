@@ -60,6 +60,37 @@ static int g_client_verified;
 static char g_panel_script_id[128];
 static char g_simplify_script_id[128];
 
+typedef struct {
+    char status[16];
+    char play_id[128];
+    char format[16];
+    char encoding[24];
+    int rate;
+    int channels;
+    int sample_bytes;
+    int valid_bits;
+    int container_bits;
+    int lossless;
+    int bitrate_kbps;
+    int quality_tier;          /* 缓存文件名里的品质档（64..6999），0 = 非缓存来源 */
+    int quality_tier_hint;     /* 面板从当前质量控件读到的选择提示，0 = 未取得 */
+    char selection[32];        /* 选择证据：quality/rate/mtime */
+    ULONGLONG audio_generation;
+    ULONGLONG updated_at_ms;
+    /* 播放中由宿主自己读缓存头：换歌后在一段时间窗内反复确认，
+       以便缓存文件晚到、或 DLL 协商出新的输入采样率后纠正选择。 */
+    ULONGLONG probe_started_ms;
+    ULONGLONG probe_last_ms;
+    char probe_path[MAX_PATH];
+} SourceMeta;
+static SourceMeta g_source;
+
+static void source_clear(void) {
+    memset(&g_source, 0, sizeof(g_source));
+    snprintf(g_source.status, sizeof(g_source.status), "unavailable");
+}
+static void source_refresh_probe(void);
+
 static int module_dir(char *out, size_t n) {
     if (!out || n == 0) return 0;
     out[0] = 0;
@@ -237,6 +268,79 @@ static int json_get_int(const char *json, const char *key, int *out) {
     if (end == p) return 0;
     *out = (int)v;
     return 1;
+}
+
+/* 从扁平 JSON 对象读取一个不含转义的短字符串。源规格字段只接受
+   playId、编码名等 ASCII 标识，遇到转义或控制字符直接拒绝。 */
+static int json_get_string(const char *json, const char *key, char *out, size_t n) {
+    char pat[128];
+    if (!out || n == 0) return 0;
+    out[0] = 0;
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return 0;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p++ != ':') return 0;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p++ != '"') return 0;
+    size_t used = 0;
+    while (*p && *p != '"') {
+        unsigned char c = (unsigned char)*p++;
+        if (c < 0x20 || c == '\\' || used + 1 >= n) return 0;
+        out[used++] = (char)c;
+    }
+    if (*p != '"') return 0;
+    out[used] = 0;
+    return used > 0;
+}
+
+static int source_allowed_id(const char *s, size_t max) {
+    size_t n = s ? strlen(s) : 0;
+    if (!n || n > max) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) return 0;
+    }
+    return 1;
+}
+
+static int source_format_allowed(const char *s) {
+    return s && (!_stricmp(s, "flac") || !_stricmp(s, "pcm") ||
+                  !_stricmp(s, "wav") || !_stricmp(s, "alac") ||
+                  !_stricmp(s, "ape") || !_stricmp(s, "mp3") ||
+                  !_stricmp(s, "aac") || !_stricmp(s, "ogg"));
+}
+
+static int source_format_is_lossless(const char *s) {
+    return s && (!_stricmp(s, "flac") || !_stricmp(s, "pcm") ||
+                 !_stricmp(s, "wav") || !_stricmp(s, "alac") ||
+                 !_stricmp(s, "ape"));
+}
+
+static int source_quality_tier_allowed(int tier) {
+    switch (tier) {
+    case 0: case 64: case 128: case 192: case 320: case 999:
+    case 1999: case 2999: case 3999: case 4999: case 5999: case 6999:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int source_bits_from_bytes(int bytes) {
+    return bytes >= 1 && bytes <= 4 ? bytes * 8 : 0;
+}
+
+static void source_uppercase(char *out, size_t n, const char *format) {
+    size_t i = 0;
+    if (!out || !n) return;
+    for (; format && format[i] && i + 1 < n; i++) {
+        unsigned char c = (unsigned char)format[i];
+        out[i] = (char)((c >= 'a' && c <= 'z') ? c - ('a' - 'A') : c);
+    }
+    out[i] = 0;
 }
 
 /* ---- 配置：hook.cfg <-> JSON ------------------------------------------- */
@@ -496,7 +600,13 @@ static unsigned long long line_ull(const char *line, const char *key) {
 }
 
 static void verification_json(char *out, size_t n, const char *line) {
-    char *escaped = json_escape(line ? line : "");
+    /* No verifier line means no measurement. Returning zeroed counters here
+       makes the panel present an empty measurement as if it were live data. */
+    if (!line || !*line) {
+        snprintf(out, n, "\"verification\":null");
+        return;
+    }
+    char *escaped = json_escape(line);
     const char *map = strstr(line ? line : "", "map=");
     char map_name[32] = "";
     if (map) sscanf(map + 4, "%31s", map_name);
@@ -529,6 +639,7 @@ static void status_json(char *out, size_t n) {
     char lastline[256] = "";
     char fault[512] = "";
     char verifier[1024] = "";
+    char remote_status[2048] = "";
     char log_ep[256] = "";
     int  log_hw = -1;
 
@@ -540,6 +651,16 @@ static void status_json(char *out, size_t n) {
             size_t L = strlen(line);
             while (L && (line[L-1] == '\r' || line[L-1] == '\n')) line[--L] = 0;
         }
+        if (strstr(line, "=== nexsink attached ===")) {
+            /* A new client process has not negotiated a stream yet. Do not
+               present the previous process's format and verifier as current. */
+            engaged[0] = 0;
+            verifier[0] = 0;
+            fault[0] = 0;
+            remote_status[0] = 0;
+            log_ep[0] = 0;
+            log_hw = -1;
+        }
         if (strstr(line, "sink ENGAGED")) {
             snprintf(engaged, sizeof(engaged), "%s", line);
             ep_from_line(line, log_ep, sizeof(log_ep), &log_hw);
@@ -549,6 +670,13 @@ static void status_json(char *out, size_t n) {
         }
         if (strstr(line, "hifi verifier:")) {
             snprintf(verifier, sizeof(verifier), "%s", line);
+        }
+        if (strstr(line, "audiohost: close") ||
+            strstr(line, "audiohost: ready") ||
+            strstr(line, "audiohost: host_exit") ||
+            strstr(line, "audiohost telemetry generation=") ||
+            strstr(line, "telemetry generation=")) {
+            snprintf(remote_status, sizeof(remote_status), "%s", line);
         }
         if (*line) snprintf(lastline, sizeof(lastline), "%s", line);
         if (!nl) break;
@@ -583,10 +711,492 @@ static void status_json(char *out, size_t n) {
     char *f = json_escape(fault);
     char verification[1800];
     verification_json(verification, sizeof(verification), verifier);
-    snprintf(out, n, "{\"loaded\":%s,\"lastEngaged\":\"%s\",\"lastLine\":\"%s\",\"fault\":\"%s\",%s,%s}",
+    int cfg[CFG_N];
+    cfg_read(cfg);
+    int requested_audiohost = cfg[10] != 0;
+    int active_audiohost = strstr(engaged, "engine=audiohost") != NULL;
+    unsigned long long generation = line_ull(engaged, "generation=");
+    if (!generation) generation = line_ull(remote_status, "generation=");
+    unsigned long long converted = line_ull(remote_status, "converted=");
+    unsigned long long source_waits = line_ull(remote_status, "source_waits=");
+    unsigned long long backpressure = line_ull(remote_status, "backpressure=");
+    unsigned long long underruns = line_ull(remote_status, "underrun=");
+    unsigned long long dropped = line_ull(remote_status, "dropped=");
+    unsigned long long eos_submitted = line_ull(remote_status, "eos_submitted=");
+    unsigned long long eos_complete = line_ull(remote_status, "eos_complete=");
+    char *rs = json_escape(remote_status);
+    source_refresh_probe();
+    if (!_stricmp(g_source.status, "pending") && !g_source.probe_started_ms &&
+        g_source.updated_at_ms && GetTickCount64() - g_source.updated_at_ms > 30000) {
+        source_clear();
+    }
+    char *source_play_id = json_escape(g_source.play_id);
+    char *source_format = json_escape(g_source.format);
+    char *source_encoding = json_escape(g_source.encoding);
+    const char *source_status = g_source.status[0] ? g_source.status : "unavailable";
+    snprintf(out, n,
+             "{\"loaded\":%s,\"lastEngaged\":\"%s\",\"lastLine\":\"%s\","
+             "\"fault\":\"%s\",\"requestedEngine\":\"wasapi\","
+             "\"requestedDeployment\":\"%s\","
+             "\"activeEngine\":\"%s\",\"deployment\":\"%s\","
+             "\"convertedFrames\":%llu,\"sourceWaits\":%llu,"
+             "\"backpressure\":%llu,\"underrunEvents\":%llu,"
+             "\"droppedFrames\":%llu,\"currentGeneration\":%llu,"
+             "\"eosSubmittedGeneration\":%llu,\"eosCompleteGeneration\":%llu,"
+             "\"remoteStatus\":\"%s\",%s,%s,"
+             "\"source_status\":\"%s\",\"source_play_id\":\"%s\","
+             "\"source_format\":\"%s\",\"source_rate\":%d,"
+             "\"source_channels\":%d,\"source_sample_bytes\":%d,"
+             "\"source_valid_bits\":%d,\"source_container_bits\":%d,"
+             "\"source_encoding\":\"%s\",\"source_lossless\":%s,"
+             "\"source_bitrate_kbps\":%d,\"source_quality_tier\":%d,"
+             "\"source_quality_tier_hint\":%d,\"source_selection\":\"%s\","
+             "\"source_audio_generation\":%llu,\"source_updated_at_ms\":%llu}",
              engaged[0] || lastline[0] ? "true" : "false",
-             e ? e : "", l ? l : "", f ? f : "", ep, verification);
-    free(e); free(l); free(f);
+             e ? e : "", l ? l : "", f ? f : "",
+             requested_audiohost ? "audiohost" : "in_process",
+             active_audiohost ? "wasapi" : "wasapi",
+             active_audiohost ? "audiohost" : "in_process",
+             converted, source_waits, backpressure, underruns, dropped, generation,
+             eos_submitted, eos_complete, rs ? rs : "", ep, verification,
+             source_status, source_play_id ? source_play_id : "",
+             source_format ? source_format : "", g_source.rate, g_source.channels,
+             g_source.sample_bytes, g_source.valid_bits, g_source.container_bits,
+             source_encoding ? source_encoding : "",
+             g_source.lossless ? "true" : (g_source.status[0] == 'o' ? "false" : "null"),
+             g_source.bitrate_kbps, g_source.quality_tier,
+             g_source.quality_tier_hint, g_source.selection,
+             (unsigned long long)g_source.audio_generation,
+             (unsigned long long)g_source.updated_at_ms);
+    free(e); free(l); free(f); free(rs); free(source_play_id); free(source_format); free(source_encoding);
+}
+
+static ULONGLONG source_current_generation(void) {
+    char *tail = read_tail(kSinkLog, 8192);
+    ULONGLONG generation = 0;
+    char *line = tail;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        if (strstr(line, "sink ENGAGED")) generation = line_ull(line, "generation=");
+        if (!nl) break;
+        line = nl + 1;
+    }
+    free(tail);
+    return generation;
+}
+
+/* ---- 源规格：读网易云 .uc 缓存头 ----------------------------------------
+   网易云的 .uc 缓存是逐字节 XOR 0xA3 的原始音频文件，文件名形如
+   <歌曲 id>-<品质档>-<hash>.uc。同一首歌可能同时缓存了几个品质档，
+   所以要在候选里挑出当前真正在播的那一个：
+     1. 面板读到的当前质量档提示优先，用来区分同采样率的不同位深/码率；
+     2. 没有质量提示时，再优先匹配 DLL 最近一次协商到的客户端输入采样率；
+     3. 仍无法区分时才使用最近写入时间，并把证据写进状态。
+   这里只读文件头（FLAC STREAMINFO / MP3 帧头 / MP4 moov），
+   不读取完整曲目，也不改变缓存内容。 */
+typedef struct {
+    char format[16];
+    char encoding[24];
+    int rate;
+    int channels;
+    int bits;
+    int kbps;
+    int lossless;
+    int tier;
+    FILETIME mtime;
+    char path[MAX_PATH];
+} CacheProbe;
+
+static unsigned cache_be16(const unsigned char *p) {
+    return ((unsigned)p[0] << 8) | p[1];
+}
+
+static unsigned long cache_be32(const unsigned char *p) {
+    return ((unsigned long)p[0] << 24) | ((unsigned long)p[1] << 16) |
+           ((unsigned long)p[2] << 8) | p[3];
+}
+
+static size_t cache_read_at(FILE *fp, long long off, unsigned char *buf, size_t n) {
+    size_t got, i;
+    if (off < 0 || _fseeki64(fp, off, SEEK_SET) != 0) return 0;
+    got = fread(buf, 1, n, fp);
+    for (i = 0; i < got; i++) buf[i] ^= 0xA3;
+    return got;
+}
+
+static int cache_parse_flac(const unsigned char *d, size_t n, CacheProbe *o) {
+    unsigned long long packed = 0;
+    int block_len, i;
+    if (n < 42 || memcmp(d, "fLaC", 4) != 0) return 0;
+    block_len = ((int)d[5] << 16) | ((int)d[6] << 8) | d[7];
+    if ((d[4] & 0x7F) != 0 || block_len < 34) return 0;
+    for (i = 0; i < 8; i++) packed = (packed << 8) | d[18 + i];
+    o->rate = (int)((packed >> 44) & 0xFFFFF);
+    o->channels = (int)(((packed >> 41) & 0x7) + 1);
+    o->bits = (int)(((packed >> 36) & 0x1F) + 1);
+    if (o->bits < 4) return 0;
+    snprintf(o->format, sizeof(o->format), "flac");
+    snprintf(o->encoding, sizeof(o->encoding), "FLAC");
+    o->lossless = 1;
+    return 1;
+}
+
+static int cache_parse_mp3(FILE *fp, const unsigned char *head, size_t head_n, CacheProbe *o) {
+    static const int kbps_v1[16] = {0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0};
+    static const int kbps_v2[16] = {0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0};
+    static const int rates[3][3] = {{44100,48000,32000},{22050,24000,16000},{11025,12000,8000}};
+    unsigned char d[4096];
+    long long off = 0;
+    size_t n, i;
+    if (head_n >= 10 && memcmp(head, "ID3", 3) == 0) {
+        off = 10 + (((long long)(head[6] & 0x7F) << 21) | ((head[7] & 0x7F) << 14) |
+                    ((head[8] & 0x7F) << 7) | (head[9] & 0x7F));
+        if (head[5] & 0x10) off += 10;
+    }
+    n = cache_read_at(fp, off, d, sizeof(d));
+    for (i = 0; i + 4 <= n; i++) {
+        int ver, layer, bi, si, mode, mpeg1, side, spf;
+        if (d[i] != 0xFF || (d[i + 1] & 0xE0) != 0xE0) continue;
+        ver = (d[i + 1] >> 3) & 3;          /* 3 = MPEG1, 2 = MPEG2, 0 = MPEG2.5 */
+        layer = (d[i + 1] >> 1) & 3;        /* 1 = Layer III */
+        bi = d[i + 2] >> 4;
+        si = (d[i + 2] >> 2) & 3;
+        mode = d[i + 3] >> 6;
+        if (ver == 1 || layer != 1 || bi == 0 || bi == 15 || si == 3) continue;
+        mpeg1 = ver == 3;
+        o->rate = rates[mpeg1 ? 0 : (ver == 2 ? 1 : 2)][si];
+        o->channels = mode == 3 ? 1 : 2;
+        o->kbps = mpeg1 ? kbps_v1[bi] : kbps_v2[bi];
+        /* VBR 文件第一帧是 Xing 头，帧头码率没有意义；用总字节/总帧数换算平均码率。
+           CBR 文件这里是 "Info"，帧头码率就是真实码率。 */
+        side = mpeg1 ? (mode == 3 ? 17 : 32) : (mode == 3 ? 9 : 17);
+        spf = mpeg1 ? 1152 : 576;
+        if (i + 4 + side + 16 <= n && memcmp(d + i + 4 + side, "Xing", 4) == 0) {
+            const unsigned char *x = d + i + 4 + side + 4;
+            unsigned long flags = cache_be32(x), frames = 0, bytes = 0;
+            x += 4;
+            if (flags & 1) { frames = cache_be32(x); x += 4; }
+            if ((flags & 2) && x + 4 <= d + n) bytes = cache_be32(x);
+            o->kbps = frames && bytes
+                ? (int)(((double)bytes * 8.0 * o->rate) / ((double)frames * spf) / 1000.0 + 0.5)
+                : 0;
+        }
+        snprintf(o->format, sizeof(o->format), "mp3");
+        snprintf(o->encoding, sizeof(o->encoding), "MP3");
+        return 1;
+    }
+    return 0;
+}
+
+/* esds：ES_Descriptor 里的 DecoderConfigDescriptor（tag 0x04）带 objectType 与平均码率 */
+static void cache_parse_esds(const unsigned char *p, size_t n, CacheProbe *o) {
+    size_t i;
+    for (i = 4; i + 2 < n; i++) {
+        size_t j = i + 1, k;
+        unsigned long avg, max;
+        unsigned obj;
+        if (p[i] != 0x04) continue;
+        for (k = 0; k < 3 && j < n && (p[j] & 0x80); k++) j++;
+        j++;                                  /* 长度字段最后一个字节 */
+        if (j + 13 > n) continue;
+        obj = p[j];
+        if (obj != 0x40 && obj != 0x66 && obj != 0x67 && obj != 0x68 &&
+            obj != 0x69 && obj != 0x6B) continue;
+        max = cache_be32(p + j + 5);
+        avg = cache_be32(p + j + 9);
+        o->kbps = (int)(((avg ? avg : max) + 500) / 1000);
+        if (obj == 0x69 || obj == 0x6B) {
+            snprintf(o->format, sizeof(o->format), "mp3");
+            snprintf(o->encoding, sizeof(o->encoding), "MP3");
+        }
+        return;
+    }
+}
+
+static int cache_walk_mp4(const unsigned char *p, size_t n, int depth, CacheProbe *o) {
+    size_t off = 0;
+    if (depth > 8) return 0;
+    while (off + 8 <= n) {
+        unsigned long size = cache_be32(p + off);
+        const unsigned char *type = p + off + 4;
+        if (size < 8 || size > n - off) return 0;
+        if (!memcmp(type, "trak", 4) || !memcmp(type, "mdia", 4) ||
+            !memcmp(type, "minf", 4) || !memcmp(type, "stbl", 4)) {
+            if (cache_walk_mp4(p + off + 8, size - 8, depth + 1, o)) return 1;
+        } else if (!memcmp(type, "stsd", 4) && size >= 16) {
+            const unsigned char *e = p + off + 16;      /* 跳过 version/flags + entry_count */
+            size_t left = size - 16;
+            while (left >= 36) {
+                unsigned long esize = cache_be32(e);
+                if (esize < 36 || esize > left) break;
+                if (!memcmp(e + 4, "mp4a", 4)) {
+                    size_t c = 36;
+                    o->channels = (int)cache_be16(e + 24);
+                    o->rate = (int)(cache_be32(e + 32) >> 16);
+                    snprintf(o->format, sizeof(o->format), "aac");
+                    snprintf(o->encoding, sizeof(o->encoding), "AAC");
+                    while (c + 8 <= esize) {
+                        unsigned long csize = cache_be32(e + c);
+                        if (csize < 8 || csize > esize - c) break;
+                        if (!memcmp(e + c + 4, "esds", 4)) {
+                            cache_parse_esds(e + c + 8, csize - 8, o);
+                            break;
+                        }
+                        c += csize;
+                    }
+                    return o->rate >= 8000 && o->channels >= 1;
+                }
+                e += esize;
+                left -= esize;
+            }
+        }
+        off += size;
+    }
+    return 0;
+}
+
+static int cache_parse_mp4(FILE *fp, CacheProbe *o) {
+    long long off = 0;
+    int i;
+    for (i = 0; i < 32; i++) {
+        unsigned char h[16];
+        unsigned long long size;
+        if (cache_read_at(fp, off, h, sizeof(h)) < 8) return 0;
+        size = cache_be32(h);
+        if (size == 1) size = ((unsigned long long)cache_be32(h + 8) << 32) | cache_be32(h + 12);
+        if (size < 8) return 0;
+        if (!memcmp(h + 4, "moov", 4)) {
+            unsigned char *moov;
+            size_t got;
+            int ok;
+            if (size > 16u * 1024u * 1024u) return 0;
+            moov = (unsigned char *)malloc((size_t)size);
+            if (!moov) return 0;
+            got = cache_read_at(fp, off, moov, (size_t)size);
+            ok = got == size && cache_walk_mp4(moov + 8, (size_t)size - 8, 0, o);
+            free(moov);
+            return ok;
+        }
+        off += (long long)size;
+    }
+    return 0;
+}
+
+static int cache_parse_file(const char *path, CacheProbe *o) {
+    unsigned char head[128];
+    size_t got;
+    int ok = 0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    got = cache_read_at(fp, 0, head, sizeof(head));
+    if (got >= 4 && memcmp(head, "fLaC", 4) == 0) ok = cache_parse_flac(head, got, o);
+    else if (got >= 8 && memcmp(head + 4, "ftyp", 4) == 0) ok = cache_parse_mp4(fp, o);
+    else if (got >= 4) ok = cache_parse_mp3(fp, head, got, o);
+    fclose(fp);
+    return ok && o->rate >= 8000 && o->rate <= 768000 && o->channels >= 1 && o->channels <= 32;
+}
+
+/* DLL 最近一次协商到的客户端输入采样率；没有则 0。 */
+static int source_client_input_rate(void) {
+    char *tail = read_tail(kSinkLog, 12288);
+    int rate = 0;
+    char *line = tail;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        if (strstr(line, "=== nexsink attached ===")) rate = 0;
+        if (strstr(line, "sink ENGAGED")) {
+            const char *in = strstr(line, "in=rate:");
+            rate = in ? atoi(in + 8) : 0;
+        }
+        if (!nl) break;
+        line = nl + 1;
+    }
+    free(tail);
+    return rate;
+}
+
+static int source_probe_cache(const char *play_id_in, int quality_tier_hint) {
+    /* 调用方常传 g_source.play_id 本身，而下面会 source_clear()，先拷一份。 */
+    char play_id[sizeof(g_source.play_id)];
+    char local_appdata[MAX_PATH] = "";
+    char prefix[128] = "";
+    char dir[MAX_PATH] = "";
+    char pattern[MAX_PATH] = "";
+    const char *sep;
+    size_t prefix_len;
+    WIN32_FIND_DATAA fd;
+    HANDLE find;
+    CacheProbe best, cand;
+    int have = 0, best_score = -1, client_rate;
+    const char *best_selection = "cache_mtime_fallback";
+    ULONGLONG keep_started = g_source.probe_started_ms;
+    ULONGLONG now = GetTickCount64();
+
+    g_source.probe_last_ms = now;
+    if (!play_id_in || !source_allowed_id(play_id_in, 96)) return 0;
+    snprintf(play_id, sizeof(play_id), "%s", play_id_in);
+    sep = strchr(play_id, '_');
+    prefix_len = sep ? (size_t)(sep - play_id) : strlen(play_id);
+    if (!prefix_len || prefix_len >= sizeof(prefix)) return 0;
+    for (size_t i = 0; i < prefix_len; i++)
+        if (play_id[i] < '0' || play_id[i] > '9') return 0;
+    memcpy(prefix, play_id, prefix_len);
+    prefix[prefix_len] = 0;
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", local_appdata, sizeof(local_appdata))) return 0;
+    if (snprintf(dir, sizeof(dir), "%s\\NetEase\\CloudMusic\\Cache\\Cache", local_appdata) <= 0 ||
+        snprintf(pattern, sizeof(pattern), "%s\\%s-*.uc", dir, prefix) <= 0) return 0;
+
+    find = FindFirstFileA(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE) return 0;
+    client_rate = source_client_input_rate();
+    memset(&best, 0, sizeof(best));
+    do {
+        int rate_match, quality_match, score;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        memset(&cand, 0, sizeof(cand));
+        if (snprintf(cand.path, sizeof(cand.path), "%s\\%s", dir, fd.cFileName) <= 0) continue;
+        if (!cache_parse_file(cand.path, &cand)) continue;
+        cand.tier = atoi(fd.cFileName + prefix_len + 1);
+        cand.mtime = fd.ftLastWriteTime;
+        rate_match = client_rate && cand.rate == client_rate;
+        quality_match = quality_tier_hint && cand.tier == quality_tier_hint;
+        /* 质量提示来源于当前播放器选择，优先级高于客户端 PCM 采样率：
+           源文件可能已经被播放器重采样，单看输入采样率会误选另一档。 */
+        score = quality_match ? 4 : (rate_match ? 2 : 0);
+        if (!have || score > best_score ||
+            (score == best_score && CompareFileTime(&cand.mtime, &best.mtime) > 0)) {
+            best = cand;
+            best_score = score;
+            best_selection = quality_match && rate_match ? "cache_quality_and_rate"
+                : quality_match ? "cache_quality_hint"
+                : rate_match ? "cache_rate_match" : "cache_mtime_fallback";
+            have = 1;
+        }
+    } while (FindNextFileA(find, &fd));
+    FindClose(find);
+    if (!have) return 0;
+
+    {
+        int changed = strcmp(g_source.probe_path, best.path) != 0 ||
+                      _stricmp(g_source.status, "observed") != 0 ||
+                      strcmp(g_source.play_id, play_id) != 0;
+        source_clear();
+        snprintf(g_source.status, sizeof(g_source.status), "observed");
+        snprintf(g_source.play_id, sizeof(g_source.play_id), "%s", play_id);
+        snprintf(g_source.format, sizeof(g_source.format), "%s", best.format);
+        snprintf(g_source.encoding, sizeof(g_source.encoding), "%s", best.encoding);
+        snprintf(g_source.probe_path, sizeof(g_source.probe_path), "%s", best.path);
+        g_source.rate = best.rate;
+        g_source.channels = best.channels;
+        g_source.valid_bits = best.bits;
+        g_source.container_bits = best.bits;
+        g_source.sample_bytes = (best.bits + 7) / 8;
+        g_source.lossless = best.lossless;
+        g_source.bitrate_kbps = best.kbps;
+        g_source.quality_tier = best.tier;
+        g_source.quality_tier_hint = quality_tier_hint;
+        snprintf(g_source.selection, sizeof(g_source.selection), "%s", best_selection);
+        g_source.audio_generation = source_current_generation();
+        g_source.updated_at_ms = now;
+        g_source.probe_started_ms = keep_started;
+        g_source.probe_last_ms = now;
+        if (changed)
+            host_log("source cache probe: observed playId=%s %s rate=%d channels=%d bits=%d kbps=%d tier=%d client_rate=%d selection=%s file=%s",
+                     play_id, best.encoding, best.rate, best.channels, best.bits, best.kbps,
+                     best.tier, client_rate, best_selection, best.path);
+    }
+    return 1;
+}
+
+/* 换歌后的确认窗口：缓存文件可能晚于 playId 出现，DLL 也可能稍后才协商出
+   新的输入采样率；窗口内每 1.5 秒重新挑一次，窗口结束仍没有就判为未取得。 */
+#define SOURCE_PROBE_WINDOW_MS 30000
+#define SOURCE_PROBE_INTERVAL_MS 1500
+
+static void source_begin_probe(const char *play_id, int quality_tier_hint) {
+    source_clear();
+    snprintf(g_source.status, sizeof(g_source.status), "pending");
+    snprintf(g_source.play_id, sizeof(g_source.play_id), "%s", play_id);
+    g_source.audio_generation = source_current_generation();
+    g_source.updated_at_ms = GetTickCount64();
+    g_source.probe_started_ms = g_source.updated_at_ms;
+    g_source.quality_tier_hint = quality_tier_hint;
+    source_probe_cache(play_id, quality_tier_hint);
+}
+
+static void source_refresh_probe(void) {
+    ULONGLONG now = GetTickCount64();
+    if (!g_source.probe_started_ms || !g_source.play_id[0]) return;
+    if (now - g_source.probe_started_ms > SOURCE_PROBE_WINDOW_MS) {
+        if (!_stricmp(g_source.status, "pending")) {
+            snprintf(g_source.status, sizeof(g_source.status), "unavailable");
+            g_source.updated_at_ms = now;
+            host_log("source cache probe: no cache header for playId=%s", g_source.play_id);
+        }
+        return;
+    }
+    if (now - g_source.probe_last_ms < SOURCE_PROBE_INTERVAL_MS) return;
+    source_probe_cache(g_source.play_id, g_source.quality_tier_hint);
+}
+
+static int source_update_from_json(const char *body) {
+    char status[16] = "", play_id[128] = "", format[16] = "";
+    int sample_bytes = 0, rate = 0, channels = 0, quality_tier_hint = 0;
+    if (!json_get_string(body, "source_status", status, sizeof(status))) return 400;
+    if (!_stricmp(status, "reset")) {
+        source_clear();
+        return 200;
+    }
+    if (!json_get_string(body, "source_play_id", play_id, sizeof(play_id)) ||
+        !source_allowed_id(play_id, 96)) return 400;
+    if (json_get_int(body, "source_quality_tier_hint", &quality_tier_hint) &&
+        !source_quality_tier_allowed(quality_tier_hint)) return 400;
+    if (!_stricmp(status, "pending")) {
+        source_clear();
+        snprintf(g_source.status, sizeof(g_source.status), "pending");
+        snprintf(g_source.play_id, sizeof(g_source.play_id), "%s", play_id);
+        g_source.quality_tier_hint = quality_tier_hint;
+        g_source.audio_generation = source_current_generation();
+        g_source.updated_at_ms = GetTickCount64();
+        return 200;
+    }
+    if (!_stricmp(status, "probe") || !_stricmp(status, "unavailable")) {
+        /* 面板在换歌时报告 playId 和当前质量提示；源规格由宿主读缓存头取得。
+           同一 playId 已经在确认窗口内或已取得结果时不重来，避免清掉 observed。 */
+        if (!strcmp(g_source.play_id, play_id) &&
+            g_source.quality_tier_hint == quality_tier_hint &&
+            (g_source.probe_started_ms || !_stricmp(g_source.status, "observed"))) return 200;
+        source_begin_probe(play_id, quality_tier_hint);
+        return 200;
+    }
+    if (_stricmp(status, "observed") != 0 ||
+        !json_get_string(body, "source_format", format, sizeof(format)) ||
+        !source_format_allowed(format) ||
+        !json_get_int(body, "source_sample_bytes", &sample_bytes) ||
+        !json_get_int(body, "source_rate", &rate) ||
+        !json_get_int(body, "source_channels", &channels) ||
+        sample_bytes < 0 || sample_bytes > 4 ||
+        (source_format_is_lossless(format) && !source_bits_from_bytes(sample_bytes)) ||
+        rate < 8000 || rate > 768000 ||
+        channels < 1 || channels > 32 || strcmp(g_source.play_id, play_id) != 0) return 409;
+    source_clear();
+    snprintf(g_source.status, sizeof(g_source.status), "observed");
+    snprintf(g_source.play_id, sizeof(g_source.play_id), "%s", play_id);
+    snprintf(g_source.format, sizeof(g_source.format), "%s", format);
+    g_source.rate = rate;
+    g_source.channels = channels;
+    g_source.sample_bytes = sample_bytes;
+    g_source.lossless = source_format_is_lossless(format);
+    g_source.valid_bits = g_source.lossless ? source_bits_from_bytes(sample_bytes) : 0;
+    g_source.container_bits = g_source.valid_bits;
+    if (!_stricmp(format, "flac")) snprintf(g_source.encoding, sizeof(g_source.encoding), "FLAC");
+    else if (!_stricmp(format, "pcm") || !_stricmp(format, "wav")) snprintf(g_source.encoding, sizeof(g_source.encoding), "整数 PCM");
+    else source_uppercase(g_source.encoding, sizeof(g_source.encoding), format);
+    g_source.audio_generation = source_current_generation();
+    g_source.updated_at_ms = GetTickCount64();
+    return 200;
 }
 
 /* ---- 进程 --------------------------------------------------------------- */
@@ -1287,7 +1897,8 @@ static int ws_send_text(SOCKET s, const char *text, char *resp, size_t respn) {
 }
 
 /* 发一个任意 CDP 命令。params 为 NULL 表示不带参数。 */
-static int cdp_cmd(SOCKET s, int id, const char *method, const char *params) {
+static int cdp_cmd_capture(SOCKET s, int id, const char *method, const char *params,
+                           char *response, size_t responsen) {
     size_t cap = strlen(method) + (params ? strlen(params) : 0) + 128;
     char *msg = (char *)malloc(cap);
     if (!msg) return 0;
@@ -1296,10 +1907,17 @@ static int cdp_cmd(SOCKET s, int id, const char *method, const char *params) {
     else
         snprintf(msg, cap, "{\"id\":%d,\"method\":\"%s\"}", id, method);
 
-    char resp[2048];
-    int ok = ws_send_text(s, msg, resp, sizeof(resp));
+    char local_resp[2048];
+    if (!response || !responsen) { response = local_resp; responsen = sizeof(local_resp); }
+    response[0] = 0;
+    int ok = ws_send_text(s, msg, response, responsen);
     free(msg);
-    if (ok && strstr(resp, "\"error\"")) {
+    if (ok && (!response[0] || !strstr(response, "\"id\""))) {
+        host_log("CDP %s �����ؿɽ�����", method);
+        return 0;
+    }
+    const char *resp = response;
+    if (ok && (strstr(response, "\"error\"") || strstr(response, "\"exceptionDetails\""))) {
         host_log("CDP %s 被拒绝: %.200s", method, resp);
         return 0;
     }
@@ -1307,6 +1925,11 @@ static int cdp_cmd(SOCKET s, int id, const char *method, const char *params) {
 }
 
 /* 在页面里执行一段 JS。 */
+static int cdp_cmd(SOCKET s, int id, const char *method, const char *params) {
+    char resp[2048];
+    return cdp_cmd_capture(s, id, method, params, resp, sizeof(resp));
+}
+
 static int cdp_eval(SOCKET s, const char *js, int id) {
     char *esc = json_escape(js);
     if (!esc) return 0;
@@ -1314,10 +1937,95 @@ static int cdp_eval(SOCKET s, const char *js, int id) {
     char *params = (char *)malloc(cap);
     if (!params) { free(esc); return 0; }
     snprintf(params, cap,
-             "{\"expression\":\"%s\",\"returnByValue\":false,\"awaitPromise\":false}", esc);
-    int ok = cdp_cmd(s, id, "Runtime.evaluate", params);
+             "{\"expression\":\"%s\",\"returnByValue\":true,\"awaitPromise\":true}", esc);
+    char resp[4096];
+    int ok = cdp_cmd_capture(s, id, "Runtime.evaluate", params, resp, sizeof(resp));
+    if (ok && strstr(resp, "\"type\":\"boolean\"") && strstr(resp, "\"value\":false")) {
+        host_log("CDP Runtime.evaluate ���� false: %.200s", resp);
+        ok = 0;
+    }
     free(params);
     free(esc);
+    return ok;
+}
+
+static int cdp_document_has_panel(const char *page) {
+    SOCKET s;
+    char resp[4096];
+    if (!page || !page[0]) return 0;
+    s = ws_open(page);
+    if (s == INVALID_SOCKET) return 0;
+    int ok = cdp_cmd_capture(s, 1, "Runtime.evaluate",
+                             "{\"expression\":\"typeof window.__nexPanelLoaded === 'string'\",\"returnByValue\":true}",
+                             resp, sizeof(resp));
+    closesocket(s);
+    return ok && strstr(resp, "\"value\":true") != NULL;
+}
+
+/* Ask the client page to rebuild the current audio stream. The page owns the
+   queue and progress bar; toggling playback makes the client run its normal
+   Stop/Start path, where the injected DLL sees the new config generation. The
+   current position and the original play/pause state are preserved. */
+static int touch_config_file(void) {
+    HANDLE f = CreateFileA(kHookCfg, FILE_WRITE_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        host_log("重开当前曲目: 无法标记配置代次 %lu", GetLastError());
+        return 0;
+    }
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    int ok = SetFileTime(f, NULL, NULL, &now) != FALSE;
+    if (!ok) host_log("重开当前曲目: 配置代次标记失败 %lu", GetLastError());
+    CloseHandle(f);
+    return ok;
+}
+
+static int restart_current_track(void) {
+    char page[128];
+    if (!cdp_page_id(page, sizeof(page))) return 0;
+    if (!touch_config_file()) return 0;
+    SOCKET s = ws_open(page);
+    if (s == INVALID_SOCKET) return 0;
+    const char *js =
+        "(function(){"
+        "function visibleButton(){"
+        "var buttons=document.querySelectorAll('[data-testid=\\\"tid_playbar_play_btn\\\"]');"
+        "for(var i=0;i<buttons.length;i++){"
+        "var rect=buttons[i].getBoundingClientRect();"
+        "if(rect.width>0&&rect.height>0)return buttons[i];"
+        "}"
+        "return null;"
+        "}"
+        "var button=visibleButton();"
+        "if(!button)return false;"
+        "var icon=button.querySelector('[role=\\\"img\\\"]');"
+        "var label=((icon&&icon.getAttribute('aria-label'))||'').toLowerCase();"
+        "var wasPlaying=label==='pause'||label==='暂停';"
+        "button.click();"
+        "return new Promise(function(resolve){"
+        "setTimeout(function(){"
+        "var b=visibleButton();"
+        "if(!b){resolve(false);return;}"
+        "var i=b.querySelector('[role=\\\"img\\\"]');"
+        "var now=((i&&i.getAttribute('aria-label'))||'').toLowerCase();"
+        "var nowPlaying=now==='pause'||now==='暂停';"
+        "if(nowPlaying!==wasPlaying)b.click();"
+        "setTimeout(function(){"
+        "var check=visibleButton();"
+        "if(!check){resolve(false);return;}"
+        "var ci=check.querySelector('[role=\\\"img\\\"]');"
+        "var finalLabel=((ci&&ci.getAttribute('aria-label'))||'').toLowerCase();"
+        "var finalPlaying=finalLabel==='pause'||finalLabel==='暂停';"
+        "resolve(finalPlaying===wasPlaying);"
+        "},40);"
+        "},120);"
+        "});"
+        "})()";
+    int ok = cdp_eval(s, js, 1);
+    closesocket(s);
+    if (ok) host_log("已请求重开当前曲目");
     return ok;
 }
 
@@ -1565,6 +2273,7 @@ static DWORD WINAPI http_thread(LPVOID unused) {
             if (v[6] < 0 || v[6] > 100) v[6] = 5;
             if (v[8] != 0 && v[8] != 1) v[8] = 0;
             if (v[9] != 0 && v[9] != 1) v[9] = 0;
+            if (v[10] != 0 && v[10] != 1) v[10] = 0;
             if (!cfg_write(v)) http_reply(c, 500, "{\"error\":\"config write failed\"}");
             else {
                 cfg_to_json(v, out, sizeof(out));
@@ -1584,6 +2293,14 @@ static DWORD WINAPI http_thread(LPVOID unused) {
                 ui_to_json(v, out, sizeof(out));
                 http_reply(c, 200, out);
             }
+        } else if (strcmp(path, "/api/restart") == 0 && strcmp(method, "POST") == 0) {
+            if (restart_current_track()) http_reply(c, 200, "{\"ok\":true}");
+            else http_reply(c, 503, "{\"error\":\"playback page unavailable\"}");
+        } else if (strcmp(path, "/api/source") == 0 && strcmp(method, "POST") == 0) {
+            int source_code = source_update_from_json(body_buf);
+            if (source_code == 200) http_reply(c, 200, "{\"ok\":true}");
+            else if (source_code == 409) http_reply(c, 409, "{\"error\":\"source playId or fields rejected\"}");
+            else http_reply(c, 400, "{\"error\":\"invalid source metadata\"}");
         } else if (strcmp(path, "/api/status") == 0) {
             status_json(out, sizeof(out));
             http_reply(c, 200, out);
@@ -1908,7 +2625,7 @@ static int stop_client_processes(void) {
     if (hwnd) PostMessageW(hwnd, WM_CLOSE, 0, 0);
     DWORD wait = WaitForSingleObject(process, 5000);
     if (wait != WAIT_OBJECT_0) {
-        host_log("安装: 网易云未在 5 秒内退出，终止 pid=%lu", (unsigned long)pid);
+        host_log("网易云未在 5 秒内退出，终止 pid=%lu", (unsigned long)pid);
         TerminateProcess(process, 0);
         wait = WaitForSingleObject(process, 3000);
     }
@@ -2272,6 +2989,26 @@ static int   g_ui_injected;
 static DWORD g_last_probe;
 static DWORD g_last_ui_time;
 static DWORD g_last_restart_attempt;
+static LONG g_cdp_relaunch_inflight;
+static int g_cdp_relaunch_attempted;
+static unsigned g_cdp_miss_probes;
+
+/* Existing clients do not retroactively open Chromium's debugging port when a
+   second instance is started with --remote-debugging-port.  Once the same
+   client has missed two 15-second probes, restart it once in a worker thread;
+   the UI thread remains available for the tray and window messages. */
+static DWORD WINAPI relaunch_client_for_cdp(LPVOID unused) {
+    (void)unused;
+    host_log("9333 连续未开放，准备重启网易云并带调试端口");
+    if (stop_client_processes()) {
+        host_log("网易云已退出，重新启动并开放 9333");
+        if (!launch_client()) host_log("带 9333 启动网易云失败");
+    } else {
+        host_log("网易云未能退出，暂不重复重启");
+    }
+    InterlockedExchange(&g_cdp_relaunch_inflight, 0);
+    return 0;
+}
 
 static void watchdog_tick(void) {
     DWORD pid = find_main_client();
@@ -2286,13 +3023,21 @@ static void watchdog_tick(void) {
             g_injected_pid = 0;
             g_ui_injected = 0;
             g_last_page[0] = 0;
+            g_cdp_miss_probes = 0;
+            g_cdp_relaunch_attempted = 0;
+            source_clear();
         }
         return;
     }
 
+    /* A relaunch worker owns the old client while it is shutting down. Do not
+       inject into a process that is about to be replaced. */
+    if (g_cdp_relaunch_inflight) return;
+
     if (pid != g_injected_pid || !module_loaded(pid, L"nexsink.dll")) {
         if (inject_dll(pid, kSinkDll)) {
             g_injected_pid = pid;
+            source_clear();
             host_log("模块已挂载到 pid=%lu", (unsigned long)pid);
         }
         g_ui_injected = 0;
@@ -2304,7 +3049,8 @@ static void watchdog_tick(void) {
     if (cdp_page_id(page, sizeof(page))) {
         /* 同一页面目标只登记一次。脚本注册会随文档加载自动执行，
            重复登记会让长时间运行的客户端累积副本。 */
-        int need = !g_ui_injected || strcmp(page, g_last_page) != 0;
+        int document_has_panel = cdp_document_has_panel(page);
+        int need = !g_ui_injected || strcmp(page, g_last_page) != 0 || !document_has_panel;
         if (need) {
             int was = g_ui_injected;
             if (inject_ui_once()) {
@@ -2312,11 +3058,27 @@ static void watchdog_tick(void) {
                 g_ui_injected = 1;
                 g_last_ui_time = now;
                 snprintf(g_last_page, sizeof(g_last_page), "%s", page);
+                g_cdp_miss_probes = 0;
             }
         }
     } else if (now - g_last_probe > 15000) {
         g_last_probe = now;
+        g_cdp_miss_probes++;
         host_log("CDP 端口未就绪（客户端可能刚启动）");
+        if (g_cdp_miss_probes >= 2 && !g_cdp_relaunch_attempted) {
+            g_cdp_relaunch_attempted = 1;
+            g_injected_pid = 0;
+            g_ui_injected = 0;
+            g_last_page[0] = 0;
+            if (InterlockedCompareExchange(&g_cdp_relaunch_inflight, 1, 0) == 0) {
+                HANDLE worker = CreateThread(NULL, 0, relaunch_client_for_cdp, NULL, 0, NULL);
+                if (worker) CloseHandle(worker);
+                else {
+                    InterlockedExchange(&g_cdp_relaunch_inflight, 0);
+                    host_log("无法创建 9333 重启线程，错误 %lu", GetLastError());
+                }
+            }
+        }
     }
 }
 
@@ -2405,6 +3167,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int main(int argc, char **argv) {
     InitializeCriticalSection(&g_log_lock);
+    source_clear();
     if (!resolve_paths()) {
         MessageBoxW(NULL, L"无法解析 NexExclusive 自身目录，已停止启动。", L"NexExclusive", MB_ICONERROR);
         return 1;

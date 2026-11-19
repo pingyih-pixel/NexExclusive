@@ -1,10 +1,11 @@
 # 从源码构建
 
 想改代码，或者想自己验证发布包里的二进制，读这一篇。只想使用的话回到 [README](../README.md)。
+本文只负责编译、回归和打包；注入、宿主运行和账户清理见 [DEVELOPMENT_RUNTIME.md](DEVELOPMENT_RUNTIME.md)。
 
 ## 构建方式
 
-源码是 C。构建脚本用 Zig 自带的 `zig cc` 交叉编译到 `x86_64-windows-gnu`，资源文件用 `zig rc` 编译。Zig 在这里充当编译器，源码本身不含 Zig 代码。构建不需要 Visual Studio，也不需要 Windows SDK。
+运行时源码是 C；`audio_policy.h` 保持 C/C++ 都能包含，策略测试用 `zig c++` 编译。构建脚本用 Zig 自带的 `zig cc` 交叉编译到 `x86_64-windows-gnu`，资源文件用 `zig rc` 编译。Zig 在这里充当编译器，源码本身不含 Zig 代码。构建不需要 Visual Studio，也不需要 Windows SDK。
 
 ## 依赖
 
@@ -50,6 +51,7 @@ ZIG=/c/zig/zig-x86_64-windows-0.17.1 bash mod/build.sh all
 | `mod/src/nexsink.c` | 注入客户端进程的 DLL 的入口，依次包含下面六个 `.inc`，合成一个编译单元 |
 | `mod/src/sink_core.inc` | 配置、日志、状态、vtable 记录 |
 | `mod/src/sink_dsp.inc` | 环形缓冲、采样格式转换、重采样 |
+| `mod/src/audio_policy.h` | C/C++ 共用的采样率、有效位深、容器位深候选规则 |
 | `mod/src/sink_device.inc` | 输出线程、故障处理、伪造的客户端对象 |
 | `mod/src/sink_lifecycle.inc` | 设备「代」的切换、停止与拆除 |
 | `mod/src/sink_endpoint.inc` | 格式协商、迁移、接管 |
@@ -57,7 +59,8 @@ ZIG=/c/zig/zig-x86_64-windows-0.17.1 bash mod/build.sh all
 | `mod/tools/nexhost.c` | 宿主 exe：安装卸载、托盘、注入、本机配置服务、CDP 界面注入 |
 | `mod/tools/nexaudiolink.h` / `nexaudiohost.c` | 独立音频宿主协议与 WASAPI 端点进程 |
 | `mod/ui/` | 注入客户端页面的 `panel.js` 与 `simplify.js` |
-| `mod/test/regression.c` | 19 组回归，直接包含 `nexsink.c`，所以能测到内部的静态函数 |
+| `mod/test/audio_policy_test.cpp` | AudioPolicy 的 C++ 兼容性与同采样率位深候选测试 |
+| `mod/test/regression.c` | DLL 回归，直接包含 `nexsink.c`，所以能测到内部的静态函数 |
 
 回归测试覆盖 DLL 一侧：vtable、环形缓冲、重采样、生命周期、闸门。宿主一侧的安装、卸载、托盘、单实例目前靠手工验证。
 
@@ -74,3 +77,5 @@ Get-MpThreatDetection | Sort-Object InitialDetectionTime -Descending | Select -F
 ## CI
 
 `.github/workflows/build.yml` 在 `windows-latest` 上运行与本地相同的 `bash mod/build.sh test` 和 `bash release.sh`，推送 `v*` 标签时再创建 Release。
+
+本轮构建记录：`bash mod/build.sh all` 重新生成 DLL、Host 和 NexAudioHost；`bash mod/build.sh test` 完成协议、设备、背压、Host 退出、EOS 和生命周期回归，结果为 `ALL TESTS PASSED: 0 failure(s)`。真实设备验收与日志字段见 `docs/AUDIO_CORRECTNESS_AUDIT_2026-11-16.md`。

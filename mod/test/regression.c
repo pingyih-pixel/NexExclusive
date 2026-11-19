@@ -97,6 +97,18 @@ static void test_fade(void) {
            samples, old_result, new_result);
 }
 
+static void test_valid_bits_alignment(void) {
+    BYTE packed24[3], packed32[4];
+    sample_write(0.5, packed24, 24, 16, 0, 0);
+    CHECK(packed24[0] == 0 && packed24[1] == 0 && packed24[2] == 0x40);
+    CHECK(fabs(sample_read(packed24, 24, 16, 0) - 0.5) < 1e-9);
+    sample_write(-0.5, packed32, 32, 16, 0, 0);
+    CHECK(packed32[0] == 0 && packed32[1] == 0 &&
+          packed32[2] == 0x00 && packed32[3] == 0xC0);
+    CHECK(fabs(sample_read(packed32, 32, 16, 0) + 0.5) < 1e-9);
+    printf("PASS valid bits alignment: 16-bit samples stay left-aligned in 24/32-bit containers\n");
+}
+
 /* ---- ring + proxy ------------------------------------------------------- */
 static void prepare_ring(void) {
     memset(&g_sink, 0, sizeof(g_sink));
@@ -110,6 +122,11 @@ static void prepare_ring(void) {
     g_sink.in_valid_bits = 32;
     g_sink.out_bits = 32;
     g_sink.generation = 7;
+    g_sink.config_epoch = g_cfg_policy_epoch;
+    g_sink.config_file_epoch = g_cfg_epoch;
+    g_sink.config_enable = g_enable;
+    g_sink.config_frames = g_out_frames;
+    g_sink.config_audiohost = g_audiohost;
     g_sink.ring = (BYTE *)malloc(32 * 8);
     g_sink.conv = (BYTE *)malloc(32 * 8);
     memset(g_sink.ring, 0x5A, 32 * 8);
@@ -121,6 +138,7 @@ static void prepare_ring(void) {
     g_fake_render.generation = g_sink.generation;
     g_fake_render.capacity = g_sink.reported_frames;
     g_fake_render.staging = (BYTE *)malloc((size_t)g_fake_render.capacity * g_sink.in_block);
+    g_fake_render.staging_bytes = (size_t)g_fake_render.capacity * g_sink.in_block;
     g_sink.proxy_render = &g_fake_render;
 }
 static void free_ring(void) {
@@ -165,6 +183,39 @@ static void test_silent(void) {
     printf("PASS silent: recycled samples cleared, bounds/order/cancellation checked\n");
 }
 
+typedef struct {
+    HANDLE entered;
+} RingLockThread;
+static DWORD WINAPI ring_lock_holder(LPVOID arg) {
+    RingLockThread *ctx = (RingLockThread *)arg;
+    EnterCriticalSection(&g_lock);
+    SetEvent(ctx->entered);
+    Sleep(50);
+    LeaveCriticalSection(&g_lock);
+    return 0;
+}
+
+/* A short overlap with the drain's ring copy must not turn a valid client
+   packet into DEVICE_INVALIDATED. The audio thread may wait for this tiny
+   critical section; dropping the packet starts the same-format rebuild loop
+   seen in the live client. */
+static void test_ring_reserve_waits_for_drain(void) {
+    prepare_ring();
+    RingLockThread ctx = { CreateEventA(NULL, TRUE, FALSE, NULL) };
+    HANDLE thread = CreateThread(NULL, 0, ring_lock_holder, &ctx, 0, NULL);
+    CHECK(thread != NULL);
+    if (thread) {
+        CHECK(WaitForSingleObject(ctx.entered, 1000) == WAIT_OBJECT_0);
+        BYTE *p = ring_reserve(4);
+        CHECK(p != NULL);
+        CHECK(WaitForSingleObject(thread, 1000) == WAIT_OBJECT_0);
+        CloseHandle(thread);
+    }
+    CloseHandle(ctx.entered);
+    free_ring();
+    printf("PASS ring_reserve: transient drain lock does not drop a client packet\n");
+}
+
 /* A stale proxy from a previous stream must not be able to write into the new
    ring, even though the pointer is still valid memory. */
 static void test_stale_proxy(void) {
@@ -177,6 +228,142 @@ static void test_stale_proxy(void) {
     CHECK(g_sink.w == 0);
     free_ring();
     printf("PASS stale proxy: previous stream's handle rejected after rebuild\n");
+}
+
+/* A policy edit may arrive together with a client-contract or engine edit.
+   Those latter changes still belong to the next Initialize, so the reload
+   path must defer the whole combination instead of rebuilding mid-stream. */
+static void test_config_reload_defer_matrix(void) {
+    CHECK(config_reload_should_defer(0, 0, 0) == 0);
+    CHECK(config_reload_should_defer(0, 1, 0) == 1);
+    CHECK(config_reload_should_defer(0, 0, 1) == 1);
+    CHECK(config_reload_should_defer(1, 0, 0) == 0);
+    CHECK(config_reload_should_defer(1, 1, 0) == 1);
+    CHECK(config_reload_should_defer(1, 0, 1) == 1);
+    printf("PASS config reload: contract and engine changes defer even with policy changes\n");
+}
+
+/* A policy rebuild replaces the device generation while the client keeps its
+   IAudioRenderClient, IAudioClock and event handle. The public proxy pointer
+   must remain usable after the generation token is refreshed. */
+static void test_policy_rebuild_preserves_client_state(void) {
+    prepare_ring();
+    HANDLE client_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    CHECK(client_event != NULL);
+    g_sink.owner = (void *)(UINT_PTR)0x1234;
+    g_sink.h_client = client_event;
+    FakeObj *render = g_sink.proxy_render;
+    BYTE *staging = render->staging;
+    memset(&g_fake_clock, 0, sizeof(g_fake_clock));
+    g_fake_clock.vtbl = g_fake_clock_vtbl;
+    g_fake_clock.ref = 1;
+    g_fake_clock.generation = g_sink.generation;
+    g_sink.proxy_clock = &g_fake_clock;
+    UINT64 next_generation = g_sink.generation + 1;
+    CHECK(sink_rebind_client_state(next_generation) == S_OK);
+    CHECK(g_sink.owner == (void *)(UINT_PTR)0x1234);
+    CHECK(g_sink.h_client == client_event);
+    CHECK(g_sink.proxy_render == render);
+    CHECK(g_sink.proxy_render->generation == next_generation);
+    CHECK(g_sink.proxy_render->capacity == g_sink.reported_frames);
+    CHECK(g_sink.proxy_render->staging == staging);
+    BYTE *p = NULL;
+    CHECK(fr_GetBuffer(render, 4, &p) == S_OK);
+    CHECK(p == staging);
+    CHECK(fr_ReleaseBuffer(render, 0, 0) == S_OK);
+    CloseHandle(client_event);
+    g_sink.h_client = NULL;
+    free_ring();
+    printf("PASS policy rebuild: client owner, event and proxy identity survive generation refresh\n");
+}
+
+/* NetEase can create the next IAudioClient while the previous same-format
+   client is still submitting.  The device side must stay alive across that
+   client handoff; tearing it down here produces an audible gap. */
+typedef struct {
+    void **vtbl;
+    LONG refs;
+} HandoffClient;
+static ULONG STDMETHODCALLTYPE handoff_addref(void *self) {
+    return (ULONG)InterlockedIncrement(&((HandoffClient *)self)->refs);
+}
+static ULONG STDMETHODCALLTYPE handoff_release(void *self) {
+    return (ULONG)InterlockedDecrement(&((HandoffClient *)self)->refs);
+}
+static void *handoff_vtbl[3] = { NULL, (void *)handoff_addref, (void *)handoff_release };
+
+static void test_same_format_stream_handoff(void) {
+    prepare_ring();
+    load_config();
+    g_sink.config_epoch = g_cfg_policy_epoch;
+    g_sink.config_file_epoch = g_cfg_epoch;
+    g_sink.config_enable = g_enable;
+    g_sink.config_frames = g_out_frames;
+    g_sink.config_audiohost = g_audiohost;
+    SinkGen *gen = mock_gen();
+    HandoffClient old_client = { handoff_vtbl, 1 };
+    HandoffClient new_client = { handoff_vtbl, 1 };
+    g_sink.owner = &old_client;
+    g_sink.started = 1;
+    g_sink.in_rate = 44100;
+    g_sink.in_channels = 2;
+    g_sink.in_block = 8;
+    g_sink.in_container_bits = 32;
+    g_sink.in_valid_bits = 32;
+    g_sink.channel_mask = mask_for(2);
+    g_sink.in_is_float = 0;
+    FakeObj *old_proxy = g_sink.proxy_render;
+    fr_AddRef(old_proxy);
+    memset(&g_fake_clock, 0, sizeof(g_fake_clock));
+    g_fake_clock.vtbl = g_fake_clock_vtbl;
+    g_fake_clock.ref = 1;
+    g_fake_clock.generation = g_sink.generation;
+    g_sink.proxy_clock = &g_fake_clock;
+    BYTE *pending = NULL;
+    CHECK(fr_GetBuffer(old_proxy, 1, &pending) == S_OK);
+    if (pending) memset(pending, 0xA7, g_sink.in_block);
+    WAVEFORMATEXTENSIBLE fmt;
+    build_fmt_ex(&fmt, 44100, 32, 0, 2, mask_for(2));
+
+    HRESULT hr = sink_engage_controlled((IAudioClient *)&new_client,
+                                        &fmt.Format, 300000, NULL);
+    CHECK(hr == S_OK);
+    CHECK(g_sink.engaged);
+    CHECK(g_sink.gen == gen);
+    CHECK(g_sink.owner == &new_client);
+    /* Each IAudioClient needs an independent staging buffer. The device
+       generation stays shared during a same-format handoff, so the previous
+       client may finish its outstanding packet and submit another packet
+       while the successor is already active. */
+    CHECK(g_sink.proxy_render != old_proxy);
+    FakeObj *new_proxy = g_sink.proxy_render;
+    CHECK(g_sink.started == 1);
+    CHECK(H_Stop(&new_client) == S_FALSE);
+    CHECK(g_sink.started == 1);
+    CHECK(H_Start(&new_client) == S_OK);
+    CHECK(g_sink.started == 1);
+    CHECK(old_client.refs == 0);
+    CHECK(new_client.refs == 2);
+    BYTE *successor = NULL;
+    CHECK(fr_GetBuffer(new_proxy, 1, &successor) == S_OK);
+    CHECK(successor != NULL && successor != pending);
+    memset(successor, 0x5A, g_sink.in_block);
+    CHECK(fr_ReleaseBuffer(new_proxy, 1, 0) == S_OK);
+    CHECK(fr_ReleaseBuffer(old_proxy, 1, 0) == S_OK);
+    CHECK(g_sink.w == 2);
+    BYTE *continued = NULL;
+    HRESULT continued_hr = fr_GetBuffer(old_proxy, 1, &continued);
+    CHECK(continued_hr == S_OK);
+    if (continued_hr == S_OK && continued) {
+        memset(continued, 0x3C, g_sink.in_block);
+        CHECK(fr_ReleaseBuffer(old_proxy, 1, 0) == S_OK);
+        CHECK(g_sink.w == 3);
+    }
+    fr_Release(old_proxy);
+
+    sink_teardown_controlled();
+    CHECK(new_client.refs == 1);
+    printf("PASS same-format handoff: device generation, playback state and pending client data survive a new client\n");
 }
 
 /* The occupied span wrapping past cap must survive compaction: the naive
@@ -324,7 +511,7 @@ static void test_valid_format(void) {
 
 static void test_src_prefer_order(void) {
     int rates[] = {88200, 96000, 44100, 176400, 48000};
-    prefer_integer_ratios(rates, 5, 88200);
+    nex_audio_policy_prefer_integer_ratios(rates, 5, 88200);
     CHECK(rates[0] == 88200);
     CHECK(rates[1] == 44100);
     CHECK(rates[2] == 176400);
@@ -370,7 +557,7 @@ static void test_hifi_config_policy(void) {
     g_cfg_loaded = 0;
     f = _wfopen(path, L"wb");
     if (!f) { printf("SKIP hifi policy: cannot create compatibility config\n"); return; }
-    fputs("hifi=0\ncompat=1\nshared_fallback=1\n", f);
+    fputs("hifi=0\ncompat=1\naudiohost=1\nshared_fallback=1\n", f);
     fclose(f);
     WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL);
     _putenv_s("NEX_CFG", utf8);
@@ -378,11 +565,12 @@ static void test_hifi_config_policy(void) {
     load_config();
     CHECK(g_hifi == 0);
     CHECK(g_compat == 1);
+    CHECK(g_audiohost == 1);
     CHECK(g_shared_fallback == 0);
     DeleteFileW(path);
     _putenv_s("NEX_CFG", "");
     g_cfg_loaded = 0;
-    printf("PASS output policy: strict native disables processing; shared fallback stays off\n");
+    printf("PASS output policy: strict native disables processing; audiohost permits converted PCM; shared fallback stays off\n");
 }
 
 static void test_hifi_verifier(void) {
@@ -539,6 +727,8 @@ static UINT32 mock_padding;
 static UINT32 mock_gb_frames, mock_rb_frames;
 static DWORD  mock_rb_flags;
 static int    mock_start_calls, mock_gb_calls;
+static int    mock_event_full;
+static UINT32 mock_event_capacity;
 
 static HRESULT STDMETHODCALLTYPE mock_get_padding(void *s, UINT32 *p) {
     (void)s; if (p) *p = mock_padding; return S_OK;
@@ -555,6 +745,7 @@ static HRESULT STDMETHODCALLTYPE mock_start_counted(void *s) { (void)s; mock_sta
 static HRESULT STDMETHODCALLTYPE mock_render_get(void *s, UINT32 frames, BYTE **pp) {
     (void)s;
     mock_gb_calls++; mock_gb_frames = frames;
+    if (mock_event_full && frames != mock_event_capacity) return AUDCLNT_E_BUFFER_SIZE_ERROR;
     if (pp) *pp = mock_dev_buf;
     return S_OK;
 }
@@ -651,6 +842,387 @@ static void test_drain(void) {
     free(g_inb); g_inb = NULL;
     free_ring();
     printf("PASS drain: sizes agree, no fabricated silence, start deferred, space clamped\n");
+}
+
+/* ---- remote v3 producer path -------------------------------------------- */
+static void remote_fixture_begin(NexAudioControl *c, BYTE *data, UINT32 capacity,
+                                 UINT32 frame_bytes) {
+    memset(c, 0, sizeof(*c));
+    nex_audio_control_init(c, 9);
+    c->state = NEX_AUDIO_READY;
+    c->capacity_frames = capacity;
+    c->output_frame_bytes = frame_bytes;
+    c->data_bytes = (UINT64)capacity * frame_bytes;
+    c->client_hash = c->converted_hash = c->endpoint_hash = 1469598103934665603ull;
+    memset(data, 0, (size_t)c->data_bytes);
+    g_remote_ipc = c;
+    g_remote_pcm_data = data;
+    g_remote_data = CreateEventA(NULL, FALSE, FALSE, NULL);
+    g_remote_space = CreateEventA(NULL, FALSE, FALSE, NULL);
+    g_remote_error = S_OK;
+    g_remote_reason = NEX_AUDIO_FALLBACK_NONE;
+}
+
+static void remote_fixture_end(void) {
+    if (g_remote_data) CloseHandle(g_remote_data);
+    if (g_remote_space) CloseHandle(g_remote_space);
+    g_remote_data = g_remote_space = NULL;
+    g_remote_ipc = NULL;
+    g_remote_pcm_data = NULL;
+    g_remote_error = E_FAIL;
+    g_remote_reason = NEX_AUDIO_FALLBACK_NONE;
+}
+
+static void test_remote_converted_drain(void) {
+    prepare_ring();
+    g_sink.in_rate = 44100;
+    g_sink.out_rate = 44100;
+    g_sink.out_container_bits = 24;
+    g_sink.out_valid_bits = 24;
+    g_sink.out_bits = 24;
+    g_sink.out_block = 6;
+    g_sink.hifi_map = 2;
+    g_sink.resample = 0;
+    free(g_inb);
+    g_inb = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_block);
+    g_remote_out = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.out_block);
+    BYTE original[8 * 8], expected[8 * 6];
+    for (UINT32 f = 0; f < 8; f++)
+        for (UINT32 b = 0; b < g_sink.in_block; b++) {
+            BYTE value = (BYTE)(f * 11 + b + 1);
+            g_sink.ring[f * g_sink.in_block + b] = value;
+            original[f * g_sink.in_block + b] = value;
+        }
+    g_sink.w = 8;
+    convert(original, expected, 8);
+
+    NexAudioControl control;
+    BYTE pcm[64 * 8];
+    remote_fixture_begin(&control, pcm, 64, 6);
+    SinkGen gen;
+    memset(&gen, 0, sizeof(gen));
+    gen.remote = 1;
+    gen.real_frames = 8;
+    g_sink.gen = &gen;
+    CHECK(drain_once(&gen) == S_OK);
+    CHECK(control.client_frames == 8);
+    CHECK(control.converted_frames == 8);
+    CHECK(control.endpoint_frames == 0);
+    CHECK(control.write_frame == 8 && control.read_frame == 0);
+    CHECK(control.client_hash != control.converted_hash);
+    CHECK(memcmp(pcm, expected, sizeof(expected)) == 0);
+    CHECK(gen.submitted == 8 && g_sink.r == 8);
+    CHECK(gen.device_started == 0); /* only the host may publish this flag */
+    CHECK(g_sink.hifi_client_frames == 8 && g_sink.hifi_converted_frames == 8);
+
+    /* An event-driven client keeps waiting for the next device period even
+       while its producer ring still holds frames. A remote submission must
+       release that wait regardless of the ring's instantaneous fill level. */
+    HANDLE client_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    CHECK(client_event != NULL);
+    g_sink.h_client = client_event;
+    for (UINT32 f = 8; f < 24; f++)
+        for (UINT32 b = 0; b < g_sink.in_block; b++)
+            g_sink.ring[f * g_sink.in_block + b] = (BYTE)(f * 11 + b + 1);
+    g_sink.w = 24;
+    CHECK(drain_once(&gen) == S_OK);
+    CHECK(g_sink.r == 16 && g_sink.w == 24);
+    CHECK(WaitForSingleObject(client_event, 0) == WAIT_OBJECT_0);
+    CloseHandle(client_event);
+    g_sink.h_client = NULL;
+
+    free(g_remote_out);
+    g_remote_out = NULL;
+    remote_fixture_end();
+    free(g_inb);
+    g_inb = NULL;
+    free_ring();
+    printf("PASS remote converted drain: existing DSP feeds independent PCM mapping\n");
+}
+
+static void test_remote_resample_respects_device_period(void) {
+    prepare_ring();
+    g_sink.in_rate = 44100;
+    g_sink.out_rate = 48000;
+    g_sink.out_container_bits = 24;
+    g_sink.out_valid_bits = 24;
+    g_sink.out_bits = 24;
+    g_sink.out_block = 6;
+    g_sink.hifi_map = 2;
+    CHECK(src_init(g_sink.in_rate, g_sink.out_rate, 2));
+    g_sink.resample = 1;
+    free(g_inb);
+    free(g_fin);
+    free(g_fout);
+    g_inb = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_block);
+    g_fin = (float *)malloc((size_t)SCRATCH_FRAMES * 2 * sizeof(float));
+    g_fout = (float *)malloc(64 * 2 * sizeof(float));
+    g_remote_out = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.out_block);
+    CHECK(g_inb && g_fin && g_fout && g_remote_out);
+    memset(g_fout, 0xA5, 64 * 2 * sizeof(float));
+    for (UINT32 f = 0; f < 16; f++)
+        for (UINT32 b = 0; b < g_sink.in_block; b++)
+            g_sink.ring[f * g_sink.in_block + b] = (BYTE)(f * 13 + b + 1);
+    g_sink.w = 16;
+
+    NexAudioControl control;
+    BYTE pcm[64 * 6];
+    remote_fixture_begin(&control, pcm, 64, 6);
+    SinkGen gen;
+    memset(&gen, 0, sizeof(gen));
+    gen.remote = 1;
+    gen.real_frames = 8;
+    g_sink.gen = &gen;
+    CHECK(drain_once(&gen) == S_OK);
+
+    const BYTE *fout_bytes = (const BYTE *)g_fout;
+    int canary_intact = 1;
+    for (size_t i = 8 * 2 * sizeof(float); i < 64 * 2 * sizeof(float); i++)
+        if (fout_bytes[i] != 0xA5) { canary_intact = 0; break; }
+    CHECK(canary_intact);
+    CHECK(control.converted_frames == 8);
+    CHECK(control.write_frame == 8 && gen.submitted == 8);
+
+    free(g_remote_out);
+    g_remote_out = NULL;
+    remote_fixture_end();
+    scratch_free();
+    src_free();
+    free_ring();
+    printf("PASS remote resample: one device period bounds conversion scratch and PCM submission\n");
+}
+
+static void test_remote_clock_uses_host_device_clock(void) {
+    prepare_ring();
+    memset(&g_fake_clock, 0, sizeof(g_fake_clock));
+    g_fake_clock.vtbl = g_fake_clock_vtbl;
+    g_fake_clock.ref = 1;
+    g_fake_clock.generation = g_sink.generation;
+    g_sink.proxy_clock = &g_fake_clock;
+    SinkGen *gen = mock_gen();
+    gen->remote = 1;
+    gen->real_clock = NULL;
+    gen->clock_frequency = 0;
+    g_sink.out_rate = 48000;
+
+    NexAudioControl control;
+    BYTE pcm[64 * 6];
+    remote_fixture_begin(&control, pcm, 64, 6);
+    control.output_rate = 48000;
+    control.device_clock_frequency = 10000000ULL;
+    control.device_clock_position = 5000000ULL;
+    control.device_clock_qpc = 900ULL;
+    UINT64 pos = 0, qpc = 0;
+    CHECK(fc_GetPosition(NULL, &pos, &qpc) == S_OK);
+    CHECK(pos == 5000000ULL);
+    CHECK(qpc == 900ULL);
+    control.device_clock_position = 10000208ULL;
+    control.device_clock_qpc = 901ULL;
+    CHECK(fc_GetPosition(NULL, &pos, &qpc) == S_OK);
+    CHECK(pos == 10000208ULL);
+
+    /* Once the endpoint is running, one device period has been queued ahead of
+       the playhead. Correct the remote clock base at that transition so the
+       public position stays continuous while later values follow the queue. */
+    gen->device_started = 1;
+    gen->real_frames = 4800;
+    control.device_clock_position = 10000208ULL;
+    CHECK(fc_GetPosition(NULL, &pos, &qpc) == S_OK);
+    CHECK(pos == 10000208ULL);
+    control.device_clock_position = 11000208ULL;
+    CHECK(fc_GetPosition(NULL, &pos, &qpc) == S_OK);
+    CHECK(pos == 11000208ULL);
+
+    control.device_clock_position = 0;
+    CHECK(fc_GetPosition(NULL, &pos, &qpc) == S_OK);
+    CHECK(pos == 11000208ULL);
+
+    remote_fixture_end();
+    free_ring();
+    printf("PASS remote clock: Host IAudioClock provides the client timeline\n");
+}
+
+static void test_remote_backpressure_is_atomic(void) {
+    memset(&g_sink, 0, sizeof(g_sink));
+    NexAudioControl control;
+    BYTE pcm[64 * 8], source[4 * 8];
+    memset(source, 0x6C, sizeof(source));
+    remote_fixture_begin(&control, pcm, 4, 8);
+    CHECK(nex_audio_ring_write(&control, pcm, source, 3) == 3);
+    CHECK(remote_write(NULL, source, 2) == 0);
+    CHECK(control.state == NEX_AUDIO_FAILED);
+    CHECK(control.fallback_reason == NEX_AUDIO_FALLBACK_RING_BACKPRESSURE);
+    CHECK(control.backpressure_events == 1);
+    CHECK(control.write_frame == 3 && control.read_frame == 0);
+    CHECK(control.converted_frames == 0 && control.dropped_frames == 0);
+    CHECK(g_remote_error == HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+    remote_fixture_end();
+    printf("PASS remote backpressure: full write refuses truncation without dropped frames\n");
+}
+
+static void test_remote_drain_backpressure_is_atomic(void) {
+    prepare_ring();
+    g_sink.in_rate = g_sink.out_rate = 48000;
+    g_sink.out_container_bits = g_sink.out_valid_bits = g_sink.out_bits = 32;
+    g_sink.out_block = g_sink.in_block = 8;
+    g_sink.resample = 0;
+    g_sink.w = 2;
+    memset(g_sink.ring, 0x39, (size_t)g_sink.w * g_sink.in_block);
+    g_inb = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_block);
+    g_remote_out = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.out_block);
+    CHECK(g_inb && g_remote_out);
+
+    NexAudioControl control;
+    BYTE pcm[4 * 8], source[3 * 8];
+    memset(source, 0x71, sizeof(source));
+    remote_fixture_begin(&control, pcm, 4, 8);
+    CHECK(nex_audio_ring_write(&control, pcm, source, 3) == 3);
+    SinkGen gen;
+    memset(&gen, 0, sizeof(gen));
+    gen.remote = 1;
+    gen.real_frames = 2;
+    g_sink.gen = &gen;
+    CHECK(drain_once(&gen) == HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+    CHECK(control.state == NEX_AUDIO_FAILED);
+    CHECK(control.backpressure_events == 1);
+    CHECK(control.write_frame == 3 && control.read_frame == 0);
+    CHECK(g_sink.r == 0 && g_sink.w == 2);
+    CHECK(control.dropped_frames == 0);
+
+    free(g_remote_out); g_remote_out = NULL;
+    free(g_inb); g_inb = NULL;
+    remote_fixture_end();
+    free_ring();
+    printf("PASS remote drain backpressure: source ring stays unconsumed on timeout\n");
+}
+
+static void test_remote_host_exit_is_visible_to_drain(void) {
+    NexAudioControl control;
+    BYTE pcm[4 * 8];
+    remote_fixture_begin(&control, pcm, 4, 8);
+    control.state = NEX_AUDIO_RUNNING;
+    HANDLE exited = CreateEventA(NULL, TRUE, TRUE, NULL);
+    CHECK(exited != NULL);
+    g_remote_process.hProcess = exited;
+    CHECK(remote_state() == NEX_AUDIO_FAILED);
+    CHECK(control.fallback_reason == NEX_AUDIO_FALLBACK_HOST_EXIT);
+    CHECK(control.error == (UINT32)HRESULT_FROM_WIN32(ERROR_PROCESS_ABORTED));
+    g_remote_process.hProcess = NULL;
+    CloseHandle(exited);
+    remote_fixture_end();
+    printf("PASS remote host exit: drain observes a dead Host despite stale shared state\n");
+}
+
+static void test_remote_fallback_policy_and_eos_stamp(void) {
+    CHECK(remote_fallback_is_local(NEX_AUDIO_FALLBACK_PROTOCOL_MISMATCH));
+    CHECK(remote_fallback_is_local(NEX_AUDIO_FALLBACK_BUILD_MISMATCH));
+    CHECK(remote_fallback_is_local(NEX_AUDIO_FALLBACK_MAPPING_FAILED));
+    CHECK(remote_fallback_is_local(NEX_AUDIO_FALLBACK_UNSUPPORTED_FORMAT));
+    CHECK(remote_fallback_is_local(NEX_AUDIO_FALLBACK_ENDPOINT_OPEN_FAILED));
+    CHECK(!remote_fallback_is_local(NEX_AUDIO_FALLBACK_RING_BACKPRESSURE));
+    CHECK(!remote_fallback_is_local(NEX_AUDIO_FALLBACK_RUNTIME_DEVICE_LOST));
+
+    memset(&g_sink, 0, sizeof(g_sink));
+    NexAudioControl control;
+    BYTE pcm[64 * 8];
+    remote_fixture_begin(&control, pcm, 4, 8);
+    remote_submit_eos();
+    CHECK(control.eos_submitted_generation == control.stream_generation);
+    CHECK(control.eos_complete_generation == 0);
+    control.eos_complete_generation = control.stream_generation;
+    CHECK(remote_wait_eos_complete(control.stream_generation) == 1);
+    remote_fixture_end();
+    printf("PASS remote fallback: startup can retry locally; runtime failures and EOS keep generation\n");
+}
+
+static void test_watch_does_not_follow_default_change(void) {
+    CHECK(watch_should_retarget(0, 0) == 0);
+    CHECK(watch_should_retarget(0, 1) == 0);
+    CHECK(watch_should_retarget(1, 0) == 1);
+    CHECK(watch_should_retarget(1, 1) == 1);
+    printf("PASS endpoint watch: default changes wait for client rebind; device loss still migrates\n");
+}
+
+static void test_event_buffer_floor(void) {
+    SinkGen gen;
+    memset(&gen, 0, sizeof(gen));
+    gen.real_frames = 4410;
+    /* The client can be event-driven even when the real endpoint uses polling. */
+    CHECK(event_safe_client_frames(1408, &gen) == 4410);
+    gen.real_evt = (HANDLE)(UINT_PTR)1;
+    CHECK(event_safe_client_frames(1408, &gen) == 4410);
+    CHECK(event_safe_client_frames(8192, &gen) == 8192);
+    printf("PASS event buffer: public prefill never below the real device buffer\n");
+}
+
+/* Event-driven exclusive endpoints reject partial GetBuffer requests. The
+   drain loop must keep asking the client for fixed-size packets until one
+   complete device buffer is ready, without rejecting a packet merely because
+   it crosses the smaller client-visible buffer boundary. */
+static void test_event_drain_requires_full_buffer(void) {
+    prepare_ring();
+    reset_patches();
+    SinkGen *gen = mock_gen();
+    gen->real_frames = 16;
+    gen->real_evt = (HANDLE)(UINT_PTR)1;
+    gen->device_started = 0;
+    g_sink.h_client = CreateEventA(NULL, FALSE, FALSE, NULL);
+
+    void *ac_vt[15] = {0}, *ac_orig[24] = {0};
+    ac_vt[AC_GETCURRENTPADDING] = (void *)mock_get_padding;
+    ac_vt[AC_START] = (void *)mock_start_counted;
+    ac_vt[AC_STOP] = (void *)mock_stop;
+    for (int i = 0; i < 15; i++) ac_orig[i] = ac_vt[i];
+    register_originals(ac_vt, ac_orig);
+    void *ac_obj[1] = { ac_vt };
+
+    void *rc_vt[5] = {0}, *rc_orig[24] = {0};
+    rc_vt[RC_GETBUFFER] = (void *)mock_render_get;
+    rc_vt[RC_RELEASEBUFFER] = (void *)mock_render_release;
+    for (int i = 0; i < 5; i++) rc_orig[i] = rc_vt[i];
+    register_originals(rc_vt, rc_orig);
+    void *rc_obj[1] = { rc_vt };
+    gen->real = (IAudioClient *)ac_obj;
+    gen->real_render = (IAudioRenderClient *)rc_obj;
+
+    free(g_inb);
+    g_inb = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_block);
+    mock_padding = 0;
+    mock_gb_calls = 0;
+    mock_start_calls = 0;
+    mock_event_full = 1;
+    mock_event_capacity = gen->real_frames;
+
+    /* The real client uses fixed packets (512 frames in the captured stream),
+       while the device period is not an integer multiple of that packet size.
+       Three packets are therefore needed before the first 16-frame commit. */
+    for (int packet = 0; packet < 3; packet++) {
+        CHECK(drain_once(gen) == S_FALSE);
+        CHECK(mock_gb_calls == 0);
+        CHECK(WaitForSingleObject(g_sink.h_client, 0) == WAIT_OBJECT_0);
+        BYTE *p = NULL;
+        HRESULT packet_hr = fr_GetBuffer(NULL, 6, &p);
+        CHECK(packet_hr == S_OK);
+        if (FAILED(packet_hr) || !p) break;
+        for (int i = 0; i < 6 * g_sink.in_block; i++) p[i] = (BYTE)(packet + i);
+        CHECK(fr_ReleaseBuffer(NULL, 6, 0) == S_OK);
+    }
+    CHECK(g_sink.w == 18 && g_sink.r == 0);
+    CHECK(drain_once(gen) == S_OK);
+    CHECK(mock_gb_frames == 16);
+    CHECK(mock_rb_frames == 16);
+    CHECK(gen->submitted == 16);
+    CHECK(g_sink.w == 18 && g_sink.r == 16 && g_sink.w - g_sink.r == 2);
+    CHECK(mock_start_calls == 1);
+    CHECK(gen->device_started == 1);
+
+    mock_event_full = 0;
+    CloseHandle(g_sink.h_client);
+    g_sink.h_client = NULL;
+    free(g_inb);
+    g_inb = NULL;
+    free_ring();
+    printf("PASS event drain: fixed client packets prefill one complete device buffer\n");
 }
 
 /* ---- reset -------------------------------------------------------------- */
@@ -862,7 +1434,7 @@ static void test_teardown_with_outstanding_proxy_buffer(void) {
    without freeing anything the parked thread still holds. */
 static HANDLE abandon_entered;   /* set when the drain thread is inside GetBuffer */
 static HANDLE abandon_release;   /* set by the test to let the call return      */
-static LONG   abandon_ac_released, abandon_rc_released;
+static LONG   abandon_ac_released, abandon_rc_released, abandon_stop_calls;
 static HRESULT STDMETHODCALLTYPE abandon_get_buffer(void *s, UINT32 frames, BYTE **pp) {
     (void)s;
     SetEvent(abandon_entered);
@@ -881,6 +1453,9 @@ static ULONG STDMETHODCALLTYPE abandon_release_ac(void *s) {
 static ULONG STDMETHODCALLTYPE abandon_release_rc(void *s) {
     (void)s; InterlockedIncrement(&abandon_rc_released); return 1;
 }
+static HRESULT STDMETHODCALLTYPE abandon_stop(void *s) {
+    (void)s; InterlockedIncrement(&abandon_stop_calls); return S_OK;
+}
 static HRESULT STDMETHODCALLTYPE abandon_ok(void *s) { (void)s; return S_OK; }
 
 static void test_generation_abandon(void) {
@@ -889,7 +1464,7 @@ static void test_generation_abandon(void) {
 
     void *ac_vt[15] = {0}, *ac_orig[24] = {0}, *ac_obj[1];
     ac_vt[SLOT_RELEASE] = (void *)abandon_release_ac;
-    ac_vt[AC_STOP] = (void *)abandon_ok;
+    ac_vt[AC_STOP] = (void *)abandon_stop;
     ac_vt[AC_RESET] = (void *)abandon_ok;
     ac_vt[AC_GETCURRENTPADDING] = (void *)mock_get_padding;
     for (int i = 0; i < 15; i++) ac_orig[i] = ac_vt[i];
@@ -908,7 +1483,8 @@ static void test_generation_abandon(void) {
     gen->real = (IAudioClient *)ac_obj;
     gen->real_render = (IAudioRenderClient *)rc_obj;
     gen->real_frames = 64;
-    gen->device_started = 1;
+    gen->device_started = 0;
+    abandon_stop_calls = 0;
     g_sink.reported_frames = 32;
     g_sink.w = 8; g_sink.r = 0;
     mock_padding = 0;
@@ -944,6 +1520,7 @@ static void test_generation_abandon(void) {
     CHECK(gen->retired == 1);
     CHECK(abandon_ac_released == 0);   /* nothing freed under the parked call */
     CHECK(abandon_rc_released == 0);
+    CHECK(abandon_stop_calls >= 1);    /* Stop must interrupt GetBuffer even before Start */
     if (gate != INVALID_HANDLE_VALUE) {
         /* 闸门在这一代被真正回收之前一直攥着。被放弃的那条独占流还开着，设备确实
            还占着——闸门说的是实话。提前放掉会让下一个 engage 对着一台还被占着的
@@ -1462,10 +2039,15 @@ int main(void) {
     InitializeCriticalSection(&g_patch_lock);
     g_log[0] = 0; /* No on-disk playback log is modified by this test. */
     test_fade();
+    test_valid_bits_alignment();
     test_silent();
     test_stale_proxy();
+    test_config_reload_defer_matrix();
+    test_policy_rebuild_preserves_client_state();
+    test_same_format_stream_handoff();
     test_ring_compact_wrap();
     test_ring_reserve_limit();
+    test_ring_reserve_waits_for_drain();
     test_clock();
     test_valid_format();
     test_src_prefer_order();
@@ -1475,6 +2057,16 @@ int main(void) {
     test_unregistered_vtable_and_internal_activate();
     test_patch_records();
     test_drain();
+    test_remote_converted_drain();
+    test_remote_resample_respects_device_period();
+    test_remote_clock_uses_host_device_clock();
+    test_remote_backpressure_is_atomic();
+    test_remote_drain_backpressure_is_atomic();
+    test_remote_host_exit_is_visible_to_drain();
+    test_remote_fallback_policy_and_eos_stamp();
+    test_watch_does_not_follow_default_change();
+    test_event_buffer_floor();
+    test_event_drain_requires_full_buffer();
     test_reset();
     test_stop_serializes_with_proxy_lock();
     test_lifecycle_entrypoint_serialization();

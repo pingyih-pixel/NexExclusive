@@ -15,7 +15,7 @@
 
 - **独占输出**：音频不经过系统混音器，没有那层强制的 48/96 kHz 重采样。
 - **跟随音源**：44.1 的曲目以 44.1 播放，96 的曲目以 96 播放。设备拒绝这个格式时才做转换，面板里会标明本次是「直通」还是「转换过」。
-- **切换时不中断**：切歌、拖动进度、更换输出设备时，新旧输出之间平滑交接。
+- **切换交接**：切歌、拖动进度、更换输出设备时，模块会重建或迁移独占流；连续性仍以当前设备与路径的实测记录为准。
 - **装好即常驻**：一键安装，托盘常驻，开机自启；客户端重启或页面刷新后自动重新接入。
 
 ## 安装前须知
@@ -74,7 +74,7 @@ NexExclusive.exe --help
 
 设置页会新增一个独立的「NexExclusive」入口，里面集中显示独占状态、输出模式、输出规格和兼容处理。播放页仍保留「独占输出」面板，便于从当前播放设置快速查看。
 
-播放页网易云原生的「无损」标签属于服务端音质选择，NexExclusive 不会修改它。独占模块只会在其左侧增加一张「音频规格」卡片，显示客户端 PCM 到独占端点的采样率、位深和 `Bit-perfect` / 转换状态；悬浮后可以查看设备与完整协商信息。
+播放页网易云原生的「无损」标签属于服务端质量选择，NexExclusive 不会修改它。音频规格收纳在 NexExclusive 设置窗口，显示源规格、客户端 PCM、独占端点和 `Bit-perfect` / 转换状态；尚未取得独立源元数据时显示「源规格：未取得」。客户端日志里的 `32 bit` 是客户端 PCM 容器或浮点传输格式，不能直接当成服务端源文件位深。
 
 | 项 | 作用 | 何时调整 |
 | --- | --- | --- |
@@ -90,8 +90,8 @@ NexExclusive.exe --help
 | 共享回退 | 不打开共享输出 | 当前产品路径固定关闭，避免把共享输出误认为独占 |
 | 独立音频宿主 | 将严格原样路径的独占端点和实时提交移到 `NexAudioHost.exe` | 默认关闭，属于实验引擎；原率优先下的转换仍由 DLL 内部完成 |
 
-同样的设置写在 `hook.cfg` 里（纯文本 `key=value`），改完重启客户端生效。面板是它的前端。`audiohost=1` 需要发布包里的 `NexAudioHost.exe`，独立进程只接受客户端原格式 PCM。
-严格原样的验证对象是「客户端 PCM → 独占端点 PCM」；设备支持源格式时可以做到 bit-perfect 输出，但它不代表网易云解码前的源文件已经完成 bit-perfect 证明。设备不支持源格式时，面板会提示切换到原率优先，当前曲目不会退回共享输出。播放栏的音频规格详情会同时标出这条证据边界。
+同样的设置写在 `hook.cfg` 里（纯文本 `key=value`），面板修改后先留在草稿中。「保存（下一首应用）」会立即写入配置并保持当前曲目的播放进度，下一首或下一次音频流建立时读取新配置。「保存（当前曲目重开应用）」会先保存未提交修改，再通过客户端正常的暂停/恢复路径重建音频流；当前曲目位置和原来的播放/暂停状态都会保留。`audiohost=1` 需要发布包里的 `NexAudioHost.exe`，独立进程只接受客户端原格式 PCM。
+严格原样的验证对象是「客户端 PCM → 独占端点 PCM」；设备支持源格式时可以做到 bit-perfect 输出，但它不代表网易云解码前的源文件已经完成 bit-perfect 证明。设备不支持源格式时，面板会提示切换到原率优先，当前曲目不会退回共享输出。音频规格只在 NexExclusive 设置窗口中展示，源元数据尚未取得时显示「源规格：未取得」。远程 audiohost 已改用 Host 的 `IAudioClock` 位置和 EOS 等待窗口，长时间连续播放仍在单变量验收阶段。
 
 ## 工作原理
 
@@ -116,14 +116,17 @@ NexExclusive.exe --help
 - **无管理员权限卸载时会留下 exe**：程序正被自己占用，此时无法登记「重启后删除」。关掉程序后手动删除目录即可。
 - **设置面板仍缺少跨版本回归**：当前版本已验收独立模块、右侧对齐、编辑保存/取消和无损规格框；不同网易云版本仍需单独确认节点选择器。
 - **88.2 kHz 的音源**：在只支持 44.1 / 48 / 96 的设备上会转换到 96 kHz，这是「保带宽」的取舍，代价是一次非整数比的重采样。
+- **远程播放正确性仍在审计**：远程路径现在读取 Host 的设备时钟快照，EOS 会等待环排空和设备时钟越过尾部；暂停、换轨、seek 与长时间播放仍需真机验收。详见 [docs/AUDIO_CORRECTNESS_AUDIT_2026-11-16.md](docs/AUDIO_CORRECTNESS_AUDIT_2026-11-16.md)。
 
 完整的限制清单和后续计划见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 ## 文档
 
 - [docs/BUILDING.md](docs/BUILDING.md)：从源码构建、运行回归测试、打发布包
-- [docs/DEVELOPMENT_RUNTIME.md](docs/DEVELOPMENT_RUNTIME.md)：编译、注入、宿主看护、日志验收与常见故障
-- [docs/OPENHOME_NETEASE_RESEARCH.md](docs/OPENHOME_NETEASE_RESEARCH.md)：OpenHome 架构借鉴与网易云本地数据库结论
+- [docs/DEVELOPMENT_RUNTIME.md](docs/DEVELOPMENT_RUNTIME.md)：注入、宿主看护、日志验收与账户清理
+- [docs/AUDIO_CORRECTNESS_AUDIT_2026-11-16.md](docs/AUDIO_CORRECTNESS_AUDIT_2026-11-16.md)：PCM、时钟、EOS、背压与真实播放证据
+- [docs/REMOTE_AUDIO_PROTOCOL_DESIGN.md](docs/REMOTE_AUDIO_PROTOCOL_DESIGN.md)：远程协议字段、状态机和回退语义
+- [docs/RESEARCH_OPENHOME_AND_BACKENDS.md](docs/RESEARCH_OPENHOME_AND_BACKENDS.md)：外部后端研究与当前边界
 - [docs/ROADMAP.md](docs/ROADMAP.md)：限制清单与后续计划
 - [docs/defender-false-positive.md](docs/defender-false-positive.md)：向微软提交误报的材料
 

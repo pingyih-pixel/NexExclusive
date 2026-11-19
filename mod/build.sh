@@ -40,7 +40,18 @@ if [[ ! -x "$CC" ]]; then
 fi
 
 FLAGS=(-target x86_64-windows-gnu -O2 -Wall)
-LIBS=(-lole32 -loleaut32 -luuid)
+LIBS=(-lole32 -loleaut32 -luuid -lavrt)
+# The control-page identity is generated from the checked-out wire sources and
+# the current working diff.  Both client and Host receive the same wire id,
+# while the Host compares against its own compiled-in expected value.
+WIRE_HASH=$( {
+    git -C "$MOD_DIR/.." rev-parse HEAD 2>/dev/null || true
+    git -C "$MOD_DIR/.." diff -- mod/tools/nexaudiolink.h mod/tools/nexaudiohost.c mod/src 2>/dev/null || true
+} | sha256sum | cut -c1-16 )
+if [[ ! "$WIRE_HASH" =~ ^[0-9a-fA-F]{16}$ ]]; then
+    WIRE_HASH=4e45584156333031
+fi
+WIRE_DEFS=(-DNEX_AUDIO_BUILD_ID=0x$WIRE_HASH -DNEX_AUDIO_EXPECTED_BUILD_ID=0x$WIRE_HASH)
 TARGET=${1:-all}
 if (( $# > 1 )); then
     printf '用法：%s [sink|host|audiohost|all|test]\n' "$0" >&2
@@ -69,7 +80,7 @@ fi
 build_sink() {
     # 注入进客户端进程的那一半：hook IMMDevice / IAudioClient 的 vtable，
     # 独占协商、重采样、按代交接都在这里。
-    "$CC" cc "${FLAGS[@]}" -shared -o "$OUT_DIR/nexsink.dll" "$MOD_DIR/src/nexsink.c" "${LIBS[@]}"
+    "$CC" cc "${FLAGS[@]}" "${WIRE_DEFS[@]}" -shared -o "$OUT_DIR/nexsink.dll" "$MOD_DIR/src/nexsink.c" "${LIBS[@]}"
     printf '已构建到 %s：nexsink.dll\n' "$OUT_DIR"
 }
 
@@ -101,7 +112,7 @@ build_host() {
         "$MOD_DIR/tools/nexhost.rc.in" > "$rc"
     "$CC" rc "$rc" "$res"
 
-    "$CC" cc "${FLAGS[@]}" -Wl,--subsystem,windows \
+    "$CC" cc "${FLAGS[@]}" "${WIRE_DEFS[@]}" -Wl,--subsystem,windows \
         -o "$OUT_DIR/NexExclusive.exe" "$MOD_DIR/tools/nexhost.c" "$res" \
         -lws2_32 -lole32 -loleaut32 -ladvapi32 -lshell32 -luser32 -lgdi32 \
         -lversion -lcomdlg32 -lbcrypt
@@ -126,13 +137,22 @@ build_host() {
 build_audiohost() {
     # 可选的独立 WASAPI 端点进程。它通过共享内存环形缓冲读取客户端 PCM，
     # 默认不启用；只有 hook.cfg 的 audiohost=1 才会由 DLL 拉起。
-    "$CC" cc "${FLAGS[@]}" -municode -Wl,--subsystem,console \
+    "$CC" cc "${FLAGS[@]}" "${WIRE_DEFS[@]}" -municode -Wl,--subsystem,console \
         -o "$OUT_DIR/NexAudioHost.exe" "$MOD_DIR/tools/nexaudiohost.c" "${LIBS[@]}"
     printf '已构建到 %s：NexAudioHost.exe\n' "$OUT_DIR"
 }
 
 build_test() {
-    "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/regression.exe" "$MOD_DIR/test/regression.c" "${LIBS[@]}"
+    "$CC" c++ "${FLAGS[@]}" -o "$OUT_DIR/audio_policy_test.exe" "$MOD_DIR/test/audio_policy_test.cpp"
+    "$OUT_DIR/audio_policy_test.exe"
+    "$CC" cc "${FLAGS[@]}" "${WIRE_DEFS[@]}" -o "$OUT_DIR/nexaudiolink_test.exe" "$MOD_DIR/test/nexaudiolink_test.c"
+    "$OUT_DIR/nexaudiolink_test.exe"
+    "$CC" cc "${FLAGS[@]}" "${WIRE_DEFS[@]}" -o "$OUT_DIR/nexaudiohost_test.exe" "$MOD_DIR/test/nexaudiohost_test.c" "${LIBS[@]}"
+    "$OUT_DIR/nexaudiohost_test.exe"
+    "$CC" cc "${FLAGS[@]}" "${WIRE_DEFS[@]}" -o "$OUT_DIR/source_probe_test.exe" "$MOD_DIR/test/source_probe_test.c" \
+        -lws2_32 -lole32 -loleaut32 -ladvapi32 -lshell32 -luser32 -lgdi32 -lversion -lcomdlg32 -lbcrypt
+    "$OUT_DIR/source_probe_test.exe"
+    "$CC" cc "${FLAGS[@]}" "${WIRE_DEFS[@]}" -o "$OUT_DIR/regression.exe" "$MOD_DIR/test/regression.c" "${LIBS[@]}"
     "$OUT_DIR/regression.exe"
 }
 

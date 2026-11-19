@@ -35,6 +35,8 @@
 #include <stdarg.h>
 #include <wchar.h>
 #include <math.h>
+#include "../tools/nexaudiolink.h"
+#include "audio_policy.h"
 
 /* ---- vtable slots ------------------------------------------------------- */
 #define SLOT_QI              0

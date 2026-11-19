@@ -6,8 +6,28 @@
    only differ for 24-in-32, which most USB DACs accept and some interfaces do
    not - probing both is the difference between "the device takes 24-bit" and
    "the device takes 24-bit the way we happened to spell it". */
+/* An event-driven WASAPI client prefills one complete public buffer before it
+   waits for the hardware. Never advertise a buffer smaller than the real
+   exclusive buffer: the device would wait for more frames while the client
+   waits for a hardware event, so playback would remain paused. */
+static UINT32 event_safe_client_frames(UINT32 want, const SinkGen *g) {
+    if (g && want < g->real_frames) return g->real_frames;
+    return want;
+}
+
 static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container, int valid,
                              int is_float, int ch) {
+    WAVEFORMATEXTENSIBLE we;
+    build_fmt_cv(&we, rate, container, valid, is_float, ch,
+                 g_sink.channel_mask ? g_sink.channel_mask : mask_for(ch));
+    if (g_audiohost && !g_remote_bypass) {
+        HRESULT remote_hr = remote_try_exclusive(g, dev, (const WAVEFORMATEX *)&we);
+        if (SUCCEEDED(remote_hr)) return remote_hr;
+        if (!g_remote_bypass) return remote_hr;
+        log_line("audiohost: %s; retrying %d/%d.%d%s in process",
+                 nex_audio_fallback_name(g_remote_reason), rate, container, valid,
+                 is_float ? "f" : "");
+    }
     IAudioClient *ac = NULL;
     HRESULT hr = dev_activate(dev, &IID_IAudioClient, (void **)&ac);
     if (FAILED(hr) || !ac) {
@@ -15,10 +35,6 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
                  is_float ? "f" : "", (unsigned long)hr);
         return hr;
     }
-
-    WAVEFORMATEXTENSIBLE we;
-    build_fmt_cv(&we, rate, container, valid, is_float, ch,
-                 g_sink.channel_mask ? g_sink.channel_mask : mask_for(ch));
 
     hr = O_ISFORMAT(ac, AUDCLNT_SHAREMODE_EXCLUSIVE, (WAVEFORMATEX *)&we, NULL);
     if (hr != S_OK) {
@@ -38,24 +54,18 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
         return FAILED(hr) ? hr : E_FAIL;
     }
 
-    /* Event-driven exclusive output. Keep a bounded retry for endpoint
-       alignment: Windows reports the aligned frame count through the failed
-       client, then requires a fresh activation before Initialize is retried. */
-    HANDLE audio_event = CreateEventA(NULL, FALSE, FALSE, NULL);
-    if (!audio_event) {
-        if (ac) ac->lpVtbl->Release(ac);
-        return HRESULT_FROM_WIN32(GetLastError());
-    }
-    REFERENCE_TIME period = 1000000;
+    /* Keep the original 100 ms client-visible buffer and poll the real
+       endpoint. This device accepts the timer-driven exclusive contract while
+       rejecting the event callback initialization after alignment negotiation. */
+    REFERENCE_TIME buffer_duration = 1000000;
     for (int attempt = 0; attempt < 8; attempt++) {
-        hr = O_INITIALIZE(ac, AUDCLNT_SHAREMODE_EXCLUSIVE,
-                          AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                          period, 0, (WAVEFORMATEX *)&we, NULL);
+        hr = O_INITIALIZE(ac, AUDCLNT_SHAREMODE_EXCLUSIVE, 0,
+                          buffer_duration, 0, (WAVEFORMATEX *)&we, NULL);
         if (SUCCEEDED(hr)) break;
         if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
             UINT32 aligned = 0;
             if (FAILED(O_GETBUFFERSIZE(ac, &aligned)) || !aligned) break;
-            period = (REFERENCE_TIME)(((UINT64)aligned * 10000000ull) / (UINT32)rate);
+            buffer_duration = (REFERENCE_TIME)(((UINT64)aligned * 10000000ull) / (UINT32)rate);
             ac->lpVtbl->Release(ac);
             ac = NULL;
             hr = dev_activate(dev, &IID_IAudioClient, (void **)&ac);
@@ -69,16 +79,7 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
     if (FAILED(hr)) {
         log_line("probe %d/%d.%d%s: Initialize 0x%08lX", rate, container, valid,
                  is_float ? "f" : "", (unsigned long)hr);
-        CloseHandle(audio_event);
         if (ac) ac->lpVtbl->Release(ac);
-        return hr;
-    }
-    hr = O_SETEVENT(ac, audio_event);
-    if (FAILED(hr)) {
-        log_line("probe %d/%d.%d%s: SetEventHandle 0x%08lX", rate, container, valid,
-                 is_float ? "f" : "", (unsigned long)hr);
-        CloseHandle(audio_event);
-        ac->lpVtbl->Release(ac);
         return hr;
     }
 
@@ -86,7 +87,6 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
     if (FAILED(O_GETBUFFERSIZE(ac, &frames)) || !frames) {
         log_line("sink: %d Hz/%d.%d bit%s passed the format check but has no buffer",
                  rate, container, valid, is_float ? " float" : "");
-        CloseHandle(audio_event);
         ac->lpVtbl->Release(ac);
         return E_FAIL;
     }
@@ -97,7 +97,6 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
         log_line("probe %d/%d.%d%s: GetService(RenderClient) 0x%08lX rc=%p frames=%u",
                  rate, container, valid, is_float ? "f" : "", (unsigned long)hr,
                  (void *)rc, frames);
-        CloseHandle(audio_event);
         ac->lpVtbl->Release(ac);
         return FAILED(hr) ? hr : E_POINTER;
     }
@@ -110,58 +109,19 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
                  rate, container, valid, is_float ? "f" : "", (unsigned long)hr,
                  (void *)clock, (unsigned long long)frequency);
         if(clock)clock->lpVtbl->Release(clock);
-        rc->lpVtbl->Release(rc); CloseHandle(audio_event); ac->lpVtbl->Release(ac);
+        rc->lpVtbl->Release(rc); ac->lpVtbl->Release(ac);
         return FAILED(hr)?hr:E_FAIL;
     }
     REFERENCE_TIME lat = 0;
     O_GETLATENCY(ac, &lat);
     g->real_clock      = clock;
     g->clock_frequency = frequency;
-    g->real_evt        = audio_event;
+    g->real_evt        = NULL;
     g->real            = ac;
     g->real_render     = rc;
     g->real_frames     = frames;
     g->real_latency    = lat;
     return S_OK;
-}
-
-static int push_uniq(int *dst, int n, int cap, int v) {
-    for (int i = 0; i < n; i++) if (dst[i] == v) return n;
-    if (n < cap) dst[n++] = v;
-    return n;
-}
-
-/* Under simplicity preference, keep the source rate first, then prioritize
-   rate pairs with an integer conversion ratio. Preserve the existing bandwidth
-   order among equal-ratio and non-integer candidates. */
-static int integer_rate_ratio(int a, int b) {
-    if (a <= 0 || b <= 0) return 0;
-    return (a % b == 0) || (b % a == 0);
-}
-
-static int rate_ratio_factor(int a, int b) {
-    if (a <= 0 || b <= 0) return 0;
-    return a > b ? a / b : b / a;
-}
-
-static void prefer_integer_ratios(int *rates, int count, int source_rate) {
-    for (int i = 1; i < count; i++) {
-        int value = rates[i];
-        int value_integer = integer_rate_ratio(source_rate, value);
-        int value_factor = value_integer ? rate_ratio_factor(source_rate, value) : 0;
-        int j = i;
-        while (j > 1) {
-            int prev = rates[j - 1];
-            int prev_integer = integer_rate_ratio(source_rate, prev);
-            int prev_factor = prev_integer ? rate_ratio_factor(source_rate, prev) : 0;
-            int before = value_integer > prev_integer ||
-                         (value_integer == prev_integer && value_integer && value_factor < prev_factor);
-            if (!before) break;
-            rates[j] = prev;
-            j--;
-        }
-        rates[j] = value;
-    }
 }
 
 /* Identity of an endpoint, cheap enough to recompute on every poll. Two
@@ -209,46 +169,32 @@ static HRESULT negotiate(SinkGen *g, IMMDevice *dev, int ch, int *out_rate,
                          int *out_container, int *out_valid, int *out_float, int *tried) {
     static const int pool[] = {44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000};
     const int npool = (int)(sizeof(pool) / sizeof(pool[0]));
+    int depc[NEX_AUDIO_POLICY_MAX_DEPTHS], depv[NEX_AUDIO_POLICY_MAX_DEPTHS];
+    int dfl[NEX_AUDIO_POLICY_MAX_DEPTHS], nd;
+    int rates[NEX_AUDIO_POLICY_MAX_RATES], nr;
+    NexAudioPolicyInput policy;
+    NexAudioPolicyDepth depths[NEX_AUDIO_POLICY_MAX_DEPTHS];
 
-    int depc[10], depv[10], dfl[10], nd = 0;
-#define ADD_DEPTH(C, V, F) do {                                               \
-        int _dup = 0;                                                         \
-        for (int _i = 0; _i < nd; _i++)                                       \
-            if (depc[_i] == (C) && depv[_i] == (V) && dfl[_i] == (F)) _dup = 1; \
-        if (!_dup && nd < 10) { depc[nd] = (C); depv[nd] = (V); dfl[nd] = (F); nd++; } \
-    } while (0)
-
-    if (g_out_bits == 32) ADD_DEPTH(32, 32, 1);   /* 32 is float in practice */
-    else                  ADD_DEPTH(g_out_bits, g_out_bits, 0);
-    if (g_sink.in_is_float) ADD_DEPTH(32, 32, 1);
-    else {
-        ADD_DEPTH(g_sink.in_container_bits, g_sink.in_valid_bits, 0);
-        /* The other spelling of the same precision. */
-        if (g_sink.in_valid_bits == 24 && g_sink.in_container_bits != 32)
-            ADD_DEPTH(32, 24, 0);
-        else if (g_sink.in_container_bits == 32 && g_sink.in_valid_bits == 24)
-            ADD_DEPTH(24, 24, 0);
-    }
-    ADD_DEPTH(32, 32, 1);        /* float32 */
-    ADD_DEPTH(24, 24, 0);        /* packed 24 */
-    ADD_DEPTH(32, 24, 0);        /* 24-in-32 */
-    ADD_DEPTH(16, 16, 0);
-#undef ADD_DEPTH
-
-    if (g_hifi) {
-        depc[0] = g_sink.in_is_float ? 32 : g_sink.in_container_bits;
-        depv[0] = g_sink.in_is_float ? 32 : g_sink.in_valid_bits;
-        dfl[0] = g_sink.in_is_float;
-        nd = 1;
+    memset(&policy, 0, sizeof(policy));
+    policy.source_rate = g_sink.in_rate;
+    policy.source_container_bits = g_sink.in_container_bits;
+    policy.source_valid_bits = g_sink.in_valid_bits;
+    policy.source_is_float = g_sink.in_is_float;
+    policy.requested_output_bits = g_out_bits;
+    policy.forced_rate = g_force_rate;
+    policy.compatibility = g_compat;
+    policy.hifi = g_hifi;
+    policy.source_preference = g_src_prefer;
+    nd = nex_audio_policy_build_depths(&policy, depths, NEX_AUDIO_POLICY_MAX_DEPTHS);
+    for (int i = 0; i < nd; i++) {
+        depc[i] = depths[i].container_bits;
+        depv[i] = depths[i].valid_bits;
+        dfl[i] = depths[i].is_float;
     }
 
-    int rates[16], nr = 0;
-    rates[nr++] = g_force_rate ? g_force_rate : g_sink.in_rate;
-    if(!g_compat) nd=1; /* exact representation only when conversion is disabled */
-    for (int i = 0; i < npool; i++)                       /* nearest higher */
-        if (pool[i] > g_sink.in_rate) nr = push_uniq(rates, nr, 16, pool[i]);
-    for (int i = npool - 1; i >= 0; i--)                  /* lower, high to low */
-        if (pool[i] < g_sink.in_rate) nr = push_uniq(rates, nr, 16, pool[i]);
+    nr = nex_audio_policy_build_rates(&policy, pool, npool, 0,
+                                      rates, NEX_AUDIO_POLICY_MAX_RATES);
+    int endpoint_mix_rate = 0;
 
     /* endpoint mix rate: candidate only */
     {
@@ -256,18 +202,21 @@ static HRESULT negotiate(SinkGen *g, IMMDevice *dev, int ch, int *out_rate,
         WAVEFORMATEX *mixf = NULL;
         if (SUCCEEDED(dev_activate(dev, &IID_IAudioClient, (void **)&ac)) && ac) {
             if (SUCCEEDED(O_GETMIXFORMAT(ac, &mixf)) && mixf) {
-                nr = push_uniq(rates, nr, 16, (int)mixf->nSamplesPerSec);
+                endpoint_mix_rate = (int)mixf->nSamplesPerSec;
                 CoTaskMemFree(mixf);
             }
             ac->lpVtbl->Release(ac);
         }
     }
 
-    if(g_hifi || !g_compat || g_force_rate) nr=1;
-    else if(g_src_prefer==1) prefer_integer_ratios(rates,nr,g_sink.in_rate);
+    /* The mix rate is discovered after the first policy pass. Rebuild once
+       with it included so simplicity ordering also sees this candidate. */
+    nr = nex_audio_policy_build_rates(&policy, pool, npool, endpoint_mix_rate,
+                                      rates, NEX_AUDIO_POLICY_MAX_RATES);
     UINT64 endpoint_key=endpoint_hash(dev);
     if(!endpoint_key)return E_FAIL;
     *tried = 0;
+    g_remote_bypass = 0;
 
     /* Cache belongs to an endpoint and a policy, never just an input shape. */
     if (g_negotiated.valid &&
@@ -424,10 +373,12 @@ static HRESULT sink_retarget(const char *reason) {
 
     /* Keep the client's clock where it was: the new device starts at zero. */
     UINT64 keep_clock = g_sink.clock_last;
+    int was_remote = g_sink.gen && g_sink.gen->remote;
 
     /* The previous generation is already gone (sink_stop dropped it, or it was
        abandoned to its thread). Anything still here would be a bug. */
     if (g_sink.gen) { gen_release(g_sink.gen); g_sink.gen = NULL; }
+    if (was_remote) remote_close();
 
     IMMDevice *dev = NULL;
     InterlockedIncrement(&g_internal);
@@ -450,6 +401,11 @@ static HRESULT sink_retarget(const char *reason) {
     SinkGen *gen = gen_new();
     if (!gen) { dev->lpVtbl->Release(dev); sink_teardown(); return E_OUTOFMEMORY; }
     g_sink.gen = gen;
+    if (FAILED(sink_rebind_client_state(gen->id))) {
+        dev->lpVtbl->Release(dev);
+        sink_teardown();
+        return E_INVALIDARG;
+    }
 
     HRESULT why = S_OK;
     gen->endpoint_gate = acquire_endpoint_gate(dev, &why);
@@ -531,6 +487,26 @@ static HRESULT sink_retarget(const char *reason) {
     return S_OK;
 }
 
+static int sink_input_format_matches(const WAVEFORMATEX *fmt) {
+    if (!fmt) return 0;
+    int is_float = (fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
+    int valid_bits = fmt->wBitsPerSample;
+    DWORD channel_mask = mask_for(fmt->nChannels);
+    if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE && fmt->cbSize >= 22) {
+        const WAVEFORMATEXTENSIBLE *we = (const WAVEFORMATEXTENSIBLE *)fmt;
+        is_float = (we->SubFormat.Data1 == 3);
+        if (we->Samples.wValidBitsPerSample) valid_bits = we->Samples.wValidBitsPerSample;
+        if (we->dwChannelMask) channel_mask = we->dwChannelMask;
+    }
+    return (int)fmt->nSamplesPerSec == g_sink.in_rate
+        && fmt->nBlockAlign == g_sink.in_block
+        && (int)fmt->nChannels == g_sink.in_channels
+        && fmt->wBitsPerSample == g_sink.in_container_bits
+        && valid_bits == g_sink.in_valid_bits
+        && channel_mask == g_sink.channel_mask
+        && is_float == g_sink.in_is_float;
+}
+
 static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
                            REFERENCE_TIME dur) {
     if (!valid_pcm_format(fmt)) return AUDCLNT_E_UNSUPPORTED_FORMAT;
@@ -543,66 +519,28 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
                float into a ring sized for 44.1k/16, the block size would be
                wrong, and the channels would land interleaved into the wrong
                places (audible as one dead channel). Rebuild instead. */
-            int is_float = (fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
-            int valid_bits = fmt->wBitsPerSample;
-            DWORD channel_mask = mask_for(fmt->nChannels);
-            if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE && fmt->cbSize >= 22) {
-                const WAVEFORMATEXTENSIBLE *we = (const WAVEFORMATEXTENSIBLE *)fmt;
-                is_float = (we->SubFormat.Data1 == 3);
-                if (we->Samples.wValidBitsPerSample) valid_bits = we->Samples.wValidBitsPerSample;
-                if (we->dwChannelMask) channel_mask = we->dwChannelMask;
-            }
-            int same = (int)fmt->nSamplesPerSec  == g_sink.in_rate
-                    && fmt->nBlockAlign          == g_sink.in_block
-                    && (int)fmt->nChannels       == g_sink.in_channels
-                    && fmt->wBitsPerSample       == g_sink.in_container_bits
-                    && valid_bits               == g_sink.in_valid_bits
-                    && channel_mask             == g_sink.channel_mask
-                    && is_float                  == g_sink.in_is_float;
-            if (same) {
+            if (sink_input_format_matches(fmt)) {
                 log_line("sink: re-initialize with the same format, keeping the sink");
                 return S_OK;
             }
-            log_line("sink: re-initialize with a new format, rebuilding the stream");
+            log_line("sink: re-initialize format change self=%p owner=%p started=%d; rebuilding",
+                     self, g_sink.owner, g_sink.started);
             HRESULT clear=sink_teardown_controlled();if(FAILED(clear))return clear;
         } else if (!g_sink.started) {
             /* A new track usually comes with a fresh IAudioClient, and the old
                one has already been stopped by then. Release the exclusive
                stream first, otherwise the newcomer's own Initialize gets
                DEVICE_IN_USE and the client ends up with no working stream. */
-            log_line("sink: previous owner is idle, handing the device over");
+            log_line("sink: new client while owner idle self=%p owner=%p; handing over",
+                     self, g_sink.owner);
             HRESULT clear=sink_teardown_controlled();if(FAILED(clear))return clear;
         } else {
-            /* A new IAudioClient while ours is still running means the client
-               moved on without stopping the previous stream - NetEase does
-               exactly that on every track change. Passing the newcomer through
-               cannot work: the endpoint is ours, so its own Initialize gets
-               DEVICE_IN_USE and the listener ends up with a stale exclusive
-               stream plus a shared one that never starts. Hand the device over
-               instead; teardown invalidates the old proxy, so a late write from
-               the previous stream fails cleanly (DEVICE_INVALIDATED) rather
-               than crashing.
-
-               Deliberately not "telling a replacement from a concurrent
-               stream": the two are indistinguishable here. A track change, a
-               quality switch and a notification all arrive as a new client
-               while the old one is still submitting, and the exclusive device
-               can only serve one of them anyway. Newest wins is the only policy
-               that keeps playback working; the loser is told the device went
-               away and rebuilds. The numbers in this line are what would show a
-               genuinely concurrent stream if one ever appeared (a large idle
-               gap with a different format), so the case stays diagnosable. */
-            SinkGen *old = g_sink.gen;
-            DWORD now = GetTickCount();
-            DWORD idle = (old && old->last_submit)
-                       ? (DWORD)(now - (DWORD)old->last_submit) : 0xFFFFFFFFu;
-            log_line("sink: new stream while gen %llu is still running "
-                     "(submitted=%llu, last submit %ld ms ago, %d/%d/%dch -> %d/%d/%dch), taking over",
-                     (unsigned long long)(old ? old->id : 0),
-                     (unsigned long long)(old ? old->submitted : 0),
-                     idle == 0xFFFFFFFFu ? -1L : (long)idle,
-                     g_sink.in_rate, g_sink.in_container_bits, g_sink.in_channels,
-                     (int)fmt->nSamplesPerSec, (int)fmt->wBitsPerSample, (int)fmt->nChannels);
+            if (sink_input_format_matches(fmt)) {
+                return sink_handoff_same_format(self);
+            }
+            /* A changed client contract still requires a fresh device side. */
+            log_line("sink: active owner conflict self=%p owner=%p started=%d; format change -> teardown",
+                     self, g_sink.owner, g_sink.started);
             HRESULT clear=sink_teardown_controlled();if(FAILED(clear))return clear;
         }
     }
@@ -661,12 +599,6 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
         g_sink.in_is_float = (we->SubFormat.Data1 == 3);
         if (we->Samples.wValidBitsPerSample) g_sink.in_valid_bits=we->Samples.wValidBitsPerSample;
         if(we->dwChannelMask)g_sink.channel_mask=we->dwChannelMask;
-    }
-
-    if (g_audiohost) {
-        HRESULT remote_hr = remote_sink_engage(self, dev, fmt, dur, ep_name, ep_hw);
-        dev->lpVtbl->Release(dev);
-        return remote_hr;
     }
 
     int used_rate = 0, used_cont = 0, used_bits = 0, used_float = 0;
@@ -733,6 +665,7 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
         if (want > 8192) want = 8192;
     }
     want = (want + 127u) & ~127u;
+    want = event_safe_client_frames(want, gen);
     g_sink.cap = want * 8;
     if (g_sink.cap < 16384) g_sink.cap = 16384;
 
@@ -755,6 +688,7 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     g_sink.proxy_render->generation = g_sink.generation;
     g_sink.proxy_render->capacity = want;
     g_sink.proxy_render->staging = (BYTE *)malloc((size_t)want * g_sink.in_block);
+    g_sink.proxy_render->staging_bytes = (size_t)want * g_sink.in_block;
     if (!g_sink.proxy_render->staging) { sink_teardown_controlled(); return E_OUTOFMEMORY; }
     g_sink.proxy_clock->vtbl = g_fake_clock_vtbl;
     g_sink.proxy_clock->ref = 1;
@@ -762,6 +696,11 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
 
     g_sink.engaged = 1;
     g_sink.owner = (void *)self;
+    g_sink.config_epoch = g_cfg_policy_epoch;
+    g_sink.config_file_epoch = g_cfg_epoch;
+    g_sink.config_enable = g_enable;
+    g_sink.config_frames = g_out_frames;
+    g_sink.config_audiohost = g_audiohost;
     ((IUnknown *)self)->lpVtbl->AddRef((IUnknown *)self); /* the sink outlives the caller's handle */
     g_sink.reported_frames = want;
     /* A rebuilt stream starts its own timeline; the watchdog uses the key to
@@ -782,13 +721,15 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     g_sink.hifi_first_mismatch_frame = ~(UINT64)0;
     g_sink.hifi_client_hash = 1469598103934665603ull;
     g_sink.hifi_endpoint_hash = 1469598103934665603ull;
-    snprintf(b, sizeof(b), "out=rate:%d/cont:%d.%d/ch:%d%s hifi=%d map=%s  %s",
+    snprintf(b, sizeof(b), "out=rate:%d/cont:%d.%d/ch:%d%s hifi=%d map=%s  %s engine=%s",
              used_rate, used_cont, used_bits, g_sink.in_channels,
              used_float ? "/float" : "",
              g_hifi,
              g_hifi ? (native ? "client-native" : "converted") : "off",
-             native ? "[native]" : (g_sink.resample ? "[converted]" : "[depth only]"));
-    log_line("sink ENGAGED  %s  ->  %s  (client buffer %lu frames, ring %lu)  ep=\"%s\" hw=%d",
+             native ? "[native]" : (g_sink.resample ? "[converted]" : "[depth only]"),
+             gen->remote ? "audiohost" : "in-process");
+    log_line("sink ENGAGED  generation=%llu  %s  ->  %s  (client buffer %lu frames, ring %lu)  ep=\"%s\" hw=%d",
+             (unsigned long long)g_sink.generation,
              a, b, (unsigned long)want, (unsigned long)g_sink.cap, ep_name, ep_hw);
     return S_OK;
 }

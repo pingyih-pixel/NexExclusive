@@ -8,7 +8,9 @@ static void sink_fault(SinkGen *g, HRESULT hr, const char *operation) {
     if (g_sink.h_client) SetEvent(g_sink.h_client);
     if (g && g->real_evt) SetEvent(g->real_evt);
     LeaveCriticalSection(&g_lock);
-    log_line("sink fault: %s 0x%08lX; client will receive failure",operation,(unsigned long)hr);
+    log_line("sink fault: %s 0x%08lX; client will receive failure (real_frames=%lu evt=%p)",
+             operation, (unsigned long)hr,
+             (unsigned long)(g ? g->real_frames : 0), (void *)(g ? g->real_evt : NULL));
 }
 
 /* A device that disappears is not a stream failure: the audio that is already
@@ -73,7 +75,8 @@ static void dump_frames(const BYTE *p, UINT32 frames) {
    buffer seen here means the drain thread arrived after the device had already
    run out. */
 static UINT32 g_writes, g_starve, g_max_gap;
-static DWORD  g_last_write;
+static DWORD  g_last_write, g_last_report;
+static UINT64 g_last_submit_qpc, g_max_gap_qpc;
 
 static UINT64 hifi_changed_bytes(const BYTE *a, const BYTE *b, size_t n) {
     UINT64 changed = 0;
@@ -118,15 +121,25 @@ static void hifi_record_native(const BYTE *client, const BYTE *endpoint,
    let go of this generation, the thread must not touch the ring, the resampler
    or the negotiated format again - they may already belong to the next stream. */
 static HRESULT drain_once(SinkGen *g) {
-    if (g->remote) return remote_drain_once(g);
     UINT32 pad=0;
     g->stage=STAGE_PADDING;
-    HRESULT hr=O_GETPADDING(g->real,&pad);
-    if(g->retired)return E_ABORT;
-    if (FAILED(hr)) return hr;
-    if (g->device_started && pad==0 && g->submitted) g_starve++;
-    if (pad>g->real_frames) return E_UNEXPECTED;
-    UINT32 space=g->real_frames-pad;
+    HRESULT hr=S_OK;
+    UINT32 space=0;
+    if (g->remote) {
+        /* The producer owns a complete device period.  Transport availability
+           is handled by remote_write(), which waits for the whole batch or
+           fails it; it must not shorten this request before conversion. */
+        space = g->real_frames;
+        if (remote_state()==NEX_AUDIO_FAILED)
+            return FAILED(g_remote_error) ? g_remote_error : E_FAIL;
+    } else {
+        hr=O_GETPADDING(g->real,&pad);
+        if(g->retired)return E_ABORT;
+        if (FAILED(hr)) return hr;
+        if (g->device_started && pad==0 && g->submitted) g_starve++;
+        if (pad>g->real_frames) return E_UNEXPECTED;
+        space=g->real_frames-pad;
+    }
     if (!space) return S_FALSE;
     UINT32 n=0;
     if (g_sink.resample) {
@@ -141,6 +154,7 @@ static HRESULT drain_once(SinkGen *g) {
         if (want) {
             UINT32 got=ring_take(g_inb,want);
             if (got) {
+                if (g->remote) remote_note_client(g_inb, got);
                 to_float(g_inb,g_fin,got);
                 if (src_push(g_fin,(int)got,g_sink.in_channels)!=(int)got) return E_UNEXPECTED;
                 if (g_sink.h_space) SetEvent(g_sink.h_space);
@@ -157,26 +171,52 @@ static HRESULT drain_once(SinkGen *g) {
         if(n>space)n=space;
         if(n>SCRATCH_FRAMES)n=SCRATCH_FRAMES;
     }
-    if(!n)return S_FALSE;
-    BYTE *dst=NULL;
-    g->stage=STAGE_GETBUF;
-    hr=g->real_render->lpVtbl->GetBuffer(g->real_render,n,&dst);
-    /* The call above is the one that can park for the lifetime of the process.
-       Check before anything else reads shared state. */
-    if(g->retired)return E_ABORT;
-    if(FAILED(hr))return hr;
+    /* An event-driven exclusive stream is signalled for one complete device
+       buffer. Several drivers reject a short GetBuffer request with
+       AUDCLNT_E_BUFFER_SIZE_ERROR even when the current padding leaves room.
+       Wait for a full period and submit exactly the negotiated buffer size;
+       the client ring remains untouched while it is still filling. */
+    if (g->real_evt) {
+        if (n < g->real_frames) {
+            /* The client may write in packets smaller than one device period.
+               Keep its event pump moving while the ring prefills, including
+               before the hardware has been started for the first time. */
+            if (g_sink.h_client) SetEvent(g_sink.h_client);
+            return S_FALSE;
+        }
+        if (pad != 0) return S_FALSE;
+        n = g->real_frames;
+    }
+    if(!n) {
+        if (!g->real_evt && space && g_sink.h_client) {
+            EnterCriticalSection(&g_lock);
+            int empty = g_sink.w == g_sink.r;
+            LeaveCriticalSection(&g_lock);
+            if (empty) SetEvent(g_sink.h_client);
+        }
+        return S_FALSE;
+    }
+    BYTE *dst=g->remote ? g_remote_out : NULL;
+    if (!g->remote) {
+        g->stage=STAGE_GETBUF;
+        hr=g->real_render->lpVtbl->GetBuffer(g->real_render,n,&dst);
+        /* The call above is the one that can park for the lifetime of the process.
+           Check before anything else reads shared state. */
+        if(g->retired)return E_ABORT;
+        if(FAILED(hr))return hr;
+    }
     if(g_sink.resample) {
         src_pull(g_fout,(int)n,g_sink.in_channels);
         quantize(g_fout,n,dst);
     } else {
-        UINT32 got=ring_take(g_inb,n);
+        UINT32 got = g->remote ? ring_peek(g_inb,n) : ring_take(g_inb,n);
         if(got!=n) {
-            g->real_render->lpVtbl->ReleaseBuffer(g->real_render,0,0);
+            if (!g->remote) g->real_render->lpVtbl->ReleaseBuffer(g->real_render,0,0);
             return E_UNEXPECTED;
         }
         convert(g_inb,dst,n);
         if (g_sink.hifi_map == 1) {
-            hifi_record_native(g_inb, dst, n, (UINT32)g_sink.in_block);
+            if (!g->remote) hifi_record_native(g_inb, dst, n, (UINT32)g_sink.in_block);
         } else if (g_sink.hifi_map == 2) {
             g_sink.hifi_converted_frames += n;
         }
@@ -184,27 +224,71 @@ static HRESULT drain_once(SinkGen *g) {
     apply_fade(dst,n);
     dump_frames(dst,n);
     g->stage=STAGE_RELEASE;
-    hr=g->real_render->lpVtbl->ReleaseBuffer(g->real_render,n,0);
-    if(g->retired)return E_ABORT;
-    if(FAILED(hr))return hr;
+    if (g->remote) {
+        if (remote_write(g_sink.resample ? NULL : g_inb, dst, n) != n)
+            return FAILED(g_remote_error) ? g_remote_error : E_FAIL;
+        if (!g_sink.resample) ring_commit(n);
+        if (!g_sink.resample) remote_note_client(g_inb, n);
+        g->device_started = g_remote_ipc && g_remote_ipc->device_started;
+    } else {
+        hr=g->real_render->lpVtbl->ReleaseBuffer(g->real_render,n,0);
+        if(g->retired)return E_ABORT;
+        if(FAILED(hr))return hr;
+    }
     g->submitted+=n;
     {
         DWORD t=GetTickCount();
+        LARGE_INTEGER qpc_now, qpc_freq;
+        UINT64 qpc_gap = 0;
+        if (QueryPerformanceCounter(&qpc_now)) {
+            UINT64 qpc = (UINT64)qpc_now.QuadPart;
+            if (g_last_submit_qpc && qpc > g_last_submit_qpc) {
+                qpc_gap = qpc - g_last_submit_qpc;
+                if (qpc_gap > g_max_gap_qpc) g_max_gap_qpc = qpc_gap;
+            }
+            g_last_submit_qpc = qpc;
+        }
         g->last_submit=(LONG)t;
         if(g_last_write) { DWORD gap=t-g_last_write; if(gap>g_max_gap) g_max_gap=gap; }
         g_last_write=t;
-        /* Only speak up when the window shows a problem: an empty device buffer
-           or a gap longer than the buffer itself. A healthy stream is silent. */
-        if((++g_writes%5000)==0) {
-            if(g_starve || g_max_gap>50)
-                log_line("drain: %lu writes, %lu empty-buffer, max gap %lu ms",
-                         (unsigned long)g_writes,(unsigned long)g_starve,(unsigned long)g_max_gap);
+        /* Polling can submit many small batches per second. Report by elapsed
+           time so the log stays bounded and gaps use a consistent window. */
+        g_writes++;
+        if (t - g_last_report >= 10000) {
+            UINT64 ring_used = 0;
+            UINT32 device_padding = 0;
+            const char *state = "in_process";
+            if (g->remote && g_remote_ipc) {
+                ring_used = nex_audio_ring_available(g_remote_ipc);
+                device_padding = g_remote_ipc->device_padding_frames;
+                state = nex_audio_state_name(remote_state());
+            }
+            QueryPerformanceFrequency(&qpc_freq);
+            log_line("drain: gen=%llu writes=%lu empty-buffer=%lu max gap=%lu ms "
+                     "max_gap_qpc=%llu qpc_hz=%llu ring_used=%llu padding=%lu "
+                     "backpressure=%llu state=%s",
+                     (unsigned long long)g->id,
+                     (unsigned long)g_writes,(unsigned long)g_starve,
+                     (unsigned long)g_max_gap,
+                     (unsigned long long)g_max_gap_qpc,
+                     (unsigned long long)qpc_freq.QuadPart,
+                     (unsigned long long)ring_used,
+                     (unsigned long)device_padding,
+                     g->remote && g_remote_ipc
+                         ? (unsigned long long)nex_audio_read64(&g_remote_ipc->backpressure_events) : 0,
+                     state);
             g_max_gap=0;
+            g_max_gap_qpc=0;
+            g_last_report=t;
         }
     }
     if(g_sink.h_space)SetEvent(g_sink.h_space);
-    if(g_sink.h_client)SetEvent(g_sink.h_client);
-    if(!g->device_started) {
+    /* The intercepted client is event driven. Every successful device-period
+       submission creates space in its logical buffer, so every submission must
+       wake its producer. Waiting until the ring is empty leaves the producer
+       asleep while the endpoint is already consuming frames. */
+    if(g_sink.h_client) SetEvent(g_sink.h_client);
+    if(!g->device_started && !g->remote) {
         /* Start only after real audio has been committed to the device. */
         g->stage=STAGE_START;
         hr=O_START(g->real);
@@ -222,6 +306,13 @@ static DWORD WINAPI drain_thread(LPVOID param) {
     g->stage=STAGE_IDLE;
     log_line("drain: thread up (gen %llu), out=%d Hz/%d.%d bit",
              (unsigned long long)g->id,g_sink.out_rate,out_container(),out_valid());
+    g_last_write = 0;
+    g_last_report = GetTickCount();
+    g_max_gap = 0;
+    g_last_submit_qpc = 0;
+    g_max_gap_qpc = 0;
+    g_writes = 0;
+    g_starve = 0;
     while(g->running && !g->retired) {
         HRESULT hr=drain_once(g);
         if(g->retired) break;
@@ -229,7 +320,14 @@ static DWORD WINAPI drain_thread(LPVOID param) {
         /* An error that arrives after our own Stop is the expected answer to a
            submission interrupted mid-flight, not a broken stream. Faulting here
            would poison a sink that is being rebuilt on purpose. */
-        if(FAILED(hr)) { if(!g->running) break; sink_fault(g,hr,"device submission"); break; }
+        if(FAILED(hr)) {
+            if(!g->running) break;
+            log_line("sink: device submission detail hr=0x%08lX stage=%ld real_frames=%lu evt=%p",
+                     (unsigned long)hr, (long)g->stage,
+                     (unsigned long)g->real_frames, (void *)g->real_evt);
+            sink_fault(g,hr,"device submission");
+            break;
+        }
         if(hr==S_FALSE) {
             HANDLE waiters[3]; DWORD count = 0;
             if (g->real_evt) waiters[count++] = g->real_evt;
@@ -237,8 +335,10 @@ static DWORD WINAPI drain_thread(LPVOID param) {
             if (g->remote && g_remote_space) waiters[count++] = g_remote_space;
             if (g_h_wake) waiters[count++] = g_h_wake;
             if (count) {
-                DWORD timeout = g->real_evt ? 100 : 3;
-                (void)WaitForMultipleObjects(count, waiters, FALSE, timeout);
+                /* The device event is the primary wake-up. A short polling
+                   fallback bounds delivery lateness if the event or this thread
+                   is scheduled after the buffer has already run empty. */
+                (void)WaitForMultipleObjects(count, waiters, FALSE, 3);
             } else Sleep(2);
         }
     }
@@ -267,6 +367,7 @@ struct FakeObj {
     UINT64 generation;
     BYTE *staging; /* client's outstanding buffer survives stream teardown */
     UINT32 capacity;
+    size_t staging_bytes;
     UINT32 reserved;
     DWORD writer_tid;
     /* Set when Stop/Reset threw away an outstanding reservation. It lets a
@@ -279,7 +380,14 @@ static FakeObj g_fake_render;
 static FakeObj g_fake_clock;
 
 static int proxy_current(FakeObj *obj) {
-    return g_sink.engaged && obj && (obj->generation==g_sink.generation);
+    return g_sink.engaged && obj && obj->generation == g_sink.generation;
+}
+static int render_proxy_current(FakeObj *obj) {
+    /* A same-format successor shares the device generation with the previous
+       client. Keep every proxy from that generation usable until its owner
+       releases it; invalidating the previous proxy here makes the client
+       rebuild again and turns a handoff into a repeating audible gap. */
+    return proxy_current(obj);
 }
 static ULONG STDMETHODCALLTYPE fr_AddRef(void *s) { return (ULONG)InterlockedIncrement(&((FakeObj *)s)->ref); }
 static ULONG STDMETHODCALLTYPE fr_Release(void *s) {
@@ -310,14 +418,22 @@ static HRESULT STDMETHODCALLTYPE fr_GetBuffer(void *s, UINT32 frames, BYTE **pp)
     }
     EnterCriticalSection(&g_control);
     HRESULT hr=S_OK;
-    if(!proxy_current(obj)) hr=AUDCLNT_E_DEVICE_INVALIDATED;
+    UINT32 used_frames=0, free_frames=0, queue_frames=g_sink.reported_frames;
+    if(!render_proxy_current(obj)) hr=AUDCLNT_E_DEVICE_INVALIDATED;
     else if(FAILED(g_sink.fault)) hr=g_sink.fault;
     else if(obj->reserved) hr=AUDCLNT_E_OUT_OF_ORDER;
     else if(!frames) hr=AUDCLNT_E_INVALID_SIZE; /* WASAPI rejects a zero-frame request */
     else {
         EnterCriticalSection(&g_lock);
-        UINT32 used=g_sink.w-g_sink.r;
-        UINT32 free_frames=used<g_sink.reported_frames ? g_sink.reported_frames-used : 0;
+        used_frames=g_sink.w-g_sink.r;
+        queue_frames = g_sink.reported_frames;
+        /* Event-driven exclusive prefill can span several fixed client packets
+           before one full device period is committed. Keep the public buffer
+           size and per-request capacity unchanged, but let those packets use
+           the ring storage that was allocated for exactly this queueing. */
+        if (g_sink.gen && g_sink.gen->real_evt && g_sink.cap > queue_frames)
+            queue_frames = g_sink.cap;
+        free_frames=used_frames<queue_frames ? queue_frames-used_frames : 0;
         LeaveCriticalSection(&g_lock);
         if(frames>free_frames) hr=AUDCLNT_E_BUFFER_TOO_LARGE;
         else {
@@ -329,19 +445,6 @@ static HRESULT STDMETHODCALLTYPE fr_GetBuffer(void *s, UINT32 frames, BYTE **pp)
         }
     }
     LeaveCriticalSection(&g_control);
-    if (hr != S_OK) {
-        /* "Client goes silent after a seek" has one silent cause: GetBuffer
-           starts failing and the client never reports why. Rate-limited so a
-           broken stream cannot flood the log. */
-        static DWORD last_log;
-        DWORD now = GetTickCount();
-        if (now - last_log > 250) {
-            last_log = now;
-            log_line("GetBuffer(%u) -> 0x%08lX (reserved=%u)",
-                     frames, (unsigned long)hr,
-                     (unsigned)(obj ? obj->reserved : 0));
-        }
-    }
     return hr;
 }
 
@@ -350,7 +453,15 @@ static HRESULT STDMETHODCALLTYPE fr_ReleaseBuffer(void *s, UINT32 written, DWORD
     FakeObj *obj=s ? s : &g_fake_render;
     EnterCriticalSection(&g_control);
     HRESULT hr=S_OK;
-    if(!proxy_current(obj)) hr=AUDCLNT_E_DEVICE_INVALIDATED;
+    /* Same-format handoffs keep all proxies in the generation usable. A full
+       generation teardown invalidates outstanding packets, so their staging
+       memory remains alive only until the caller releases the proxy. */
+    int pending_old = g_sink.engaged && obj && obj->generation == g_sink.generation
+                   && obj->reserved && obj != g_sink.proxy_render;
+    int discarded_old = g_sink.engaged && obj && obj->generation == g_sink.generation
+                     && obj->discarded && obj != g_sink.proxy_render;
+    if(!render_proxy_current(obj) && !pending_old && !discarded_old)
+        hr=AUDCLNT_E_DEVICE_INVALIDATED;
     else if(FAILED(g_sink.fault)) hr=g_sink.fault;
     /* Stop/Reset discards the reservation on purpose (a seek never releases the
        frames it was holding). A release arriving after that is the tail of a
@@ -361,19 +472,15 @@ static HRESULT STDMETHODCALLTYPE fr_ReleaseBuffer(void *s, UINT32 written, DWORD
     else if(written && obj->writer_tid!=GetCurrentThreadId()) hr=AUDCLNT_E_OUT_OF_ORDER;
     else if(written>obj->reserved) hr=AUDCLNT_E_INVALID_SIZE;
     else if(written) {
-        BYTE *dst=ring_reserve(written);
-        if(!dst) {
+        if(flags&AUDCLNT_BUFFERFLAGS_SILENT)
+            memset(obj->staging,0,(size_t)written*g_sink.in_block);
+        if(!ring_write_copy(obj->staging,written)) {
             hr=AUDCLNT_E_DEVICE_INVALIDATED;
             obj->reserved=0;
             obj->writer_tid=0;
             obj->discarded=1;
         }
         else {
-            if(flags&AUDCLNT_BUFFERFLAGS_SILENT) memset(dst,0,(size_t)written*g_sink.in_block);
-            else memcpy(dst,obj->staging,(size_t)written*g_sink.in_block);
-            EnterCriticalSection(&g_lock);
-            g_sink.w+=written;
-            LeaveCriticalSection(&g_lock);
             SetEvent(g_sink.h_data);
         }
     }
@@ -386,6 +493,24 @@ static void *g_fake_render_vtbl[5] = {
     (void *)fr_QI, (void *)fr_AddRef, (void *)fr_Release,
     (void *)fr_GetBuffer, (void *)fr_ReleaseBuffer,
 };
+
+/* A same-format successor owns a distinct client-facing render proxy. The
+   device generation and ring are shared, but each IAudioClient needs its own
+   reservation state and staging buffer so an overlapping handoff cannot make
+   one client's packet overwrite the other one's packet. */
+static FakeObj *proxy_render_new(UINT64 generation, UINT32 capacity, int block) {
+    if (!generation || !capacity || block <= 0) return NULL;
+    FakeObj *obj = (FakeObj *)calloc(1, sizeof(*obj));
+    if (!obj) return NULL;
+    obj->vtbl = g_fake_render_vtbl;
+    obj->ref = 1; /* sink-owned until the next handoff or teardown */
+    obj->generation = generation;
+    obj->capacity = capacity;
+    obj->staging_bytes = (size_t)capacity * (size_t)block;
+    obj->staging = (BYTE *)malloc(obj->staging_bytes);
+    if (!obj->staging) { free(obj); return NULL; }
+    return obj;
+}
 
 /* ---- fake IAudioClock --------------------------------------------------- */
 static HRESULT STDMETHODCALLTYPE fc_QI(void *s, const GUID *iid, void **out) {
@@ -417,26 +542,58 @@ static HRESULT STDMETHODCALLTYPE fc_GetPosition(void *s, UINT64 *pos, UINT64 *qp
        known position keeps the client's timeline where it was; a failure here
        would look like the track ended. */
     else if(g_sink.device_lost) { *pos=g_sink.clock_last; if(qpc)*qpc=0; }
-    else if(!g_sink.gen || !g_sink.gen->real_clock || !g_sink.gen->clock_frequency) hr=E_UNEXPECTED;
+    else if(!g_sink.gen) hr=E_UNEXPECTED;
     else {
-        IAudioClock *clk=g_sink.gen->real_clock;
-        hr=clk->lpVtbl->GetPosition(clk,&p,&q);
+        UINT64 f=0;
+        if(g_sink.gen->remote) {
+            /* The Host publishes the actual IAudioClock snapshot. Endpoint
+               submission counters describe queue traffic, not the playhead,
+               so they must not be converted into a client timeline. */
+            if(!g_remote_ipc || !g_remote_ipc->device_clock_frequency) hr=E_UNEXPECTED;
+            else {
+                p=nex_audio_read64((volatile UINT64 *)&g_remote_ipc->device_clock_position);
+                f=g_remote_ipc->device_clock_frequency;
+                q=nex_audio_read64((volatile UINT64 *)&g_remote_ipc->device_clock_qpc);
+            }
+        } else {
+            if(!g_sink.gen->real_clock || !g_sink.gen->clock_frequency) hr=E_UNEXPECTED;
+            else {
+                IAudioClock *clk=g_sink.gen->real_clock;
+                f=g_sink.gen->clock_frequency;
+                hr=clk->lpVtbl->GetPosition(clk,&p,&q);
+            }
+        }
         if(SUCCEEDED(hr)) {
-            UINT64 f=g_sink.gen->clock_frequency;
-            UINT64 ticks=g_sink.clock_base+(p/f)*10000000ULL
-                         +(UINT64)((long double)(p%f)*10000000.0L/f);
+            UINT64 ticks;
+            if (g_sink.gen->remote) {
+                /* Remote p is already in IAudioClock ticks. */
+                ticks = g_sink.clock_base + p;
+            } else {
+                ticks=g_sink.clock_base+(p/f)*10000000ULL
+                     +(UINT64)((long double)(p%f)*10000000.0L/f);
+            }
             UINT64 prev=g_sink.clock_last;
             if(ticks<prev) {
-                /* Only a real backwards jump is worth a line. A seek resets the
-                   device clock, and this clamp is what stops the client's
-                   timeline from snapping back mid-track. */
-                log_line("GetPosition: device clock went backwards (%.3f s -> %.3f s), clamped",
-                         (double)prev/10000000.0,(double)ticks/10000000.0);
-                ticks=prev;
+                /* A new remote device generation can restart its clock at zero.
+                   Move the base forward once to preserve continuity across that
+                   generation boundary; no queue-period estimate is involved. */
+                if (g_sink.gen->remote && g_sink.gen->device_started) {
+                    UINT64 delta = prev - ticks;
+                    g_sink.clock_base += delta;
+                    ticks += delta;
+                    log_line("GetPosition: remote device clock adjusted clock base by %.3f s",
+                             (double)delta / 10000000.0);
+                } else {
+                    /* A local reset or migration can still report a stale
+                       device position. Keep the public timeline monotonic. */
+                    log_line("GetPosition: device clock went backwards (%.3f s -> %.3f s), clamped",
+                             (double)prev/10000000.0,(double)ticks/10000000.0);
+                    ticks=prev;
+                }
             }
             g_sink.clock_last=ticks;
             *pos=ticks;
-            if(qpc)*qpc=q; /* WASAPI supplies matching QPC in 100 ns units */
+            if(qpc)*qpc=q; /* matching QueryPerformanceCounter units */
         }
     }
     LeaveCriticalSection(&g_control);

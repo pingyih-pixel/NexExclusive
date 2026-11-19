@@ -18,10 +18,10 @@ static void ring_compact(void) {
     g_sink.r = 0;
 }
 
-// Reserve n contiguous input frames without waiting. The client already saw
-// the reported buffer size, so a full ring means the generation is not able to
-// accept this write; the caller restarts the stream instead of parking its
-// audio thread behind the drain thread.
+// Reserve n contiguous input frames. The drain copies at most one device
+// period while holding g_lock, so waiting for that short critical section is
+// preferable to reporting DEVICE_INVALIDATED and making the client rebuild a
+// same-format stream in the middle of playback.
 static BYTE *ring_reserve(UINT32 n) {
     if (n > g_sink.cap) {
         /* Cannot fit by definition. Waiting here would spin forever, because
@@ -32,7 +32,7 @@ static BYTE *ring_reserve(UINT32 n) {
                  (unsigned long)n, (unsigned long)g_sink.cap);
         return NULL;
     }
-    if (!TryEnterCriticalSection(&g_lock)) return NULL;
+    EnterCriticalSection(&g_lock);
     if (!g_sink.engaged) { LeaveCriticalSection(&g_lock); return NULL; }
     UINT32 used = g_sink.w - g_sink.r;
     if (g_sink.cap - used < n) { LeaveCriticalSection(&g_lock); return NULL; }
@@ -46,6 +46,27 @@ static BYTE *ring_reserve(UINT32 n) {
     return p;
 }
 
+/* Select the destination and copy the packet under the same lock.  A pointer
+   returned by ring_reserve() becomes stale if the drain thread consumes or
+   compacts the ring before the client finishes its memcpy. */
+static int ring_write_copy(const BYTE *src, UINT32 n) {
+    if (!src || !n || n > g_sink.cap) return 0;
+    EnterCriticalSection(&g_lock);
+    if (!g_sink.engaged) { LeaveCriticalSection(&g_lock); return 0; }
+    UINT32 used = g_sink.w - g_sink.r;
+    if (g_sink.cap - used < n) { LeaveCriticalSection(&g_lock); return 0; }
+    if ((g_sink.w % g_sink.cap) + n > g_sink.cap) ring_compact();
+    if ((g_sink.w % g_sink.cap) + n > g_sink.cap) {
+        LeaveCriticalSection(&g_lock);
+        return 0;
+    }
+    BYTE *dst = g_sink.ring + (size_t)(g_sink.w % g_sink.cap) * g_sink.in_block;
+    memcpy(dst, src, (size_t)n * g_sink.in_block);
+    g_sink.w += n;
+    LeaveCriticalSection(&g_lock);
+    return 1;
+}
+
 /* ---- sample conversion -------------------------------------------------- */
 static double rnd01(void);
 /* container is the byte width, valid the precision inside it. They differ only
@@ -55,15 +76,20 @@ static double rnd01(void);
    mismatch. */
 static double sample_read(const BYTE *p, int container, int valid, int is_float) {
     if (is_float) { float f; memcpy(&f,p,4); return isfinite(f) ? f : 0.0; }
-    if (container == 16) { short x; memcpy(&x,p,2); return (double)x / 32768.0; }
+    if (container == 16) {
+        short x; memcpy(&x,p,2);
+        if (valid < 16) x = (short)(x >> (16 - valid));
+        return (double)x / ldexp(1.0, valid - 1);
+    }
     if (container == 24) {
         int x = p[0] | (p[1]<<8) | (p[2]<<16);
         if (x & 0x800000) x |= ~0xFFFFFF;
-        return (double)x / 8388608.0;
+        if (valid < 24) x >>= (24 - valid);
+        return (double)x / ldexp(1.0, valid - 1);
     }
     int x; memcpy(&x,p,4);
-    if (valid == 24) return (double)(x >> 8) / 8388608.0;
-    return (double)x / 2147483648.0;
+    if (valid < 32) x >>= (32 - valid);
+    return (double)x / ldexp(1.0, valid - 1);
 }
 static void sample_write(double v, BYTE *p, int container, int valid, int is_float, int dither) {
     if (!isfinite(v)) v = 0.0;
@@ -75,11 +101,15 @@ static void sample_write(double v, BYTE *p, int container, int valid, int is_flo
     if (v < -scale) v = -scale;
     INT64 q = (INT64)llrint(v);
     if (container == 16) { short x=(short)q; memcpy(p,&x,2); }
-    else if (container == 24) { p[0]=(BYTE)q; p[1]=(BYTE)(q>>8); p[2]=(BYTE)(q>>16); }
-    else if (valid == 24) { /* left-justified in 32 bits; unsigned shift is defined
-                               for negative values, signed left shift is not */
-                            int x=(int)((UINT32)q << 8); memcpy(p,&x,4); }
-    else { int x=(int)q; memcpy(p,&x,4); }
+    else if (container == 24) {
+        INT64 aligned = q << (24 - valid);
+        p[0]=(BYTE)aligned; p[1]=(BYTE)(aligned >> 8); p[2]=(BYTE)(aligned >> 16);
+    } else {
+        /* WAVEFORMATEXTENSIBLE stores valid PCM bits at the high end of the
+           container.  This covers both 24-in-32 and 16-in-32. */
+        INT64 aligned = q << (32 - valid);
+        int x=(int)aligned; memcpy(p,&x,4);
+    }
 }
 static void convert(const BYTE *src, BYTE *dst, UINT32 frames) {
     size_t n = (size_t)frames * g_sink.in_channels;
@@ -142,7 +172,10 @@ typedef struct {
 static Src g_src;
 static double g_i0_beta = 1.0;
 
-#define SCRATCH_FRAMES 4096
+/* A 100 ms exclusive buffer reaches 38400 frames at 384 kHz. Keep one complete
+   device buffer available even at the highest probed rate; truncating it would
+   force short submissions during the initial prefill. */
+#define SCRATCH_FRAMES 65536
 static BYTE  *g_inb;    /* client-format scratch */
 static float *g_fin;    /* the same frames as float */
 static float *g_fout;   /* resampled output, up to one device buffer */
@@ -427,8 +460,9 @@ static void apply_fade(BYTE *dst, UINT32 frames) {
     }
 }
 
-/* pull up to maxframes from the ring into a client-format scratch buffer */
-static UINT32 ring_take(BYTE *dst, UINT32 maxframes) {
+/* Copy without moving the read cursor.  Remote submission uses this two-step
+   form so a timed-out IPC write leaves the client ring untouched. */
+static UINT32 ring_peek(BYTE *dst, UINT32 maxframes) {
     EnterCriticalSection(&g_lock);
     UINT32 avail = g_sink.w - g_sink.r;
     UINT32 start = g_sink.r % g_sink.cap;
@@ -437,8 +471,22 @@ static UINT32 ring_take(BYTE *dst, UINT32 maxframes) {
     if (n)
         memcpy(dst, g_sink.ring + (size_t)start * g_sink.in_block,
                (size_t)n * g_sink.in_block);
+    LeaveCriticalSection(&g_lock);
+    return n;
+}
+
+static UINT32 ring_commit(UINT32 frames) {
+    EnterCriticalSection(&g_lock);
+    UINT32 avail = g_sink.w - g_sink.r;
+    UINT32 n = frames < avail ? frames : avail;
     g_sink.r += n;
     LeaveCriticalSection(&g_lock);
     return n;
+}
+
+/* pull up to maxframes from the ring into a client-format scratch buffer */
+static UINT32 ring_take(BYTE *dst, UINT32 maxframes) {
+    UINT32 n = ring_peek(dst, maxframes);
+    return ring_commit(n);
 }
 
