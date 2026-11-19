@@ -153,47 +153,145 @@ static struct {
     int out_rate, out_container, out_valid, out_float;
 } g_negotiated;
 
-/* Candidate search. Order follows the compatibility spec:
-     - the user's requested output depth comes first: it is the only meaning
-       "output bit depth" has, and without it the setting is inert
-     - then the source representation (native passthrough costs nothing)
-     - then float32, then packed 24, then 24-in-32, then 16
-     - inside a group: source rate, then the nearest higher rates, then lower
-       rates from high to low
+/* Candidate search. Which formats are tried, and in which order, is decided by
+   audio_policy.h (nex_audio_policy_build_plan): every depth at the source rate
+   first, then the conversion rates. This file only probes.
+
    The endpoint's own mix rate is a candidate like any other; it is never taken
    as evidence that exclusive mode will accept it.
-   Packed 24 and 24-in-32 are separate declarations in the audio engine. A
-   source that arrives in one of them may only be accepted in the other, so both
-   are probed rather than assuming the container the client happened to use. */
-static HRESULT negotiate(SinkGen *g, IMMDevice *dev, int ch, int *out_rate,
-                         int *out_container, int *out_valid, int *out_float, int *tried) {
-    static const int pool[] = {44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000};
-    const int npool = (int)(sizeof(pool) / sizeof(pool[0]));
-    int depc[NEX_AUDIO_POLICY_MAX_DEPTHS], depv[NEX_AUDIO_POLICY_MAX_DEPTHS];
-    int dfl[NEX_AUDIO_POLICY_MAX_DEPTHS], nd;
-    int rates[NEX_AUDIO_POLICY_MAX_RATES], nr;
-    NexAudioPolicyInput policy;
-    NexAudioPolicyDepth depths[NEX_AUDIO_POLICY_MAX_DEPTHS];
 
-    memset(&policy, 0, sizeof(policy));
-    policy.source_rate = g_sink.in_rate;
-    policy.source_container_bits = g_sink.in_container_bits;
-    policy.source_valid_bits = g_sink.in_valid_bits;
-    policy.source_is_float = g_sink.in_is_float;
-    policy.requested_output_bits = g_out_bits;
-    policy.forced_rate = g_force_rate;
-    policy.compatibility = g_compat;
-    policy.hifi = g_hifi;
-    policy.source_preference = g_src_prefer;
-    nd = nex_audio_policy_build_depths(&policy, depths, NEX_AUDIO_POLICY_MAX_DEPTHS);
-    for (int i = 0; i < nd; i++) {
-        depc[i] = depths[i].container_bits;
-        depv[i] = depths[i].valid_bits;
-        dfl[i] = depths[i].is_float;
+   A probe that fails with DEVICE_IN_USE says the previous stream still holds
+   the endpoint. It is not a refusal of the format, so it neither settles the
+   search nor is a conversion chosen behind it remembered. */
+typedef struct NegotiateProbe {
+    SinkGen *gen;
+    IMMDevice *dev;
+    int channels;
+    HRESULT last;
+} NegotiateProbe;
+
+static int negotiate_probe(void *context, const NexAudioPolicyCandidate *c) {
+    NegotiateProbe *p = (NegotiateProbe *)context;
+    if (c->rate != g_sink.in_rate) {
+        /* Conversion ratios the resampler cannot build are not candidates. */
+        long long gcd = src_gcd(g_sink.in_rate, c->rate);
+        if (c->rate / gcd > SRC_MAX_PHASES ||
+            (double)SRC_TAPS / 2.0 * fmax(1.0, (double)g_sink.in_rate / c->rate) > SRC_MAX_HALF)
+            return NEX_AUDIO_PROBE_SKIPPED;
+    }
+    p->last = try_exclusive(p->gen, p->dev, c->rate, c->container_bits, c->valid_bits,
+                            c->is_float, p->channels);
+    if (SUCCEEDED(p->last)) return NEX_AUDIO_PROBE_ACCEPTED;
+    return nex_audio_policy_classify_failure((unsigned long)p->last);
+}
+
+static int negotiated_matches(int ch, UINT64 endpoint_key) {
+    return g_negotiated.valid &&
+           g_negotiated.in_rate == g_sink.in_rate &&
+           g_negotiated.in_bits == (g_sink.in_is_float ? 32 : g_sink.in_container_bits) &&
+           g_negotiated.in_valid == g_sink.in_valid_bits &&
+           g_negotiated.in_float == g_sink.in_is_float &&
+           g_negotiated.channel_mask == g_sink.channel_mask &&
+           g_negotiated.channels == ch && g_negotiated.force_rate == g_force_rate &&
+           g_negotiated.compat == g_compat && g_negotiated.want_bits == g_out_bits &&
+           g_negotiated.src_prefer == g_src_prefer &&
+           g_negotiated.hifi == g_hifi &&
+           g_negotiated.endpoint_key == endpoint_key;
+}
+
+static void negotiated_remember(int ch, UINT64 endpoint_key, const NexAudioPolicyCandidate *c) {
+    g_negotiated.valid    = 1;
+    g_negotiated.in_rate  = g_sink.in_rate;
+    g_negotiated.in_bits  = g_sink.in_is_float ? 32 : g_sink.in_container_bits;
+    g_negotiated.in_valid = g_sink.in_valid_bits;
+    g_negotiated.in_float = g_sink.in_is_float;
+    g_negotiated.channel_mask = g_sink.channel_mask;
+    g_negotiated.channels = ch;
+    g_negotiated.force_rate = g_force_rate;
+    g_negotiated.compat = g_compat;
+    g_negotiated.endpoint_key = endpoint_key;
+    g_negotiated.want_bits = g_out_bits;
+    g_negotiated.src_prefer = g_src_prefer;
+    g_negotiated.hifi = g_hifi;
+    g_negotiated.out_rate = c->rate;
+    g_negotiated.out_container = c->container_bits;
+    g_negotiated.out_valid = c->valid_bits;
+    g_negotiated.out_float = c->is_float;
+}
+
+static void negotiate_policy_input(NexAudioPolicyInput *policy) {
+    memset(policy, 0, sizeof(*policy));
+    policy->source_rate = g_sink.in_rate;
+    policy->source_container_bits = g_sink.in_container_bits;
+    policy->source_valid_bits = g_sink.in_valid_bits;
+    policy->source_is_float = g_sink.in_is_float;
+    policy->requested_output_bits = g_out_bits;
+    policy->forced_rate = g_force_rate;
+    policy->compatibility = g_compat;
+    policy->hifi = g_hifi;
+    policy->source_preference = g_src_prefer;
+}
+
+/* The remembered format first, then the plan. Separated from the device so the
+   regression test can drive it with a probe of its own. */
+static HRESULT negotiate_run(const NexAudioPolicyPlan *plan, NexAudioPolicyProbe probe,
+                             void *context, int ch, UINT64 endpoint_key,
+                             int *out_rate, int *out_container, int *out_valid,
+                             int *out_float, int *tried) {
+    NexAudioPolicySearch found;
+    NexAudioPolicyCandidate chosen;
+    int cached_busy = 0;
+    int budget = g_probe_limit ? g_probe_limit : 64;
+    int result;
+    *tried = 0;
+
+    /* Cache belongs to an endpoint and a policy, never just an input shape. */
+    if (negotiated_matches(ch, endpoint_key)) {
+        NexAudioPolicyCandidate cached;
+        int r;
+        cached.rate = g_negotiated.out_rate;
+        cached.container_bits = g_negotiated.out_container;
+        cached.valid_bits = g_negotiated.out_valid;
+        cached.is_float = g_negotiated.out_float;
+        r = probe(context, &cached);
+        if (r != NEX_AUDIO_PROBE_SKIPPED) (*tried)++;
+        if (r == NEX_AUDIO_PROBE_ACCEPTED) {
+            *out_rate      = cached.rate;
+            *out_container = cached.container_bits;
+            *out_valid     = cached.valid_bits;
+            *out_float     = cached.is_float;
+            return S_OK;
+        }
+        cached_busy = (r == NEX_AUDIO_PROBE_BUSY);
     }
 
-    nr = nex_audio_policy_build_rates(&policy, pool, npool, 0,
-                                      rates, NEX_AUDIO_POLICY_MAX_RATES);
+    result = nex_audio_policy_search(plan, probe, context, budget - *tried, cached_busy, &found);
+    *tried += found.tried;
+    if (result == NEX_AUDIO_SEARCH_LIMIT) return AUDCLNT_E_UNSUPPORTED_FORMAT;
+    if (result == NEX_AUDIO_SEARCH_BUSY) return AUDCLNT_E_DEVICE_IN_USE;
+    if (result != NEX_AUDIO_SEARCH_FOUND) return E_FAIL;
+
+    chosen = plan->items[found.index];
+    *out_rate      = chosen.rate;
+    *out_container = chosen.container_bits;
+    *out_valid     = chosen.valid_bits;
+    *out_float     = chosen.is_float;
+    if (found.cacheable) {
+        negotiated_remember(ch, endpoint_key, &chosen);
+    } else {
+        log_line("negotiate: %d Hz/%d.%d%s chosen while an earlier candidate was busy; "
+                 "not remembered, the next stream starts from the source format",
+                 chosen.rate, chosen.container_bits, chosen.valid_bits,
+                 chosen.is_float ? "f" : "");
+    }
+    return S_OK;
+}
+
+static HRESULT negotiate(SinkGen *g, IMMDevice *dev, int ch, int *out_rate,
+                         int *out_container, int *out_valid, int *out_float, int *tried) {
+    NexAudioPolicyInput policy;
+    NexAudioPolicyPlan plan;
+    NegotiateProbe probe;
     int endpoint_mix_rate = 0;
 
     /* endpoint mix rate: candidate only */
@@ -209,74 +307,19 @@ static HRESULT negotiate(SinkGen *g, IMMDevice *dev, int ch, int *out_rate,
         }
     }
 
-    /* The mix rate is discovered after the first policy pass. Rebuild once
-       with it included so simplicity ordering also sees this candidate. */
-    nr = nex_audio_policy_build_rates(&policy, pool, npool, endpoint_mix_rate,
-                                      rates, NEX_AUDIO_POLICY_MAX_RATES);
+    negotiate_policy_input(&policy);
+    nex_audio_policy_build_plan(&policy, endpoint_mix_rate, &plan);
     UINT64 endpoint_key=endpoint_hash(dev);
     if(!endpoint_key)return E_FAIL;
     *tried = 0;
     g_remote_bypass = 0;
 
-    /* Cache belongs to an endpoint and a policy, never just an input shape. */
-    if (g_negotiated.valid &&
-        g_negotiated.in_rate == g_sink.in_rate &&
-        g_negotiated.in_bits == (g_sink.in_is_float ? 32 : g_sink.in_container_bits) &&
-        g_negotiated.in_valid == g_sink.in_valid_bits &&
-        g_negotiated.in_float == g_sink.in_is_float &&
-        g_negotiated.channel_mask == g_sink.channel_mask &&
-        g_negotiated.channels==ch && g_negotiated.force_rate==g_force_rate &&
-        g_negotiated.compat==g_compat && g_negotiated.want_bits==g_out_bits &&
-        g_negotiated.src_prefer==g_src_prefer &&
-        g_negotiated.hifi==g_hifi &&
-        g_negotiated.endpoint_key==endpoint_key) {
-        (*tried)++;
-        if (SUCCEEDED(try_exclusive(g, dev, g_negotiated.out_rate, g_negotiated.out_container,
-                                    g_negotiated.out_valid, g_negotiated.out_float, ch))) {
-            *out_rate      = g_negotiated.out_rate;
-            *out_container = g_negotiated.out_container;
-            *out_valid     = g_negotiated.out_valid;
-            *out_float     = g_negotiated.out_float;
-            return S_OK;
-        }
-    }
-
-    /* Source RATE precedes precision preferences: try all depths at that rate. */
-    for (int ri = 0; ri < nr; ri++) {
-        for (int di = 0; di < nd; di++) {
-            if (*tried >= 64) return AUDCLNT_E_UNSUPPORTED_FORMAT;
-            if (g_probe_limit && *tried >= g_probe_limit) return AUDCLNT_E_UNSUPPORTED_FORMAT;
-            if(rates[ri]!=g_sink.in_rate) {
-                long long gcd=src_gcd(g_sink.in_rate,rates[ri]);
-                if(rates[ri]/gcd>SRC_MAX_PHASES ||
-                   (double)SRC_TAPS/2.0*fmax(1.0,(double)g_sink.in_rate/rates[ri])>SRC_MAX_HALF)continue;
-            }
-            (*tried)++;
-            HRESULT hr = try_exclusive(g, dev, rates[ri], depc[di], depv[di], dfl[di], ch);
-            if (SUCCEEDED(hr)) {
-                *out_rate      = rates[ri];
-                *out_container = depc[di];
-                *out_valid     = depv[di];
-                *out_float     = dfl[di];
-                g_negotiated.valid    = 1;
-                g_negotiated.in_rate  = g_sink.in_rate;
-                g_negotiated.in_bits  = g_sink.in_is_float ? 32 : g_sink.in_container_bits;
-                g_negotiated.in_valid = g_sink.in_valid_bits;
-                g_negotiated.in_float = g_sink.in_is_float;
-                g_negotiated.channel_mask = g_sink.channel_mask;
-                g_negotiated.channels=ch;g_negotiated.force_rate=g_force_rate;
-                g_negotiated.compat=g_compat;g_negotiated.endpoint_key=endpoint_key;
-                g_negotiated.want_bits=g_out_bits;g_negotiated.src_prefer=g_src_prefer;
-                g_negotiated.hifi=g_hifi;
-                g_negotiated.out_rate = *out_rate;
-                g_negotiated.out_container = *out_container;
-                g_negotiated.out_valid = *out_valid;
-                g_negotiated.out_float = *out_float;
-                return S_OK;
-            }
-        }
-    }
-    return E_FAIL;
+    probe.gen = g;
+    probe.dev = dev;
+    probe.channels = ch;
+    probe.last = E_FAIL;
+    return negotiate_run(&plan, negotiate_probe, &probe, ch, endpoint_key,
+                         out_rate, out_container, out_valid, out_float, tried);
 }
 
 static int channel_mask_channels(DWORD mask) {
@@ -285,28 +328,22 @@ static int channel_mask_channels(DWORD mask) {
     return n;
 }
 
-static int dither_selected(int input_float, int input_valid, int output_float,
-                           int output_valid, int mode, int fade_ms) {
-    if (output_float) return 0;
-    if (mode == 1) return 1;
-    return mode == 2 && output_valid < (input_float ? 24 : input_valid) && fade_ms == 0;
-}
-
+/* WAVEFORMATEX unpacking only; which layouts are legal is audio_policy.h's
+   decision. A zero wValidBitsPerSample means "the whole container". */
 static int valid_pcm_format(const WAVEFORMATEX *fmt) {
-    if(!fmt || fmt->nSamplesPerSec<8000 || fmt->nSamplesPerSec>384000 ||
-       fmt->nChannels<1 || fmt->nChannels>8)return 0;
-    if(fmt->wBitsPerSample!=16 && fmt->wBitsPerSample!=24 && fmt->wBitsPerSample!=32)return 0;
-    if(fmt->nBlockAlign!=fmt->nChannels*(fmt->wBitsPerSample/8))return 0;
+    if(!fmt)return 0;
     int fl=fmt->wFormatTag==WAVE_FORMAT_IEEE_FLOAT;
+    int valid=fmt->wBitsPerSample;
     if(fmt->wFormatTag==WAVE_FORMAT_EXTENSIBLE) {
         if(fmt->cbSize<22)return 0;
         const WAVEFORMATEXTENSIBLE *we=(const WAVEFORMATEXTENSIBLE *)fmt;
         if(!IsEqualGUID(&we->SubFormat,&SUB_PCM) && !IsEqualGUID(&we->SubFormat,&SUB_FLOAT))return 0;
-        if(we->Samples.wValidBitsPerSample>fmt->wBitsPerSample)return 0;
+        if(we->Samples.wValidBitsPerSample)valid=we->Samples.wValidBitsPerSample;
         if(we->dwChannelMask && channel_mask_channels(we->dwChannelMask)!=fmt->nChannels)return 0;
         fl=IsEqualGUID(&we->SubFormat,&SUB_FLOAT);
     } else if(fmt->wFormatTag!=WAVE_FORMAT_PCM && !fl)return 0;
-    return !fl || fmt->wBitsPerSample==32;
+    return nex_audio_policy_format_valid((int)fmt->nSamplesPerSec,fmt->nChannels,
+                                         fmt->wBitsPerSample,valid,fl,fmt->nBlockAlign);
 }
 /* A zero-share handle is released by the OS even when a process crashes.
    Unlike a semaphore, it cannot leave an endpoint permanently locked. The
@@ -440,7 +477,7 @@ static HRESULT sink_retarget(const char *reason) {
 
     /* Same rule as the first engage: depth reduction only, and only when the
        integer-domain opening ramp is off (see the note in sink_engage). */
-    g_sink.dither = dither_selected(g_sink.in_is_float, g_sink.in_valid_bits,
+    g_sink.dither = nex_audio_policy_dither_selected(g_sink.in_is_float, g_sink.in_valid_bits,
                                     fl, valid, g_dither, g_fade_ms);
 
     /* The resampler is rebuilt from scratch: its history belongs to the old
@@ -638,7 +675,7 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
        noise is multiplied by the ramp and stops being triangular for the first
        few milliseconds. Moving the ramp into the float path ahead of quantise
        would let this condition drop; until then the config decides. */
-    g_sink.dither = dither_selected(g_sink.in_is_float, g_sink.in_valid_bits,
+    g_sink.dither = nex_audio_policy_dither_selected(g_sink.in_is_float, g_sink.in_valid_bits,
                                     used_float, used_bits, g_dither, g_fade_ms);
 
     if (g_sink.resample &&

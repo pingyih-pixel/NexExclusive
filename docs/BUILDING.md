@@ -51,7 +51,7 @@ ZIG=/c/zig/zig-x86_64-windows-0.17.1 bash mod/build.sh all
 | `mod/src/nexsink.c` | 注入客户端进程的 DLL 的入口，依次包含下面六个 `.inc`，合成一个编译单元 |
 | `mod/src/sink_core.inc` | 配置、日志、状态、vtable 记录 |
 | `mod/src/sink_dsp.inc` | 环形缓冲、采样格式转换、重采样 |
-| `mod/src/audio_policy.h` | C/C++ 共用的采样率、有效位深、容器位深候选规则 |
+| `mod/src/audio_policy.h` | C/C++ 共用的音频策略：采样率池与合法范围、配置默认值与规范化、格式合法性、抖动选择、候选顺序（统一入口 `nex_audio_policy_build_plan`）、探测失败分类与搜索（`nex_audio_policy_search`）。不含端点探测、样本转换和远程协议校验 |
 | `mod/src/sink_device.inc` | 输出线程、故障处理、伪造的客户端对象 |
 | `mod/src/sink_lifecycle.inc` | 设备「代」的切换、停止与拆除 |
 | `mod/src/sink_endpoint.inc` | 格式协商、迁移、接管 |
@@ -59,7 +59,7 @@ ZIG=/c/zig/zig-x86_64-windows-0.17.1 bash mod/build.sh all
 | `mod/tools/nexhost.c` | 宿主 exe：安装卸载、托盘、注入、本机配置服务、CDP 界面注入 |
 | `mod/tools/nexaudiolink.h` / `nexaudiohost.c` | 独立音频宿主协议与 WASAPI 端点进程 |
 | `mod/ui/` | 注入客户端页面的 `panel.js` 与 `simplify.js` |
-| `mod/test/audio_policy_test.cpp` | AudioPolicy 的 C++ 兼容性与同采样率位深候选测试 |
+| `mod/test/audio_policy_test.cpp` | AudioPolicy 的 C++ 测试：位深与采样率顺序、统一候选计划、假端点搜索（含设备占用）、配置规范化、格式合法性、抖动 |
 | `mod/test/regression.c` | DLL 回归，直接包含 `nexsink.c`，所以能测到内部的静态函数 |
 
 回归测试覆盖 DLL 一侧：vtable、环形缓冲、重采样、生命周期、闸门。宿主一侧的安装、卸载、托盘、单实例目前靠手工验证。

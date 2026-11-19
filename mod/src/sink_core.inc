@@ -415,19 +415,27 @@ static void load_config(void) {
         }
     }
     fclose(f);
-    if (g_src_prefer != 0 && g_src_prefer != 1) g_src_prefer = 0;
-    if (g_out_bits != 16 && g_out_bits != 24 && g_out_bits != 32) g_out_bits = 24;
-    if (g_out_frames < 0 || g_out_frames > 32768) g_out_frames = 0;
-    if (g_force_rate < 0 || g_force_rate > 384000) g_force_rate = 0;
-    if (g_dither < 0 || g_dither > 2) g_dither = 2;
-    if (g_fade_ms < 0 || g_fade_ms > 100) g_fade_ms = 5;
-    if (g_hifi) {
-        /* Strict native mode follows the client's format and refuses processing
-           that would make the output differ from the client PCM. */
-        g_force_rate = 0;
-        g_compat = 0;
-        g_dither = 0;
-        g_fade_ms = 0;
+    {
+        /* Legal ranges, defaults and the strict-native overrides are policy:
+           see nex_audio_policy_normalize_config. */
+        NexAudioPolicyConfig cfg;
+        cfg.out_bits = g_out_bits;
+        cfg.force_rate = g_force_rate;
+        cfg.out_frames = g_out_frames;
+        cfg.compat = g_compat;
+        cfg.dither = g_dither;
+        cfg.fade_ms = g_fade_ms;
+        cfg.src_prefer = g_src_prefer;
+        cfg.hifi = g_hifi;
+        nex_audio_policy_normalize_config(&cfg);
+        g_out_bits = cfg.out_bits;
+        g_force_rate = cfg.force_rate;
+        g_out_frames = cfg.out_frames;
+        g_compat = cfg.compat;
+        g_dither = cfg.dither;
+        g_fade_ms = cfg.fade_ms;
+        g_src_prefer = cfg.src_prefer;
+        g_hifi = cfg.hifi;
     }
     /* audiohost selects who owns the endpoint. It is independent of hifi:
        converted streams use the same SRC and quantiser before entering the host. */

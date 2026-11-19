@@ -509,6 +509,151 @@ static void test_valid_format(void) {
     printf("PASS valid_pcm_format: validates valid bits and channel-mask geometry\n");
 }
 
+/* ---- negotiation: occupied is not unsupported ----------------------------- */
+typedef struct {
+    int busy_rate;        /* this rate answers DEVICE_IN_USE while busy_left > 0 */
+    int busy_left;
+    int accept_rate[2], accept_container[2], accept_valid[2];
+    int calls;
+} PolicyEndpoint;
+
+static int policy_endpoint_probe(void *context, const NexAudioPolicyCandidate *c) {
+    PolicyEndpoint *e = (PolicyEndpoint *)context;
+    e->calls++;
+    if (e->busy_rate == c->rate && e->busy_left > 0) {
+        e->busy_left--;
+        return nex_audio_policy_classify_failure((unsigned long)AUDCLNT_E_DEVICE_IN_USE);
+    }
+    for (int i = 0; i < 2; i++) {
+        if (e->accept_rate[i] == c->rate && e->accept_container[i] == c->container_bits &&
+            e->accept_valid[i] == c->valid_bits && !c->is_float)
+            return NEX_AUDIO_PROBE_ACCEPTED;
+    }
+    return nex_audio_policy_classify_failure((unsigned long)AUDCLNT_E_UNSUPPORTED_FORMAT);
+}
+
+static void test_negotiate_busy_is_not_remembered(void) {
+    int save_bits = g_out_bits, save_rate = g_force_rate, save_compat = g_compat;
+    int save_hifi = g_hifi, save_prefer = g_src_prefer;
+    NexAudioPolicyInput policy;
+    NexAudioPolicyPlan plan;
+    int rate = 0, cont = 0, valid = 0, fl = 0, tried = 0;
+    const UINT64 key = 0x1234;
+
+    memset(&g_sink, 0, sizeof(g_sink));
+    memset(&g_negotiated, 0, sizeof(g_negotiated));
+    g_out_bits = 24; g_force_rate = 0; g_compat = 1; g_hifi = 0; g_src_prefer = 0;
+    g_sink.in_rate = 44100;
+    g_sink.in_container_bits = 16;
+    g_sink.in_valid_bits = 16;
+    g_sink.in_channels = 2;
+    g_sink.channel_mask = mask_for(2);
+    negotiate_policy_input(&policy);
+    nex_audio_policy_build_plan(&policy, 48000, &plan);
+
+    /* The endpoint takes 44.1/16, but the previous stream holds it for the
+       whole search. Playback continues at 48 kHz; nothing is remembered. */
+    PolicyEndpoint held = {44100, 1000, {44100, 48000}, {16, 24}, {16, 24}, 0};
+    CHECK(negotiate_run(&plan, policy_endpoint_probe, &held, 2, key,
+                        &rate, &cont, &valid, &fl, &tried) == S_OK);
+    CHECK(rate == 48000 && cont == 24 && valid == 24);
+    CHECK(!g_negotiated.valid);
+
+    /* Next stream, endpoint free: the source format is back and is remembered. */
+    PolicyEndpoint idle = {0, 0, {44100, 48000}, {16, 24}, {16, 24}, 0};
+    CHECK(negotiate_run(&plan, policy_endpoint_probe, &idle, 2, key,
+                        &rate, &cont, &valid, &fl, &tried) == S_OK);
+    CHECK(rate == 44100 && cont == 16 && valid == 16 && tried == 1);
+    CHECK(g_negotiated.valid && g_negotiated.out_rate == 44100);
+
+    /* Held again: the remembered 44.1 kHz entry survives the detour. */
+    held.busy_left = 1000; held.calls = 0;
+    CHECK(negotiate_run(&plan, policy_endpoint_probe, &held, 2, key,
+                        &rate, &cont, &valid, &fl, &tried) == S_OK);
+    CHECK(rate == 48000);
+    CHECK(g_negotiated.valid && g_negotiated.out_rate == 44100);
+
+    /* Released during the search: the source rate is retried before converting. */
+    memset(&g_negotiated, 0, sizeof(g_negotiated));
+    held.busy_left = 2; held.calls = 0;
+    CHECK(negotiate_run(&plan, policy_endpoint_probe, &held, 2, key,
+                        &rate, &cont, &valid, &fl, &tried) == S_OK);
+    CHECK(rate == 44100 && cont == 16 && valid == 16);
+    CHECK(g_negotiated.valid && g_negotiated.out_rate == 44100);
+
+    /* A real refusal of the source rate is a conversion worth remembering. */
+    memset(&g_negotiated, 0, sizeof(g_negotiated));
+    PolicyEndpoint only48 = {0, 0, {48000, 0}, {24, 0}, {24, 0}, 0};
+    CHECK(negotiate_run(&plan, policy_endpoint_probe, &only48, 2, key,
+                        &rate, &cont, &valid, &fl, &tried) == S_OK);
+    CHECK(rate == 48000 && g_negotiated.valid && g_negotiated.out_rate == 48000);
+
+    /* Strict native with the endpoint held reports occupied, not unsupported. */
+    memset(&g_negotiated, 0, sizeof(g_negotiated));
+    g_hifi = 1; g_compat = 0;
+    negotiate_policy_input(&policy);
+    nex_audio_policy_build_plan(&policy, 48000, &plan);
+    held.busy_left = 1000;
+    CHECK(negotiate_run(&plan, policy_endpoint_probe, &held, 2, key,
+                        &rate, &cont, &valid, &fl, &tried) == AUDCLNT_E_DEVICE_IN_USE);
+    PolicyEndpoint none = {0, 0, {0, 0}, {0, 0}, {0, 0}, 0};
+    CHECK(negotiate_run(&plan, policy_endpoint_probe, &none, 2, key,
+                        &rate, &cont, &valid, &fl, &tried) == E_FAIL);
+
+    memset(&g_sink, 0, sizeof(g_sink));
+    memset(&g_negotiated, 0, sizeof(g_negotiated));
+    g_out_bits = save_bits; g_force_rate = save_rate; g_compat = save_compat;
+    g_hifi = save_hifi; g_src_prefer = save_prefer;
+    printf("PASS negotiate: an occupied endpoint neither settles nor poisons the remembered format\n");
+}
+
+static void test_config_values_are_normalized_by_policy(void) {
+    WCHAR temp[MAX_PATH];
+    if (!GetTempPathW(MAX_PATH, temp)) { printf("SKIP config policy: no temp path\n"); return; }
+    WCHAR path[MAX_PATH];
+    _snwprintf(path, MAX_PATH, L"%lsNexExclusive-policy-%lu.cfg", temp,
+               (unsigned long)GetCurrentProcessId());
+    FILE *f = _wfopen(path, L"wb");
+    if (!f) { printf("SKIP config policy: cannot create config\n"); return; }
+    fputs("hifi=0\ncompat=1\nbits=20\nrate=5\nbuffer=99999\ndither=9\nfade_ms=500\n", f);
+    fclose(f);
+    char utf8[MAX_PATH];
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL);
+    _putenv_s("NEX_CFG", utf8);
+    g_cfg_loaded = 0;
+    load_config();
+    NexAudioPolicyConfig d = nex_audio_policy_config_defaults();
+    CHECK(g_out_bits == d.out_bits);
+    CHECK(g_force_rate == 0);            /* 5 Hz is not a rate */
+    CHECK(g_out_frames == d.out_frames);
+    CHECK(g_dither == d.dither);
+    CHECK(g_fade_ms == d.fade_ms);
+    DeleteFileW(path);
+    _putenv_s("NEX_CFG", "");
+    g_cfg_loaded = 0;
+    printf("PASS config: out-of-range values fall back to the policy defaults\n");
+}
+
+/* The remote wire check stays in nexaudiolink.h; it must not drift from the
+   policy's legal range. */
+static void test_policy_range_matches_wire_range(void) {
+    const int rates[] = {7999, 8000, 44100, 384000, 384001};
+    const int chans[] = {0, 1, 8, 9};
+    const int conts[] = {8, 16, 24, 32, 40};
+    for (int r = 0; r < 5; r++) for (int c = 0; c < 4; c++) for (int b = 0; b < 5; b++)
+        for (int v = 0; v <= 40; v += 8) for (int fl = 0; fl < 2; fl++) {
+            int policy = nex_audio_policy_format_valid(rates[r], chans[c], conts[b], v, fl,
+                                                       chans[c] * (conts[b] / 8));
+            int wire = nex_audio_encoding_layout_valid((uint32_t)rates[r], (uint16_t)chans[c],
+                           (uint16_t)conts[b], (uint16_t)v,
+                           fl ? NEX_AUDIO_ENCODING_FLOAT : NEX_AUDIO_ENCODING_PCM);
+            /* The wire additionally insists that float carries 32 valid bits. */
+            if (fl && v != 32) { CHECK(!wire); continue; }
+            CHECK(policy == wire);
+        }
+    printf("PASS policy legal range and remote wire range agree\n");
+}
+
 static void test_src_prefer_order(void) {
     int rates[] = {88200, 96000, 44100, 176400, 48000};
     nex_audio_policy_prefer_integer_ratios(rates, 5, 88200);
@@ -521,14 +666,14 @@ static void test_src_prefer_order(void) {
 }
 
 static void test_dither_policy(void) {
-    CHECK(dither_selected(0, 24, 0, 16, 2, 0));
-    CHECK(!dither_selected(0, 24, 0, 16, 2, 5));
-    CHECK(!dither_selected(0, 24, 0, 24, 2, 0));
-    CHECK(!dither_selected(0, 24, 1, 16, 2, 0));
-    CHECK(dither_selected(0, 24, 0, 24, 1, 5));
-    CHECK(!dither_selected(0, 24, 0, 16, 0, 0));
-    CHECK(!dither_selected(1, 32, 0, 24, 2, 0));
-    CHECK(dither_selected(1, 32, 0, 16, 2, 0));
+    CHECK(nex_audio_policy_dither_selected(0, 24, 0, 16, 2, 0));
+    CHECK(!nex_audio_policy_dither_selected(0, 24, 0, 16, 2, 5));
+    CHECK(!nex_audio_policy_dither_selected(0, 24, 0, 24, 2, 0));
+    CHECK(!nex_audio_policy_dither_selected(0, 24, 1, 16, 2, 0));
+    CHECK(nex_audio_policy_dither_selected(0, 24, 0, 24, 1, 5));
+    CHECK(!nex_audio_policy_dither_selected(0, 24, 0, 16, 0, 0));
+    CHECK(!nex_audio_policy_dither_selected(1, 32, 0, 24, 2, 0));
+    CHECK(nex_audio_policy_dither_selected(1, 32, 0, 16, 2, 0));
     printf("PASS dither policy: auto requires integer depth reduction and fade off\n");
 }
 
@@ -2052,6 +2197,9 @@ int main(void) {
     test_valid_format();
     test_src_prefer_order();
     test_dither_policy();
+    test_negotiate_busy_is_not_remembered();
+    test_config_values_are_normalized_by_policy();
+    test_policy_range_matches_wire_range();
     test_hifi_config_policy();
     test_hifi_verifier();
     test_unregistered_vtable_and_internal_activate();

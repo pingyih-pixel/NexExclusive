@@ -1,10 +1,13 @@
 /*
- * NexExclusive audio negotiation policy.
+ * NexExclusive audio policy.
  *
- * This header intentionally has no Windows dependency so the candidate rules
- * can be exercised from both the injected C translation unit and a C++ test.
- * It describes candidates only; endpoint probing and sample conversion remain
- * in the caller.
+ * This header decides which output formats may be tried, in which order, which
+ * combinations are legal, and what a failed probe means for the rest of the
+ * search. It has no Windows dependency so the same rules are exercised from the
+ * injected C translation unit and from a C++ test.
+ *
+ * It does not probe endpoints (sink_endpoint.inc), convert samples
+ * (sink_dsp.inc) or validate the remote wire layout (nexaudiolink.h).
  */
 #ifndef NEX_AUDIO_POLICY_H
 #define NEX_AUDIO_POLICY_H
@@ -15,8 +18,110 @@
 extern "C" {
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define NEX_AUDIO_POLICY_FN static __attribute__((unused))
+#else
+#define NEX_AUDIO_POLICY_FN static
+#endif
+
+/* ---- legal range ---------------------------------------------------------- */
+
+#define NEX_AUDIO_POLICY_MIN_RATE 8000
+#define NEX_AUDIO_POLICY_MAX_RATE 384000
+#define NEX_AUDIO_POLICY_MAX_CHANNELS 8
+
 #define NEX_AUDIO_POLICY_MAX_RATES 16
 #define NEX_AUDIO_POLICY_MAX_DEPTHS 12
+#define NEX_AUDIO_POLICY_MAX_CANDIDATES \
+    (NEX_AUDIO_POLICY_MAX_RATES * NEX_AUDIO_POLICY_MAX_DEPTHS)
+
+/* Rates offered as conversion targets when the endpoint refuses the source
+   rate. Ascending; the order of use is decided by build_rates. */
+NEX_AUDIO_POLICY_FN const int *nex_audio_policy_rate_pool(int *count) {
+    static const int pool[] = {44100, 48000, 88200, 96000,
+                               176400, 192000, 352800, 384000};
+    if (count) *count = (int)(sizeof(pool) / sizeof(pool[0]));
+    return pool;
+}
+
+NEX_AUDIO_POLICY_FN int nex_audio_policy_rate_valid(int rate) {
+    return rate >= NEX_AUDIO_POLICY_MIN_RATE && rate <= NEX_AUDIO_POLICY_MAX_RATE;
+}
+
+/* One PCM layout. valid_bits is the precision inside container_bits; a caller
+   holding a plain WAVEFORMATEX passes the container width for both. */
+NEX_AUDIO_POLICY_FN int nex_audio_policy_format_valid(int rate, int channels,
+                                                      int container_bits, int valid_bits,
+                                                      int is_float, int block_align) {
+    if (!nex_audio_policy_rate_valid(rate)) return 0;
+    if (channels < 1 || channels > NEX_AUDIO_POLICY_MAX_CHANNELS) return 0;
+    if (container_bits != 16 && container_bits != 24 && container_bits != 32) return 0;
+    if (valid_bits < 1 || valid_bits > container_bits) return 0;
+    if (block_align != channels * (container_bits / 8)) return 0;
+    return !is_float || container_bits == 32;
+}
+
+/* ---- configuration -------------------------------------------------------- */
+
+typedef struct NexAudioPolicyConfig {
+    int out_bits;     /* 16, 24 or 32 (32 = float32)                          */
+    int force_rate;   /* 0 = follow the source                                */
+    int out_frames;   /* 0 = derive from the client's requested duration      */
+    int compat;       /* allow rate/depth conversion when the source is refused */
+    int dither;       /* 0 off, 1 on, 2 auto                                  */
+    int fade_ms;      /* opening ramp; 0 leaves samples untouched             */
+    int src_prefer;   /* 0 bandwidth, 1 integer ratios first                  */
+    int hifi;         /* strict native: the client format or nothing          */
+} NexAudioPolicyConfig;
+
+NEX_AUDIO_POLICY_FN NexAudioPolicyConfig nex_audio_policy_config_defaults(void) {
+    NexAudioPolicyConfig c;
+    c.out_bits = 24;
+    c.force_rate = 0;
+    c.out_frames = 0;
+    c.compat = 1;
+    c.dither = 2;
+    c.fade_ms = 5;
+    c.src_prefer = 0;
+    c.hifi = 0;
+    return c;
+}
+
+/* Repair out-of-range values to their defaults, then apply the strict-native
+   invariant: that mode follows the client's format and refuses any processing
+   that would make the output differ from the client PCM. */
+NEX_AUDIO_POLICY_FN void nex_audio_policy_normalize_config(NexAudioPolicyConfig *c) {
+    NexAudioPolicyConfig d = nex_audio_policy_config_defaults();
+    if (!c) return;
+    c->compat = c->compat != 0;
+    c->hifi = c->hifi != 0;
+    if (c->src_prefer != 0 && c->src_prefer != 1) c->src_prefer = d.src_prefer;
+    if (c->out_bits != 16 && c->out_bits != 24 && c->out_bits != 32) c->out_bits = d.out_bits;
+    if (c->out_frames < 0 || c->out_frames > 32768) c->out_frames = d.out_frames;
+    if (c->force_rate != 0 && !nex_audio_policy_rate_valid(c->force_rate))
+        c->force_rate = d.force_rate;
+    if (c->dither < 0 || c->dither > 2) c->dither = d.dither;
+    if (c->fade_ms < 0 || c->fade_ms > 100) c->fade_ms = d.fade_ms;
+    if (c->hifi) {
+        c->force_rate = 0;
+        c->compat = 0;
+        c->dither = 0;
+        c->fade_ms = 0;
+    }
+}
+
+/* Dither buys something only when the integer depth actually drops. auto also
+   requires fade_ms=0, because the opening ramp is applied after quantisation
+   and would shape the noise for the first few milliseconds. */
+NEX_AUDIO_POLICY_FN int nex_audio_policy_dither_selected(int input_float, int input_valid,
+                                                         int output_float, int output_valid,
+                                                         int mode, int fade_ms) {
+    if (output_float) return 0;
+    if (mode == 1) return 1;
+    return mode == 2 && output_valid < (input_float ? 24 : input_valid) && fade_ms == 0;
+}
+
+/* ---- candidates ----------------------------------------------------------- */
 
 typedef struct NexAudioPolicyInput {
     int source_rate;
@@ -36,7 +141,22 @@ typedef struct NexAudioPolicyDepth {
     int is_float;
 } NexAudioPolicyDepth;
 
-static int nex_audio_policy_push_rate(int *out, int count, int capacity, int rate) {
+typedef struct NexAudioPolicyCandidate {
+    int rate;
+    int container_bits;
+    int valid_bits;
+    int is_float;
+} NexAudioPolicyCandidate;
+
+/* Ordered search plan. The first primary_count entries are every depth at the
+   leading rate (the source rate, or the forced rate). */
+typedef struct NexAudioPolicyPlan {
+    NexAudioPolicyCandidate items[NEX_AUDIO_POLICY_MAX_CANDIDATES];
+    int count;
+    int primary_count;
+} NexAudioPolicyPlan;
+
+NEX_AUDIO_POLICY_FN int nex_audio_policy_push_rate(int *out, int count, int capacity, int rate) {
     int i;
     if (!out || rate <= 0 || count >= capacity) return count;
     for (i = 0; i < count; i++) if (out[i] == rate) return count;
@@ -44,19 +164,20 @@ static int nex_audio_policy_push_rate(int *out, int count, int capacity, int rat
     return count + 1;
 }
 
-static int nex_audio_policy_integer_ratio(int a, int b) {
+NEX_AUDIO_POLICY_FN int nex_audio_policy_integer_ratio(int a, int b) {
     if (a <= 0 || b <= 0) return 0;
     return (a % b == 0) || (b % a == 0);
 }
 
-static int nex_audio_policy_ratio_factor(int a, int b) {
+NEX_AUDIO_POLICY_FN int nex_audio_policy_ratio_factor(int a, int b) {
     if (a <= 0 || b <= 0) return 0;
     return a > b ? a / b : b / a;
 }
 
 /* Keep the source rate in slot zero. Among converted rates, integer ratios
    precede non-integer ratios and smaller integer factors precede larger ones. */
-static void nex_audio_policy_prefer_integer_ratios(int *rates, int count, int source_rate) {
+NEX_AUDIO_POLICY_FN void nex_audio_policy_prefer_integer_ratios(int *rates, int count,
+                                                                int source_rate) {
     int i;
     if (!rates || count < 2) return;
     for (i = 1; i < count; i++) {
@@ -80,17 +201,21 @@ static void nex_audio_policy_prefer_integer_ratios(int *rates, int count, int so
     }
 }
 
-/* Build the rate order used by endpoint negotiation. A forced rate and strict
-   native mode intentionally produce one candidate only. */
-static int nex_audio_policy_build_rates(const NexAudioPolicyInput *policy,
-                                        const int *pool, int pool_count,
-                                        int endpoint_mix_rate, int *out, int capacity) {
+/* Rate order. The source rate always leads. A forced rate and the strict
+   modes produce that one rate only. Otherwise: nearest higher pool rates, then
+   lower ones from high to low, then the endpoint's own mix rate, which is a
+   candidate like any other and never evidence of exclusive support. */
+NEX_AUDIO_POLICY_FN int nex_audio_policy_build_rates(const NexAudioPolicyInput *policy,
+                                                     int endpoint_mix_rate,
+                                                     int *out, int capacity) {
     int count = 0;
-    int source_rate;
+    int pool_count = 0;
+    const int *pool = nex_audio_policy_rate_pool(&pool_count);
     int i;
     if (!policy || !out || capacity <= 0) return 0;
-    source_rate = policy->forced_rate > 0 ? policy->forced_rate : policy->source_rate;
-    count = nex_audio_policy_push_rate(out, count, capacity, source_rate);
+    count = nex_audio_policy_push_rate(out, count, capacity,
+                                       policy->forced_rate > 0 ? policy->forced_rate
+                                                               : policy->source_rate);
     if (policy->forced_rate > 0 || policy->hifi || !policy->compatibility) return count;
     for (i = 0; i < pool_count; i++) {
         if (pool[i] > policy->source_rate)
@@ -100,15 +225,16 @@ static int nex_audio_policy_build_rates(const NexAudioPolicyInput *policy,
         if (pool[i] < policy->source_rate)
             count = nex_audio_policy_push_rate(out, count, capacity, pool[i]);
     }
-    count = nex_audio_policy_push_rate(out, count, capacity, endpoint_mix_rate);
+    if (nex_audio_policy_rate_valid(endpoint_mix_rate))
+        count = nex_audio_policy_push_rate(out, count, capacity, endpoint_mix_rate);
     if (policy->source_preference == 1)
         nex_audio_policy_prefer_integer_ratios(out, count, policy->source_rate);
     return count;
 }
 
-static int nex_audio_policy_push_depth(NexAudioPolicyDepth *out, int count,
-                                       int capacity, int container_bits,
-                                       int valid_bits, int is_float) {
+NEX_AUDIO_POLICY_FN int nex_audio_policy_push_depth(NexAudioPolicyDepth *out, int count,
+                                                    int capacity, int container_bits,
+                                                    int valid_bits, int is_float) {
     int i;
     if (!out || count >= capacity || container_bits <= 0 || valid_bits <= 0 ||
         valid_bits > container_bits) return count;
@@ -124,7 +250,7 @@ static int nex_audio_policy_push_depth(NexAudioPolicyDepth *out, int count,
     return count + 1;
 }
 
-static int nex_audio_policy_valid_source_depth(const NexAudioPolicyInput *policy) {
+NEX_AUDIO_POLICY_FN int nex_audio_policy_valid_source_depth(const NexAudioPolicyInput *policy) {
     if (!policy) return 0;
     if (policy->source_is_float)
         return policy->source_container_bits == 32 && policy->source_valid_bits == 32;
@@ -137,18 +263,41 @@ static int nex_audio_policy_valid_source_depth(const NexAudioPolicyInput *policy
            policy->source_valid_bits <= policy->source_container_bits;
 }
 
-/* Build depth candidates. The source representation is retained as a
-   separate candidate, including 16-valid samples in 16, 24 and 32-bit
-   containers. This keeps valid precision distinct from byte container width
-   when devices expose several spellings at the same sample rate. */
-static int nex_audio_policy_build_depths(const NexAudioPolicyInput *policy,
-                                         NexAudioPolicyDepth *out, int capacity) {
+NEX_AUDIO_POLICY_FN int nex_audio_policy_push_requested(NexAudioPolicyDepth *out, int count,
+                                                        int capacity, int requested) {
+    if (requested == 32) return nex_audio_policy_push_depth(out, count, capacity, 32, 32, 1);
+    if (requested == 16 || requested == 24)
+        return nex_audio_policy_push_depth(out, count, capacity, requested, requested, 0);
+    return count;
+}
+
+/* Depth order inside one rate.
+
+   Strict modes: the client representation and nothing else.
+
+   Otherwise:
+     1. the bits setting, only when it asks for less than the source carries;
+        that is an explicit request to reduce.
+     2. the source ladder, as in AppleMusic-OpenHome's AudioFormatPolicy:
+        source width first, then the same valid bits in wider containers, then
+        wider declarations. Every step is exact; the extra low bits are zero.
+          16 -> 16/16, 16-in-24, 16-in-32, 24/24, 24-in-32, 32/32
+          24 -> 24/24, 24-in-32, 32/32
+          32 -> 32/32          float -> float32
+     3. compatibility fallbacks: the bits setting, float32, 24/24, 24-in-32,
+        16/16. These may reduce depth and exist so playback continues on an
+        endpoint that refuses everything above. */
+NEX_AUDIO_POLICY_FN int nex_audio_policy_build_depths(const NexAudioPolicyInput *policy,
+                                                      NexAudioPolicyDepth *out, int capacity) {
     int count = 0;
     int requested;
+    int source_ok;
+    int source_precision;
     if (!policy || !out || capacity <= 0) return 0;
 
+    source_ok = nex_audio_policy_valid_source_depth(policy);
     if (policy->hifi || !policy->compatibility) {
-        if (nex_audio_policy_valid_source_depth(policy)) {
+        if (source_ok) {
             count = nex_audio_policy_push_depth(out, count, capacity,
                                                 policy->source_container_bits,
                                                 policy->source_valid_bits,
@@ -158,36 +307,160 @@ static int nex_audio_policy_build_depths(const NexAudioPolicyInput *policy,
     }
 
     requested = policy->requested_output_bits;
-    if (requested == 32)
-        count = nex_audio_policy_push_depth(out, count, capacity, 32, 32, 1);
-    else if (requested == 16 || requested == 24)
-        count = nex_audio_policy_push_depth(out, count, capacity, requested, requested, 0);
+    source_precision = policy->source_is_float ? 24 : policy->source_valid_bits;
+    if (source_ok && (requested == 16 || requested == 24) && requested < source_precision)
+        count = nex_audio_policy_push_requested(out, count, capacity, requested);
 
-    if (nex_audio_policy_valid_source_depth(policy)) {
-        if (!policy->source_is_float && policy->source_valid_bits == 16) {
-            /* Keep all three container spellings together. The valid precision
-               remains 16 bits even when an endpoint advertises 24/32 bytes. */
-            count = nex_audio_policy_push_depth(out, count, capacity, 16, 16, 0);
-            count = nex_audio_policy_push_depth(out, count, capacity, 24, 16, 0);
-            count = nex_audio_policy_push_depth(out, count, capacity, 32, 16, 0);
-        } else if (!policy->source_is_float && policy->source_valid_bits == 24) {
-            count = nex_audio_policy_push_depth(out, count, capacity, 24, 24, 0);
-            count = nex_audio_policy_push_depth(out, count, capacity, 32, 24, 0);
-        } else {
-            count = nex_audio_policy_push_depth(out, count, capacity,
-                                                policy->source_container_bits,
-                                                policy->source_valid_bits,
-                                                policy->source_is_float);
-        }
-        if (policy->source_is_float)
+    if (source_ok) {
+        if (policy->source_is_float) {
             count = nex_audio_policy_push_depth(out, count, capacity, 32, 32, 1);
+        } else {
+            if (policy->source_valid_bits == 16) {
+                count = nex_audio_policy_push_depth(out, count, capacity, 16, 16, 0);
+                count = nex_audio_policy_push_depth(out, count, capacity, 24, 16, 0);
+                count = nex_audio_policy_push_depth(out, count, capacity, 32, 16, 0);
+            }
+            if (policy->source_valid_bits <= 24) {
+                count = nex_audio_policy_push_depth(out, count, capacity, 24, 24, 0);
+                count = nex_audio_policy_push_depth(out, count, capacity, 32, 24, 0);
+            }
+            count = nex_audio_policy_push_depth(out, count, capacity, 32, 32, 0);
+        }
     }
 
+    count = nex_audio_policy_push_requested(out, count, capacity, requested);
     count = nex_audio_policy_push_depth(out, count, capacity, 32, 32, 1);
     count = nex_audio_policy_push_depth(out, count, capacity, 24, 24, 0);
     count = nex_audio_policy_push_depth(out, count, capacity, 32, 24, 0);
     count = nex_audio_policy_push_depth(out, count, capacity, 16, 16, 0);
     return count;
+}
+
+/* The single entry point for negotiation: every candidate in the order it
+   should be probed. Rate is the outer key, so every depth at the source rate
+   is tried before any conversion to another rate. */
+NEX_AUDIO_POLICY_FN int nex_audio_policy_build_plan(const NexAudioPolicyInput *policy,
+                                                    int endpoint_mix_rate,
+                                                    NexAudioPolicyPlan *plan) {
+    int rates[NEX_AUDIO_POLICY_MAX_RATES];
+    NexAudioPolicyDepth depths[NEX_AUDIO_POLICY_MAX_DEPTHS];
+    int nr, nd, ri, di;
+    if (!plan) return 0;
+    plan->count = 0;
+    plan->primary_count = 0;
+    if (!policy) return 0;
+    nr = nex_audio_policy_build_rates(policy, endpoint_mix_rate, rates,
+                                      NEX_AUDIO_POLICY_MAX_RATES);
+    nd = nex_audio_policy_build_depths(policy, depths, NEX_AUDIO_POLICY_MAX_DEPTHS);
+    for (ri = 0; ri < nr; ri++) {
+        for (di = 0; di < nd; di++) {
+            NexAudioPolicyCandidate *c = &plan->items[plan->count++];
+            c->rate = rates[ri];
+            c->container_bits = depths[di].container_bits;
+            c->valid_bits = depths[di].valid_bits;
+            c->is_float = depths[di].is_float;
+        }
+        if (ri == 0) plan->primary_count = plan->count;
+    }
+    return plan->count;
+}
+
+/* ---- search --------------------------------------------------------------- */
+
+enum {
+    NEX_AUDIO_PROBE_ACCEPTED = 0,
+    NEX_AUDIO_PROBE_REJECTED = 1,  /* the endpoint refuses this format          */
+    NEX_AUDIO_PROBE_BUSY     = 2,  /* the endpoint is held; says nothing about
+                                      the format                                */
+    NEX_AUDIO_PROBE_SKIPPED  = 3   /* not probeable here; costs no attempt      */
+};
+
+enum {
+    NEX_AUDIO_SEARCH_FOUND    = 0,
+    NEX_AUDIO_SEARCH_REJECTED = 1, /* every candidate was genuinely refused     */
+    NEX_AUDIO_SEARCH_BUSY     = 2, /* nothing worked and the endpoint was held  */
+    NEX_AUDIO_SEARCH_LIMIT    = 3  /* probe budget exhausted                    */
+};
+
+/* AUDCLNT_E_DEVICE_IN_USE is a statement about the endpoint, not the format:
+   the previous stream's teardown has not released it yet. */
+NEX_AUDIO_POLICY_FN int nex_audio_policy_classify_failure(unsigned long code) {
+    return code == 0x8889000Aul ? NEX_AUDIO_PROBE_BUSY : NEX_AUDIO_PROBE_REJECTED;
+}
+
+typedef int (*NexAudioPolicyProbe)(void *context, const NexAudioPolicyCandidate *candidate);
+
+typedef struct NexAudioPolicySearch {
+    int index;      /* winning candidate in the plan, or -1                    */
+    int tried;      /* probes spent                                            */
+    int busy_seen;  /* some probe (or the remembered format) answered busy     */
+    int cacheable;  /* the winner is the first candidate the endpoint accepts,
+                       so it may be remembered for this input and endpoint     */
+} NexAudioPolicySearch;
+
+NEX_AUDIO_POLICY_FN int nex_audio_policy_search_win(NexAudioPolicySearch *out,
+                                                    const unsigned char *busy,
+                                                    int index, int cached_busy) {
+    int k;
+    out->index = index;
+    out->cacheable = !cached_busy;
+    for (k = 0; k < index; k++) if (busy[k]) out->cacheable = 0;
+    return NEX_AUDIO_SEARCH_FOUND;
+}
+
+/* Walk the plan.
+
+   A busy answer does not move a candidate out of the way: before any rate other
+   than the leading one is considered, the leading-rate candidates that answered
+   busy are probed once more. If a conversion is still chosen while an earlier
+   candidate is unresolved, the result is usable for this stream but must not be
+   remembered, so the next stream starts from the source format again.
+
+   cached_busy tells the search that the remembered format for this input was
+   just found busy; whatever is chosen now must not replace it. */
+NEX_AUDIO_POLICY_FN int nex_audio_policy_search(const NexAudioPolicyPlan *plan,
+                                                NexAudioPolicyProbe probe, void *context,
+                                                int max_tries, int cached_busy,
+                                                NexAudioPolicySearch *out) {
+    unsigned char busy[NEX_AUDIO_POLICY_MAX_CANDIDATES];
+    NexAudioPolicySearch local;
+    int i, j, unresolved = 0;
+    if (!out) out = &local;
+    out->index = -1;
+    out->tried = 0;
+    out->busy_seen = cached_busy ? 1 : 0;
+    out->cacheable = 0;
+    if (!plan || !probe || plan->count <= 0) return NEX_AUDIO_SEARCH_REJECTED;
+    for (i = 0; i < plan->count; i++) busy[i] = 0;
+
+    for (i = 0; i <= plan->count; i++) {
+        if (i == plan->primary_count) {
+            for (j = 0; j < plan->primary_count; j++) {
+                int r;
+                if (!busy[j]) continue;
+                if (out->tried >= max_tries) return NEX_AUDIO_SEARCH_LIMIT;
+                r = probe(context, &plan->items[j]);
+                if (r == NEX_AUDIO_PROBE_SKIPPED) { busy[j] = 0; continue; }
+                out->tried++;
+                if (r == NEX_AUDIO_PROBE_ACCEPTED)
+                    return nex_audio_policy_search_win(out, busy, j, cached_busy);
+                if (r != NEX_AUDIO_PROBE_BUSY) busy[j] = 0;
+            }
+        }
+        if (i == plan->count) break;
+        {
+            int r;
+            if (out->tried >= max_tries) return NEX_AUDIO_SEARCH_LIMIT;
+            r = probe(context, &plan->items[i]);
+            if (r == NEX_AUDIO_PROBE_SKIPPED) continue;
+            out->tried++;
+            if (r == NEX_AUDIO_PROBE_ACCEPTED)
+                return nex_audio_policy_search_win(out, busy, i, cached_busy);
+            if (r == NEX_AUDIO_PROBE_BUSY) { busy[i] = 1; out->busy_seen = 1; }
+        }
+    }
+    for (i = 0; i < plan->count; i++) if (busy[i]) unresolved = 1;
+    return (unresolved || cached_busy) ? NEX_AUDIO_SEARCH_BUSY : NEX_AUDIO_SEARCH_REJECTED;
 }
 
 #ifdef __cplusplus
