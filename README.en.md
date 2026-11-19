@@ -83,7 +83,7 @@ The Settings page gets a separate "NexExclusive" entry with the exclusive status
 | Output policy | `Source-rate first (recommended)` tries the source format first, then exclusive conversion; `Strict native` accepts only the source format | Use source-rate first for normal listening and strict native when verifying a compatible endpoint |
 | Compatibility conversion | Exclusive rate or depth conversion after the source format is rejected | On in source-rate-first mode; strict native disables it |
 | Dither | Off / on / auto | Auto by default; it applies when bit depth is reduced or audio was resampled, and rarely needs a change |
-| Fade-in | 0–20 ms | Raise it if playback starts with a pop |
+| Fade-in | Off by default, 3–20 ms optional | Turn it on if playback starts with a pop; the first milliseconds of each start are then no longer bit-perfect, and the panel says so |
 | Shared fallback | Opens a shared stream after exclusive output fails | Always off in the product path |
 
 The same settings live in `hook.cfg` as plain `key=value`; restart the client to apply. The panel is a front-end for that file. Strict native verification targets client PCM to exclusive endpoint PCM; when the endpoint accepts the source format, this can produce bit-perfect output. If it rejects the source format, the UI asks you to switch to source-rate first instead of opening shared output.

@@ -207,6 +207,18 @@ static void test_cdp_unavailable_hint_for_timeout(void) {
     printf("PASS CDP-unavailable hint does not send the user away while nexui may still load\n");
 }
 
+/* A remote LoadLibrary that has not returned may still read the path buffer;
+   a module whose base has zero low 32 bits returns exit code 0. */
+static void test_inject_outcome(void) {
+    int may_free = -1;
+    CHECK(inject_outcome(WAIT_OBJECT_0, 0x5E000000, 0, &may_free) == 1 && may_free == 1);
+    CHECK(inject_outcome(WAIT_OBJECT_0, 0, 0, &may_free) == 0 && may_free == 1);
+    CHECK(inject_outcome(WAIT_OBJECT_0, 0, 1, &may_free) == 1 && may_free == 1);
+    CHECK(inject_outcome(WAIT_TIMEOUT, STILL_ACTIVE, 0, &may_free) == 0 && may_free == 0);
+    CHECK(inject_outcome(WAIT_TIMEOUT, STILL_ACTIVE, 1, &may_free) == 1 && may_free == 0);
+    printf("PASS inject outcome: a timeout is not success and keeps the path buffer\n");
+}
+
 int main(void) {
     test_find_child_pids();
     test_ui_event_exists();
@@ -219,6 +231,7 @@ int main(void) {
     test_crash_guard_trips_after_two_quick_exits();
     test_route_reason_codes();
     test_cdp_unavailable_hint_for_timeout();
+    test_inject_outcome();
     printf("%s: %d failure(s)\n", g_fail ? "FAILED" : "ALL TESTS PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

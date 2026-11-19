@@ -242,3 +242,11 @@ check(source.includes('function sourceAppRequire') && source.includes('req.c'), 
 check(!source.includes('registry[id](module, module.exports, req)'), 'source bridge must never instantiate a second AudioPlayer (it freezes the native progress bar)');
 
 console.log('PASS panel contract: grouped native-style rows and Hi-Fi state semantics');
+
+/* The sink tags a value-exact container change as [repacked] and any opening
+   fade as +fade; the panel must neither hide the fade nor call a repack a
+   conversion. bits=0 and fade_ms=0 are the defaults. */
+check(source.includes('repacked'), 'panel must recognise the [repacked] path tag');
+check(source.includes('+fade'), 'panel must recognise a +fade path tag');
+check(source.includes('开头淡入会改动'), 'panel must say that the opening fade changes samples');
+check(/bits:\s*0,/.test(source) && /fade_ms:\s*0,/.test(source), 'panel defaults must be bits=0 and fade_ms=0');

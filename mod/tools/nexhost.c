@@ -1686,6 +1686,21 @@ static int process_bitness_compatible(HANDLE target) {
     return 1;
 }
 
+/* What a remote LoadLibrary told us. A thread that has not returned may still
+   be reading the path buffer, so that buffer must not be freed, and STILL_ACTIVE
+   is not a module handle. A module whose base has zero low 32 bits returns 0
+   from the 32-bit exit code, so the module list has the last word. */
+static int inject_outcome(DWORD wait, DWORD exit_code, int module_present, int *may_free) {
+    if (wait != WAIT_OBJECT_0) {
+        if (may_free) *may_free = 0;
+        return module_present;
+    }
+    if (may_free) *may_free = 1;
+    return exit_code != 0 || module_present;
+}
+
+static int module_loaded(DWORD pid, const wchar_t *name);
+
 static int inject_dll(DWORD pid, const char *dll) {
     size_t len = strlen(dll) + 1;
     HANDLE h = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
@@ -1721,14 +1736,23 @@ static int inject_dll(DWORD pid, const char *dll) {
         CloseHandle(h);
         return 0;
     }
-    WaitForSingleObject(th, 8000);
+    DWORD wait = WaitForSingleObject(th, 8000);
     DWORD code = 0;
     GetExitCodeThread(th, &code);
     CloseHandle(th);
-    VirtualFreeEx(h, remote, 0, MEM_RELEASE);
+    wchar_t base[MAX_PATH];
+    const char *slash = strrchr(dll, '\\');
+    MultiByteToWideChar(CP_ACP, 0, slash ? slash + 1 : dll, -1, base, MAX_PATH);
+    int may_free = 0;
+    int ok = inject_outcome(wait, code, module_loaded(pid, base), &may_free);
+    if (may_free) VirtualFreeEx(h, remote, 0, MEM_RELEASE);
     CloseHandle(h);
-    host_log("注入 pid=%lu -> LoadLibraryA=0x%lX", (unsigned long)pid, (unsigned long)code);
-    return code != 0;
+    if (wait != WAIT_OBJECT_0)
+        host_log("注入 pid=%lu：LoadLibraryA 8 秒内未返回，%s", (unsigned long)pid,
+                 ok ? "模块已在进程中" : "按失败处理，路径缓冲保留给仍在运行的线程");
+    else
+        host_log("注入 pid=%lu -> LoadLibraryA=0x%lX", (unsigned long)pid, (unsigned long)code);
+    return ok;
 }
 
 /* 客户端是否已经加载过我们的模块：同名 DLL 再注入不会重新执行 DllMain，
@@ -2504,9 +2528,9 @@ static DWORD WINAPI http_thread(LPVOID unused) {
             int v[CFG_N];
             cfg_read(v);
             for (int i = 0; i < CFG_N; i++) json_get_int(body_buf, kCfgKeys[i], &v[i]);
-            if (v[1] != 16 && v[1] != 24 && v[1] != 32) v[1] = 24;
+            if (v[1] != 0 && v[1] != 16 && v[1] != 24 && v[1] != 32) v[1] = 0;
             if (v[5] < 0 || v[5] > 2) v[5] = 2;
-            if (v[6] < 0 || v[6] > 100) v[6] = 5;
+            if (v[6] < 0 || v[6] > 100) v[6] = 0;
             if (v[8] != 0 && v[8] != 1) v[8] = 0;
             if (v[9] != 0 && v[9] != 1) v[9] = 0;
             if (v[10] != 0 && v[10] != 1) v[10] = 0;

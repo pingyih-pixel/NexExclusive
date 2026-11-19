@@ -1100,11 +1100,11 @@ static void test_remote_resample_respects_device_period(void) {
     free(g_fin);
     free(g_fout);
     g_inb = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_block);
-    g_fin = (float *)malloc((size_t)SCRATCH_FRAMES * 2 * sizeof(float));
-    g_fout = (float *)malloc(64 * 2 * sizeof(float));
+    g_fin = (double *)malloc((size_t)SCRATCH_FRAMES * 2 * sizeof(double));
+    g_fout = (double *)malloc(64 * 2 * sizeof(double));
     g_remote_out = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.out_block);
     CHECK(g_inb && g_fin && g_fout && g_remote_out);
-    memset(g_fout, 0xA5, 64 * 2 * sizeof(float));
+    memset(g_fout, 0xA5, 64 * 2 * sizeof(double));
     for (UINT32 f = 0; f < 16; f++)
         for (UINT32 b = 0; b < g_sink.in_block; b++)
             g_sink.ring[f * g_sink.in_block + b] = (BYTE)(f * 13 + b + 1);
@@ -1122,7 +1122,7 @@ static void test_remote_resample_respects_device_period(void) {
 
     const BYTE *fout_bytes = (const BYTE *)g_fout;
     int canary_intact = 1;
-    for (size_t i = 8 * 2 * sizeof(float); i < 64 * 2 * sizeof(float); i++)
+    for (size_t i = 8 * 2 * sizeof(double); i < 64 * 2 * sizeof(double); i++)
         if (fout_bytes[i] != 0xA5) { canary_intact = 0; break; }
     CHECK(canary_intact);
     CHECK(control.converted_frames == 8);
@@ -1411,7 +1411,7 @@ static void test_reset(void) {
     CHECK(g_sink.w == 0 && g_sink.r == 0);
     for (int i = 0; i < SRC_CAP * 2; i++) CHECK(g_src.buf[i] == 0.0f);
     for (int i = 0; i < 32 * 8; i++) CHECK(g_sink.ring[i] == 0);
-    float zero[2048] = {0}, output[2048];
+    double zero[2048] = {0}, output[2048];
     CHECK(src_push(zero, 1024, 2) == 1024);
     int ready = src_ready(2);
     CHECK(ready > 0 && ready <= 1024);
@@ -1941,13 +1941,13 @@ static int src_tone(int in_rate, int out_rate, double r, double *gain_db, int *f
     const int ch = 2;
     const int in_frames = in_rate / 2;                     /* 0.5 s */
     const int out_cap   = out_rate / 2 + 8192;
-    float *in  = (float *)malloc((size_t)in_frames * ch * sizeof(float));
-    float *out = (float *)malloc((size_t)out_cap * ch * sizeof(float));
+    double *in  = (double *)malloc((size_t)in_frames * ch * sizeof(double));
+    double *out = (double *)malloc((size_t)out_cap * ch * sizeof(double));
     if (!in || !out) { free(in); free(out); return 0; }
     if (!src_init(in_rate, out_rate, ch)) { free(in); free(out); return 0; }
 
     for (int n = 0; n < in_frames; n++) {
-        float v = (float)sin(M_PI * r * (double)n);
+        double v = sin(M_PI * r * (double)n);
         in[n * 2] = v; in[n * 2 + 1] = v;
     }
 
@@ -2003,8 +2003,8 @@ static int src_tone(int in_rate, int out_rate, double r, double *gain_db, int *f
 static int src_dc(int in_rate, int out_rate, double *settled) {
     const int ch = 2;
     const int in_frames = in_rate / 4;
-    float *in  = (float *)malloc((size_t)in_frames * ch * sizeof(float));
-    float *out = (float *)malloc((size_t)(out_rate / 4 + 8192) * ch * sizeof(float));
+    double *in  = (double *)malloc((size_t)in_frames * ch * sizeof(double));
+    double *out = (double *)malloc((size_t)(out_rate / 4 + 8192) * ch * sizeof(double));
     if (!in || !out) { free(in); free(out); return 0; }
     if (!src_init(in_rate, out_rate, ch)) { free(in); free(out); return 0; }
     for (int n = 0; n < in_frames; n++) { in[n * 2] = 0.5f; in[n * 2 + 1] = 0.5f; }
@@ -2086,8 +2086,8 @@ static int src_impulse(int in_rate, int out_rate, double *peak, int *peak_at,
                        double *center) {
     const int ch = 2, in_frames = 4096;
     const int out_cap = in_frames + 4096;
-    float *in  = (float *)calloc((size_t)in_frames * ch, sizeof(float));
-    float *out = (float *)calloc((size_t)out_cap * ch, sizeof(float));
+    double *in  = (double *)calloc((size_t)in_frames * ch, sizeof(double));
+    double *out = (double *)calloc((size_t)out_cap * ch, sizeof(double));
     if (!in || !out) { free(in); free(out); return 0; }
     if (!src_init(in_rate, out_rate, ch)) { free(in); free(out); return 0; }
     in[0] = 1.0f; in[1] = 1.0f;                 /* 第 0 帧的左右声道各一个冲激 */
@@ -2116,6 +2116,35 @@ static int src_impulse(int in_rate, int out_rate, double *peak, int *peak_at,
     }
     free(in); free(out);
     return 1;
+}
+
+/* ---- item 5: the conversion pipeline keeps 32-bit integer precision -------- */
+static void test_float_pipeline_keeps_32_bit_precision(void) {
+    int src[4] = {0x12345679, -0x7654321F, 1, -2};
+    int dst[4] = {0};
+    double mid[4];
+    memset(&g_sink, 0, sizeof(g_sink));
+    g_sink.in_channels = 2;
+    g_sink.in_container_bits = 32;
+    g_sink.in_valid_bits = 32;
+    g_sink.out_container_bits = 32;
+    g_sink.out_valid_bits = 32;
+    g_sink.out_bits = 32;
+    to_double((const BYTE *)src, mid, 2);
+    quantize(mid, 2, (BYTE *)dst);
+    for (int i = 0; i < 4; i++) CHECK(dst[i] == src[i]);
+    memset(&g_sink, 0, sizeof(g_sink));
+    printf("PASS conversion pipeline: 32-bit integer samples survive unchanged\n");
+}
+
+/* ---- item 3: the in-process drain thread joins MMCSS like NexAudioHost ----- */
+static void test_drain_thread_registers_mmcss(void) {
+    const char *task = NULL;
+    HANDLE h = drain_mmcss_enter(&task);
+    CHECK(h != NULL);
+    CHECK(task && (!strcmp(task, "Pro Audio") || !strcmp(task, "Audio")));
+    drain_mmcss_leave(h);
+    printf("PASS drain thread: MMCSS %s task\n", task ? task : "(none)");
 }
 
 static void test_src_response(void) {
@@ -2147,6 +2176,12 @@ static void test_src_response(void) {
         printf("  %-11s passband worst %+.2f dB @ r=%.3f   at 0.95*cut: %+.2f dB\n",
                ratios[i].name, worst, worst_at, db95);
         CHECK(fabs(worst) < 0.5);
+        /* Flat right up to the band edge: 0.90 x cutoff is audible content. */
+        {
+            double db90 = 0.0; int n90 = 0;
+            CHECK(src_tone(in, out, 0.90 * cut, &db90, &n90));
+            CHECK(fabs(db90) < 0.1);
+        }
 
         /* 阻带：只对降采样有意义——高于抽取后奈奎斯特的内容必须在下采样前被
            压掉，否则会折回通带。两个探针：输入奈奎斯特边上（0.98），以及截止
@@ -2162,7 +2197,16 @@ static void test_src_response(void) {
             printf("  %-11s stopband  r=%.3f: %+.1f dB   r=%.3f: %+.1f dB\n",
                    ratios[i].name, r1, a, r2, b);
             CHECK(a < -50.0);
-            CHECK(b < -50.0);
+            CHECK(b < -100.0);
+            /* Just above the output Nyquist frequency nothing may fold back
+               into the audible band: below the 16-bit floor. */
+            {
+                double edge = 0.0; int ne = 0;
+                CHECK(src_tone(in, out, 1.01 * cut, &edge, &ne));
+                printf("  %-11s stopband  r=%.3f (1.01 x output Nyquist): %+.1f dB\n",
+                       ratios[i].name, 1.01 * cut, edge);
+                CHECK(edge < -96.0);
+            }
         }
     }
 
@@ -2312,6 +2356,8 @@ int main(void) {
     test_valid_format();
     test_src_prefer_order();
     test_dither_policy();
+    test_float_pipeline_keeps_32_bit_precision();
+    test_drain_thread_registers_mmcss();
     test_negotiate_busy_is_not_remembered();
     test_config_values_are_normalized_by_policy();
     test_policy_range_matches_wire_range();

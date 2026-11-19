@@ -125,8 +125,8 @@ static void convert(const BYTE *src, BYTE *dst, UINT32 frames) {
 
 /* ---- float pipeline: rate conversion + dithered quantisation ------------ */
 //
-// Used only when the device refuses the client's own rate or depth. The path is
-// integer/float -> float32 -> polyphase windowed-sinc resample -> quantise, so
+// Used only when the device refuses the client's own rate. The path is
+// integer/float -> double -> polyphase windowed-sinc resample -> quantise, so
 // the same code covers 192->96, 44.1->48 and 96->44.1 alike.
 //
 // Both rates are integers, so the fractional read position is not an arbitrary
@@ -140,10 +140,19 @@ static void convert(const BYTE *src, BYTE *dst, UINT32 frames) {
 // Window: Kaiser, beta = 12, which puts the stopband floor near -120 dB. The
 // earlier 32-tap Blackman version bottomed out at -74 dB - that is the Blackman
 // sidelobe floor, not a tap-count problem - so aliasing images from 192->96 sat
-// only ~20 dB under the 16-bit noise floor. 128 taps at 2:1 gives a transition
-// band of about +/-3 kHz around 48 kHz: flat to 45 kHz, -120 dB above 51 kHz.
-#define SRC_TAPS        128          /* filter length, in output samples */
-#define SRC_MAX_HALF    256          /* bound on the kernel half width */
+// only ~20 dB under the 16-bit noise floor.
+//
+// The cutoff sits SRC_EDGE below the lower Nyquist frequency, so the whole
+// transition band ends at that Nyquist instead of straddling it: nothing folds
+// back into the audible band (it used to leave ~-51 dB just under the edge for
+// 48k->44.1k). 256 taps keep the transition narrow enough that the passband is
+// flat to ~0.94 of Nyquist (20.7 kHz at 44.1k).
+//
+// Samples travel as double: a 32-bit integer source keeps every bit through
+// the filter (float32 would cut it to 24).
+#define SRC_TAPS        256          /* filter length, in output samples */
+#define SRC_EDGE        0.97         /* cutoff as a fraction of the lower Nyquist */
+#define SRC_MAX_HALF    544          /* bound on the kernel half width (4:1 fits) */
 #define SRC_MAX_PHASES  512
 #define SRC_CAP         32768
 #define SRC_BETA        12.0
@@ -156,14 +165,14 @@ typedef struct {
 } Phase;
 
 typedef struct {
-    float    *buf;   /* interleaved input history, SRC_CAP frames */
+    double   *buf;   /* interleaved input history, SRC_CAP frames */
     int       count; /* valid frames */
     long long pos;   /* read position, in units of 1/den input frames */
     long long num;   /* step numerator   = in_rate / gcd */
     long long den;   /* step denominator = out_rate / gcd */
     int       phases;
     double    step;  /* num / den */
-    double    cutoff;/* min(1, 1/step) */
+    double    cutoff;/* min(1, 1/step) * SRC_EDGE */
     double    half;  /* kernel half width, in input frames */
     Phase     ph[SRC_MAX_PHASES];
     double   *pool;
@@ -177,8 +186,8 @@ static double g_i0_beta = 1.0;
    force short submissions during the initial prefill. */
 #define SCRATCH_FRAMES 65536
 static BYTE  *g_inb;    /* client-format scratch */
-static float *g_fin;    /* the same frames as float */
-static float *g_fout;   /* resampled output, up to one device buffer */
+static double *g_fin;   /* the same frames as double */
+static double *g_fout;  /* resampled output, up to one device buffer */
 
 static void scratch_free(void) {
     if (g_inb)  { free(g_inb);  g_inb  = NULL; }
@@ -190,7 +199,7 @@ static void scratch_free(void) {
    coefficients remain valid because the rate pair has not changed. */
 static void src_reset(int ch) {
     if (!g_src.buf) return;
-    memset(g_src.buf, 0, (size_t)SRC_CAP * (size_t)ch * sizeof(float));
+    memset(g_src.buf, 0, (size_t)SRC_CAP * (size_t)ch * sizeof(double));
     int K = (int)ceil(g_src.half);
     g_src.pos = (long long)K * g_src.den;
     g_src.count = 2 * K + 1;
@@ -241,7 +250,7 @@ static int src_init(int in_rate, int out_rate, int ch) {
     g_src.num  = (long long)in_rate / g;
     g_src.den  = (long long)out_rate / g;
     g_src.step = (double)g_src.num / (double)g_src.den;
-    g_src.cutoff = g_src.step > 1.0 ? 1.0 / g_src.step : 1.0;
+    g_src.cutoff = (g_src.step > 1.0 ? 1.0 / g_src.step : 1.0) * SRC_EDGE;
 
     double half = (double)SRC_TAPS / 2.0 / g_src.cutoff;
     if (half > SRC_MAX_HALF) return 0; /* quality bound: reject rather than shorten */
@@ -257,7 +266,7 @@ static int src_init(int in_rate, int out_rate, int ch) {
     int    K      = (int)ceil(half);
     size_t stride = (size_t)(2 * K + 1);
 
-    g_src.buf  = (float *)calloc((size_t)SRC_CAP * (size_t)ch, sizeof(float));
+    g_src.buf  = (double *)calloc((size_t)SRC_CAP * (size_t)ch, sizeof(double));
     g_src.pool = (double *)calloc((size_t)phases * stride, sizeof(double));
     if (!g_src.buf || !g_src.pool) { src_free(); return 0; }
 
@@ -312,20 +321,20 @@ static void src_compact(int ch) {
     if (drop <= 0) return;
     if (drop > g_src.count) drop = g_src.count;
     memmove(g_src.buf, g_src.buf + (size_t)drop * ch,
-            (size_t)(g_src.count - drop) * ch * sizeof(float));
+            (size_t)(g_src.count - drop) * ch * sizeof(double));
     g_src.count -= drop;
     g_src.pos   -= (long long)drop * g_src.den;
 }
 
-/* append converted float frames; caller passes interleaved float */
-static int src_push(const float *in, int frames, int ch) {
+/* append converted frames; caller passes interleaved double */
+static int src_push(const double *in, int frames, int ch) {
     if (!g_src.buf) return 0;
     if (g_src.count + frames > SRC_CAP) {
         src_compact(ch);
         if (g_src.count + frames > SRC_CAP) return 0;
     }
     memcpy(g_src.buf + (size_t)g_src.count * ch, in,
-           (size_t)frames * ch * sizeof(float));
+           (size_t)frames * ch * sizeof(double));
     g_src.count += frames;
     return frames;
 }
@@ -341,7 +350,7 @@ static int src_ready(int ch) {
     return n > 0 ? (int)n : 0;
 }
 
-static void src_pull(float *out, int frames, int ch) {
+static void src_pull(double *out, int frames, int ch) {
     const long long den = g_src.den;
     const int       np  = g_src.phases;
     const int       ex  = (np == (int)den);
@@ -355,25 +364,26 @@ static void src_pull(float *out, int frames, int ch) {
         Phase *p = &g_src.ph[idx];
         if (!p->built) src_phase_build(idx);
 
-        const float  *base = g_src.buf + (size_t)(i0 + p->kmin) * ch;
+        const double *base = g_src.buf + (size_t)(i0 + p->kmin) * ch;
         const double *hh   = p->h;
         for (int c = 0; c < ch; c++) {
-            const float *x = base + c;
+            const double *x = base + c;
             double acc = 0.0;
             for (int i = 0; i < p->n; i++)
-                acc += (double)x[(size_t)i * ch] * hh[i];
-            out[(size_t)f * ch + c] = (float)acc;
+                acc += x[(size_t)i * ch] * hh[i];
+            out[(size_t)f * ch + c] = acc;
         }
         g_src.pos += g_src.num;
     }
 }
 
-/* client format -> float32, interleaved */
-static void to_float(const BYTE *src, float *dst, UINT32 frames) {
+/* client format -> double, interleaved. Exact for every integer layout. */
+static void to_double(const BYTE *src, double *dst, UINT32 frames) {
     const int ch = g_sink.in_channels;
     const UINT32 n = frames * (UINT32)ch;
     if (g_sink.in_is_float) {
-        memcpy(dst, src, (size_t)n * sizeof(float));
+        const float *f = (const float *)src;
+        for (UINT32 i = 0; i < n; i++) dst[i] = isfinite(f[i]) ? (double)f[i] : 0.0;
         return;
     }
     int ib = g_sink.in_container_bits;
@@ -382,19 +392,19 @@ static void to_float(const BYTE *src, float *dst, UINT32 frames) {
         if (g_sink.in_valid_bits == 24) {
             /* 24-in-32 from the client: same left-justified layout the device
                side may hand back. */
-            for (UINT32 i = 0; i < n; i++) dst[i] = (float)((double)(s[i] >> 8) / 8388608.0);
+            for (UINT32 i = 0; i < n; i++) dst[i] = (double)(s[i] >> 8) / 8388608.0;
         } else {
-            for (UINT32 i = 0; i < n; i++) dst[i] = (float)((double)s[i] / 2147483648.0);
+            for (UINT32 i = 0; i < n; i++) dst[i] = (double)s[i] / 2147483648.0;
         }
     } else if (ib == 24) {
         for (UINT32 i = 0; i < n; i++) {
             int v = src[i * 3] | (src[i * 3 + 1] << 8) | (src[i * 3 + 2] << 16);
             if (v & 0x800000) v |= ~0xFFFFFF;
-            dst[i] = (float)((double)v / 8388608.0);
+            dst[i] = (double)v / 8388608.0;
         }
     } else {
         const short *s = (const short *)src;
-        for (UINT32 i = 0; i < n; i++) dst[i] = (float)((double)s[i] / 32768.0);
+        for (UINT32 i = 0; i < n; i++) dst[i] = (double)s[i] / 32768.0;
     }
 }
 
@@ -405,13 +415,16 @@ static double rnd01(void) {
     return (double)((g_rng >> 8) & 0xFFFFFFul) / 16777216.0;
 }
 
-static void quantize(const float *in, UINT32 frames, BYTE *dst) {
+static void quantize(const double *in, UINT32 frames, BYTE *dst) {
     const int ch = g_sink.in_channels;
     const UINT32 n = frames * (UINT32)ch;
     const int cont = out_container(), valid = out_valid();
 
     if (g_sink.out_is_float) {
-        memcpy(dst, in, (size_t)n * sizeof(float));
+        for (UINT32 i = 0; i < n; i++) {
+            float f = (float)in[i];
+            memcpy(dst + (size_t)i * 4, &f, 4);
+        }
         return;
     }
     for (UINT32 i = 0; i < n; i++)

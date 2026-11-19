@@ -155,7 +155,7 @@ static HRESULT drain_once(SinkGen *g) {
             UINT32 got=ring_take(g_inb,want);
             if (got) {
                 if (g->remote) remote_note_client(g_inb, got);
-                to_float(g_inb,g_fin,got);
+                to_double(g_inb,g_fin,got);
                 if (src_push(g_fin,(int)got,g_sink.in_channels)!=(int)got) return E_UNEXPECTED;
                 if (g_sink.h_space) SetEvent(g_sink.h_space);
             }
@@ -300,12 +300,35 @@ static HRESULT drain_once(SinkGen *g) {
     g->stage=STAGE_IDLE;
     return S_OK;
 }
+/* The audio engine schedules its own render threads through MMCSS; a thread
+   that only raises its priority can still be preempted by DPC-heavy drivers and
+   other "Pro Audio" work, which is heard as a dropout. NexAudioHost already
+   registers; the in-process drain thread does the same. */
+static HANDLE drain_mmcss_enter(const char **task) {
+    DWORD index = 0;
+    HANDLE h = AvSetMmThreadCharacteristicsW(L"Pro Audio", &index);
+    if (task) *task = h ? "Pro Audio" : NULL;
+    if (!h) {
+        index = 0;
+        h = AvSetMmThreadCharacteristicsW(L"Audio", &index);
+        if (task) *task = h ? "Audio" : NULL;
+    }
+    if (h) AvSetMmThreadPriority(h, AVRT_PRIORITY_CRITICAL);
+    return h;
+}
+static void drain_mmcss_leave(HANDLE h) {
+    if (h) AvRevertMmThreadCharacteristics(h);
+}
+
 static DWORD WINAPI drain_thread(LPVOID param) {
     SinkGen *g=(SinkGen *)param;
     HRESULT co=CoInitializeEx(NULL,COINIT_MULTITHREADED);
+    const char *mm_task = NULL;
+    HANDLE mmcss = drain_mmcss_enter(&mm_task);
     g->stage=STAGE_IDLE;
-    log_line("drain: thread up (gen %llu), out=%d Hz/%d.%d bit",
-             (unsigned long long)g->id,g_sink.out_rate,out_container(),out_valid());
+    log_line("drain: thread up (gen %llu), out=%d Hz/%d.%d bit, mmcss=%s",
+             (unsigned long long)g->id,g_sink.out_rate,out_container(),out_valid(),
+             mm_task ? mm_task : "unavailable");
     g_last_write = 0;
     g_last_report = GetTickCount();
     g_max_gap = 0;
@@ -356,6 +379,7 @@ static DWORD WINAPI drain_thread(LPVOID param) {
         if(h)CloseHandle(h);
     }
     gen_release(g);            /* the thread's own reference */
+    drain_mmcss_leave(mmcss);
     if(SUCCEEDED(co))CoUninitialize();
     return 0;
 }

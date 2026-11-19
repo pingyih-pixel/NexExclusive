@@ -1,11 +1,11 @@
 /* ---- config ------------------------------------------------------------- */
 static int g_enable      = 1;
-static int g_out_bits    = 24;
+static int g_out_bits    = 0;   /* 0 = follow the source */
 static int g_force_rate  = 0;
 static int g_out_frames  = 0;   /* 0 = derive from client's requested duration */
 static int g_compat      = 1;   /* allow rate/depth conversion when the device refuses the source format */
 static int g_dither      = 2;   /* 0 off, 1 on, 2 auto */
-static int g_fade_ms     = 5;   /* explicit processing; 0 disables sample changes */
+static int g_fade_ms     = 0;   /* explicit processing; 0 (default) leaves samples untouched */
 static int g_shared_fallback = 0; /* strict exclusive by default */
 static int g_hifi        = 0;   /* strict native client-format exclusive path */
 static int g_audiohost   = 0;   /* optional out-of-process exclusive renderer */

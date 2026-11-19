@@ -15,8 +15,8 @@
   var SETTINGS_PANEL_ID = 'nex-settings-panel';
   var SETTINGS_LAUNCHER_ID = 'nex-settings-launcher';
   var DEFAULTS = {
-    enable: 1, bits: 24, rate: 0, buffer: 0,
-    compat: 1, dither: 2, fade_ms: 5, shared_fallback: 0,
+    enable: 1, bits: 0, rate: 0, buffer: 0,
+    compat: 1, dither: 2, fade_ms: 0, shared_fallback: 0,
     src_prefer: 0, hifi: 0, audiohost: 0
   };
 
@@ -927,7 +927,9 @@
     var valid = Number(match[3]);
     var mode = /\[converted\]/.test(text) ? '独占转换'
       : /\[depth only\]/.test(text) ? '仅位深转换'
-        : /\[native\]/.test(text) ? '原样输出' : '';
+        : /\[repacked/.test(text) ? '原样数值（容器改变）' + (/\+fade\]/.test(text) ? '，开头淡入' : '')
+          : /\[native\+fade\]/.test(text) ? '原样输出，开头淡入'
+            : /\[native\]/.test(text) ? '原样输出' : '';
     return formatRate(Number(match[1])) + ' / ' + valid + ' bit'
       + (container !== valid ? '（' + container + ' bit 容器）' : '')
       + (mode ? ' · ' + mode : '');
@@ -956,6 +958,9 @@
     if (output) lines.push('独占端点　' + formatRate(Number(output[1])) + ' / ' + output[3] + ' bit（' + output[2] + ' bit 容器）');
     if (/\[converted\]/.test(text)) lines.push('状态　独占转换');
     else if (/\[depth only\]/.test(text)) lines.push('状态　仅位深转换，未标记原样');
+    else if (/\[repacked/.test(text)) lines.push('状态　原样数值，仅容器宽度改变'
+      + (/\+fade\]/.test(text) ? '；开头淡入会改动前几毫秒' : ''));
+    else if (/\[native\+fade\]/.test(text)) lines.push('状态　原样输出；开头淡入会改动前几毫秒');
     else if (/\[native\]/.test(text)) lines.push('状态　原样输出');
     else if (!input && !output) lines.push('等待新的音频协商');
     if (snapshot && snapshot.verification && snapshot.verification.line) {
@@ -979,7 +984,9 @@
     var output = /out=rate:(\d+)\/cont:(\d+)\.(\d+)/.exec(text);
     if (!input || !output) return '等待音频协商';
     var converted = /\[converted\]|\[depth only\]/.test(text);
-    var mode = converted ? '已转换格式' : 'Bit-perfect 原样输出';
+    var mode = converted ? '已转换格式'
+      : /\+fade\]/.test(text) ? '开头淡入，其余原样'
+        : 'Bit-perfect 原样输出';
     return input[3] + ' bit / ' + formatRate(Number(input[1])) + ' → '
       + output[3] + ' bit / ' + formatRate(Number(output[1])) + ' · ' + mode;
   }

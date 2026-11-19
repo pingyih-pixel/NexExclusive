@@ -35,6 +35,7 @@
 #include <stdarg.h>
 #include <wchar.h>
 #include <math.h>
+#include <avrt.h>
 #include "../tools/nexaudiolink.h"
 #include "audio_policy.h"
 

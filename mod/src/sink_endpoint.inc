@@ -176,7 +176,7 @@ static int negotiate_probe(void *context, const NexAudioPolicyCandidate *c) {
         /* Conversion ratios the resampler cannot build are not candidates. */
         long long gcd = src_gcd(g_sink.in_rate, c->rate);
         if (c->rate / gcd > SRC_MAX_PHASES ||
-            (double)SRC_TAPS / 2.0 * fmax(1.0, (double)g_sink.in_rate / c->rate) > SRC_MAX_HALF)
+            (double)SRC_TAPS / 2.0 * fmax(1.0, (double)g_sink.in_rate / c->rate) / SRC_EDGE > SRC_MAX_HALF)
             return NEX_AUDIO_PROBE_SKIPPED;
     }
     p->last = try_exclusive(p->gen, p->dev, c->rate, c->container_bits, c->valid_bits,
@@ -503,9 +503,9 @@ static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
     if (g_sink.resample) {
         if (!src_init(g_sink.in_rate, rate, g_sink.in_channels)) { sink_teardown(); return E_OUTOFMEMORY; }
         free(g_fout);
-        g_fout = (float *)malloc((size_t)gen->real_frames * g_sink.in_channels * sizeof(float));
+        g_fout = (double *)malloc((size_t)gen->real_frames * g_sink.in_channels * sizeof(double));
         if (!g_fin)
-            g_fin = (float *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_channels * sizeof(float));
+            g_fin = (double *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_channels * sizeof(double));
         if (!g_fout || !g_fin) { sink_teardown(); return E_OUTOFMEMORY; }
     } else {
         src_free();
@@ -714,8 +714,8 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     scratch_free();
     g_inb=(BYTE *)malloc((size_t)SCRATCH_FRAMES*g_sink.in_block);
     if (g_sink.resample) {
-        g_fin=(float *)malloc((size_t)SCRATCH_FRAMES*g_sink.in_channels*sizeof(float));
-        g_fout=(float *)malloc((size_t)gen->real_frames*g_sink.in_channels*sizeof(float));
+        g_fin=(double *)malloc((size_t)SCRATCH_FRAMES*g_sink.in_channels*sizeof(double));
+        g_fout=(double *)malloc((size_t)gen->real_frames*g_sink.in_channels*sizeof(double));
     }
     if(!g_inb || (g_sink.resample && (!g_fin || !g_fout))) {
         sink_teardown_controlled();return E_OUTOFMEMORY;
@@ -777,11 +777,15 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     char a[160], b[240];
     describe("in", fmt, a, sizeof(a));
     /* "native" means the stream we opened is exactly what the client produces:
-       same rate, same container, same precision, same sample type. No
-       conversion, no dither. Container matters: 24-in-32 is not native to a
-       client that produced packed 24, even though both are 24-bit precision. */
-    int native = (used_rate == g_sink.in_rate) && (used_cont == g_sink.in_container_bits)
-                 && (used_bits == g_sink.in_valid_bits) && (used_float == g_sink.in_is_float);
+       same rate, same container, same precision, same sample type, identical
+       bytes. "repacked" keeps every value but changes the container width
+       (16-in-32 -> 16/16); the byte verifier only applies to native. An
+       opening fade changes the first samples of each start and is shown in
+       the tag rather than hidden behind [native]. */
+    int path = nex_audio_policy_path_kind(g_sink.in_rate, g_sink.in_container_bits,
+                                          g_sink.in_valid_bits, g_sink.in_is_float,
+                                          used_rate, used_cont, used_bits, used_float);
+    int native = path == NEX_AUDIO_PATH_NATIVE;
     g_sink.hifi_map = g_hifi ? (native ? 1 : 2) : 0;
     g_sink.hifi_first_mismatch_frame = ~(UINT64)0;
     g_sink.hifi_client_hash = 1469598103934665603ull;
@@ -791,7 +795,7 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
              used_float ? "/float" : "",
              g_hifi,
              g_hifi ? (native ? "client-native" : "converted") : "off",
-             native ? "[native]" : (g_sink.resample ? "[converted]" : "[depth only]"),
+             nex_audio_policy_path_tag(path, g_fade_ms),
              gen->remote ? "audiohost" : "in-process");
     log_line("sink ENGAGED  generation=%llu  %s  ->  %s  (client buffer %lu frames, ring %lu)  ep=\"%s\" hw=%d",
              (unsigned long long)g_sink.generation,

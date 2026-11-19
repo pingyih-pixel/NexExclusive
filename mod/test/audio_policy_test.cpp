@@ -1,5 +1,6 @@
 #include "../src/audio_policy.h"
 #include <cstdio>
+#include <string>
 
 static int failures;
 
@@ -369,14 +370,14 @@ static void test_failure_classification() {
 
 static void test_config_defaults_and_normalization() {
     NexAudioPolicyConfig c = nex_audio_policy_config_defaults();
-    CHECK(c.out_bits == 24 && c.force_rate == 0 && c.out_frames == 0 && c.compat == 1 &&
-          c.dither == 2 && c.fade_ms == 5 && c.src_prefer == 0 && c.hifi == 0);
+    CHECK(c.out_bits == 0 && c.force_rate == 0 && c.out_frames == 0 && c.compat == 1 &&
+          c.dither == 2 && c.fade_ms == 0 && c.src_prefer == 0 && c.hifi == 0);
 
     c.out_bits = 20; c.force_rate = 5; c.out_frames = 99999; c.dither = 7;
     c.fade_ms = 500; c.src_prefer = 3; c.compat = 9;
     nex_audio_policy_normalize_config(&c);
-    CHECK(c.out_bits == 24 && c.force_rate == 0 && c.out_frames == 0 && c.dither == 2 &&
-          c.fade_ms == 5 && c.src_prefer == 0 && c.compat == 1);
+    CHECK(c.out_bits == 0 && c.force_rate == 0 && c.out_frames == 0 && c.dither == 2 &&
+          c.fade_ms == 0 && c.src_prefer == 0 && c.compat == 1);
 
     c = nex_audio_policy_config_defaults();
     c.force_rate = 400000;
@@ -425,6 +426,67 @@ static void test_dither() {
     std::printf("PASS dither: auto needs an integer depth reduction and the fade off\n");
 }
 
+/* ---- items 7, 4, 1, 6 ------------------------------------------------------ */
+static void test_20_bit_strict_keeps_client_layout() {
+    NexAudioPolicyInput p = input(44100, 24, 20, 0, 0);
+    NexAudioPolicyDepth d[NEX_AUDIO_POLICY_MAX_DEPTHS]{};
+    p.compatibility = 0;
+    int n = nex_audio_policy_build_depths(&p, d, NEX_AUDIO_POLICY_MAX_DEPTHS);
+    CHECK(n == 1 && depth_is(d[0], 24, 20, 0));
+    p = input(96000, 32, 20, 0, 0);
+    p.hifi = 1;
+    n = nex_audio_policy_build_depths(&p, d, NEX_AUDIO_POLICY_MAX_DEPTHS);
+    CHECK(n == 1 && depth_is(d[0], 32, 20, 0));
+    std::printf("PASS 20-bit source: strict modes still offer the client layout\n");
+}
+
+static void test_20_bit_compat_source_first() {
+    NexAudioPolicyInput p = input(44100, 32, 20, 0, 0);
+    NexAudioPolicyDepth d[NEX_AUDIO_POLICY_MAX_DEPTHS]{};
+    int n = nex_audio_policy_build_depths(&p, d, NEX_AUDIO_POLICY_MAX_DEPTHS);
+    CHECK(n >= 3);
+    CHECK(depth_is(d[0], 32, 20, 0));
+    CHECK(depth_is(d[1], 24, 24, 0));
+    CHECK(depth_is(d[2], 32, 24, 0));
+    std::printf("PASS 20-bit source: client layout first, then exact 24-bit widenings\n");
+}
+
+/* bits=0 is "follow the source": no reduction is requested by default. */
+static void test_bits_zero_follows_source() {
+    NexAudioPolicyInput p = input(44100, 32, 32, 0, 0);
+    NexAudioPolicyDepth d[NEX_AUDIO_POLICY_MAX_DEPTHS]{};
+    int n = nex_audio_policy_build_depths(&p, d, NEX_AUDIO_POLICY_MAX_DEPTHS);
+    CHECK(n >= 1 && depth_is(d[0], 32, 32, 0));
+    p = input(44100, 24, 24, 0, 0);
+    n = nex_audio_policy_build_depths(&p, d, NEX_AUDIO_POLICY_MAX_DEPTHS);
+    CHECK(depth_is(d[0], 24, 24, 0));
+    NexAudioPolicyConfig c = nex_audio_policy_config_defaults();
+    CHECK(c.out_bits == 0);
+    c.out_bits = 0;
+    nex_audio_policy_normalize_config(&c);
+    CHECK(c.out_bits == 0);
+    c.out_bits = 16;
+    nex_audio_policy_normalize_config(&c);
+    CHECK(c.out_bits == 16);
+    std::printf("PASS bits=0 follows the source and is the default\n");
+}
+
+static void test_path_kind_labels() {
+    CHECK(nex_audio_policy_path_kind(44100, 16, 16, 0, 44100, 16, 16, 0) == NEX_AUDIO_PATH_NATIVE);
+    CHECK(nex_audio_policy_path_kind(44100, 32, 16, 0, 44100, 16, 16, 0) == NEX_AUDIO_PATH_REPACKED);
+    CHECK(nex_audio_policy_path_kind(44100, 16, 16, 0, 44100, 24, 16, 0) == NEX_AUDIO_PATH_REPACKED);
+    CHECK(nex_audio_policy_path_kind(44100, 16, 16, 0, 44100, 24, 24, 0) == NEX_AUDIO_PATH_DEPTH);
+    CHECK(nex_audio_policy_path_kind(44100, 32, 32, 1, 44100, 32, 32, 0) == NEX_AUDIO_PATH_DEPTH);
+    CHECK(nex_audio_policy_path_kind(44100, 16, 16, 0, 48000, 16, 16, 0) == NEX_AUDIO_PATH_CONVERTED);
+    CHECK(std::string(nex_audio_policy_path_tag(NEX_AUDIO_PATH_NATIVE, 0)) == "[native]");
+    CHECK(std::string(nex_audio_policy_path_tag(NEX_AUDIO_PATH_NATIVE, 5)) == "[native+fade]");
+    CHECK(std::string(nex_audio_policy_path_tag(NEX_AUDIO_PATH_REPACKED, 0)) == "[repacked]");
+    CHECK(std::string(nex_audio_policy_path_tag(NEX_AUDIO_PATH_REPACKED, 3)) == "[repacked+fade]");
+    CHECK(std::string(nex_audio_policy_path_tag(NEX_AUDIO_PATH_DEPTH, 5)) == "[depth only]");
+    CHECK(std::string(nex_audio_policy_path_tag(NEX_AUDIO_PATH_CONVERTED, 0)) == "[converted]");
+    std::printf("PASS path labels: native, repacked, depth only, converted; fade is never hidden\n");
+}
+
 int main() {
     test_16_bit_source_ladder_precedes_higher_setting();
     test_24_bit_source_ladder();
@@ -450,6 +512,10 @@ int main() {
     test_config_defaults_and_normalization();
     test_format_legality();
     test_dither();
+    test_20_bit_strict_keeps_client_layout();
+    test_20_bit_compat_source_first();
+    test_bits_zero_follows_source();
+    test_path_kind_labels();
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }

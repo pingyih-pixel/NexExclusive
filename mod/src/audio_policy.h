@@ -64,24 +64,24 @@ NEX_AUDIO_POLICY_FN int nex_audio_policy_format_valid(int rate, int channels,
 /* ---- configuration -------------------------------------------------------- */
 
 typedef struct NexAudioPolicyConfig {
-    int out_bits;     /* 16, 24 or 32 (32 = float32)                          */
+    int out_bits;     /* 0 = follow the source; 16/24 reduce; 32 = float32     */
     int force_rate;   /* 0 = follow the source                                */
     int out_frames;   /* 0 = derive from the client's requested duration      */
     int compat;       /* allow rate/depth conversion when the source is refused */
     int dither;       /* 0 off, 1 on, 2 auto                                  */
-    int fade_ms;      /* opening ramp; 0 leaves samples untouched             */
+    int fade_ms;      /* opening ramp; 0 (default) leaves samples untouched   */
     int src_prefer;   /* 0 bandwidth, 1 integer ratios first                  */
     int hifi;         /* strict native: the client format or nothing          */
 } NexAudioPolicyConfig;
 
 NEX_AUDIO_POLICY_FN NexAudioPolicyConfig nex_audio_policy_config_defaults(void) {
     NexAudioPolicyConfig c;
-    c.out_bits = 24;
+    c.out_bits = 0;
     c.force_rate = 0;
     c.out_frames = 0;
     c.compat = 1;
     c.dither = 2;
-    c.fade_ms = 5;
+    c.fade_ms = 0;
     c.src_prefer = 0;
     c.hifi = 0;
     return c;
@@ -96,7 +96,8 @@ NEX_AUDIO_POLICY_FN void nex_audio_policy_normalize_config(NexAudioPolicyConfig 
     c->compat = c->compat != 0;
     c->hifi = c->hifi != 0;
     if (c->src_prefer != 0 && c->src_prefer != 1) c->src_prefer = d.src_prefer;
-    if (c->out_bits != 16 && c->out_bits != 24 && c->out_bits != 32) c->out_bits = d.out_bits;
+    if (c->out_bits != 0 && c->out_bits != 16 && c->out_bits != 24 && c->out_bits != 32)
+        c->out_bits = d.out_bits;
     if (c->out_frames < 0 || c->out_frames > 32768) c->out_frames = d.out_frames;
     if (c->force_rate != 0 && !nex_audio_policy_rate_valid(c->force_rate))
         c->force_rate = d.force_rate;
@@ -119,6 +120,33 @@ NEX_AUDIO_POLICY_FN int nex_audio_policy_dither_selected(int input_float, int in
     if (output_float) return 0;
     if (mode == 1) return 1;
     return mode == 2 && output_valid < (input_float ? 24 : input_valid) && fade_ms == 0;
+}
+
+/* ---- what the negotiated path does to the samples ------------------------- */
+enum {
+    NEX_AUDIO_PATH_NATIVE = 0,    /* identical bytes                             */
+    NEX_AUDIO_PATH_REPACKED = 1,  /* identical values, other container width     */
+    NEX_AUDIO_PATH_DEPTH = 2,     /* same rate, other precision or sample type   */
+    NEX_AUDIO_PATH_CONVERTED = 3  /* resampled                                   */
+};
+
+NEX_AUDIO_POLICY_FN int nex_audio_policy_path_kind(int in_rate, int in_container, int in_valid,
+                                                   int in_float, int out_rate, int out_container,
+                                                   int out_valid, int out_float) {
+    if (in_rate != out_rate) return NEX_AUDIO_PATH_CONVERTED;
+    if (in_float != out_float || in_valid != out_valid) return NEX_AUDIO_PATH_DEPTH;
+    return in_container == out_container ? NEX_AUDIO_PATH_NATIVE : NEX_AUDIO_PATH_REPACKED;
+}
+
+/* The tag written into the ENGAGED log line and read by the panel. An opening
+   fade changes the first samples of every start, so it is part of the tag. */
+NEX_AUDIO_POLICY_FN const char *nex_audio_policy_path_tag(int kind, int fade_ms) {
+    switch (kind) {
+    case NEX_AUDIO_PATH_NATIVE: return fade_ms > 0 ? "[native+fade]" : "[native]";
+    case NEX_AUDIO_PATH_REPACKED: return fade_ms > 0 ? "[repacked+fade]" : "[repacked]";
+    case NEX_AUDIO_PATH_DEPTH: return "[depth only]";
+    default: return "[converted]";
+    }
 }
 
 /* ---- candidates ----------------------------------------------------------- */
@@ -250,6 +278,8 @@ NEX_AUDIO_POLICY_FN int nex_audio_policy_push_depth(NexAudioPolicyDepth *out, in
     return count + 1;
 }
 
+/* Any layout the format check accepts: an integer container of 16/24/32 bits
+   holding 1..container valid bits (20-in-24 included), or float32. */
 NEX_AUDIO_POLICY_FN int nex_audio_policy_valid_source_depth(const NexAudioPolicyInput *policy) {
     if (!policy) return 0;
     if (policy->source_is_float)
@@ -257,9 +287,7 @@ NEX_AUDIO_POLICY_FN int nex_audio_policy_valid_source_depth(const NexAudioPolicy
     return (policy->source_container_bits == 16 ||
             policy->source_container_bits == 24 ||
             policy->source_container_bits == 32) &&
-           (policy->source_valid_bits == 16 ||
-            policy->source_valid_bits == 24 ||
-            policy->source_valid_bits == 32) &&
+           policy->source_valid_bits >= 1 &&
            policy->source_valid_bits <= policy->source_container_bits;
 }
 
@@ -277,7 +305,8 @@ NEX_AUDIO_POLICY_FN int nex_audio_policy_push_requested(NexAudioPolicyDepth *out
 
    Otherwise:
      1. the bits setting, only when it asks for less than the source carries;
-        that is an explicit request to reduce.
+        that is an explicit request to reduce. bits=0 (the default) asks for
+        nothing and leaves the source ladder first.
      2. the source ladder, as in AppleMusic-OpenHome's AudioFormatPolicy:
         source width first, then the same valid bits in wider containers, then
         wider declarations. Every step is exact; the extra low bits are zero.
@@ -315,6 +344,12 @@ NEX_AUDIO_POLICY_FN int nex_audio_policy_build_depths(const NexAudioPolicyInput 
         if (policy->source_is_float) {
             count = nex_audio_policy_push_depth(out, count, capacity, 32, 32, 1);
         } else {
+            int v = policy->source_valid_bits;
+            /* An uncommon precision (e.g. 20 bits) is tried as the client
+               wrote it before the exact widenings below. */
+            if (v != 16 && v != 24 && v != 32)
+                count = nex_audio_policy_push_depth(out, count, capacity,
+                                                    policy->source_container_bits, v, 0);
             if (policy->source_valid_bits == 16) {
                 count = nex_audio_policy_push_depth(out, count, capacity, 16, 16, 0);
                 count = nex_audio_policy_push_depth(out, count, capacity, 24, 16, 0);
