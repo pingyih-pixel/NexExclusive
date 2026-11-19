@@ -98,6 +98,115 @@ static void test_poll_interval_backs_off_outside_wait(void) {
     printf("PASS ui_thread polls fast only while waiting\n");
 }
 
+/* ---- one injection round, with fake process operations -------------------- */
+typedef struct FakeProcs {
+    DWORD loaded[4];        int nloaded;
+    DWORD refuse[4];        int nrefuse;
+    DWORD client_parent[4]; int nparent;
+    DWORD injected[16];     int ninjected;
+} FakeProcs;
+
+static int fake_has(const DWORD *list, int n, DWORD pid) {
+    for (int i = 0; i < n; i++) if (list[i] == pid) return 1;
+    return 0;
+}
+static int fake_loaded(void *ctx, DWORD pid) {
+    FakeProcs *f = (FakeProcs *)ctx;
+    return fake_has(f->loaded, f->nloaded, pid);
+}
+static int fake_inject(void *ctx, DWORD pid) {
+    FakeProcs *f = (FakeProcs *)ctx;
+    if (fake_has(f->refuse, f->nrefuse, pid)) return 0;
+    f->injected[f->ninjected++] = pid;
+    return 1;
+}
+static int fake_parent(void *ctx, DWORD pid) {
+    FakeProcs *f = (FakeProcs *)ctx;
+    return fake_has(f->client_parent, f->nparent, pid);
+}
+
+static void test_round_skips_loaded_and_caps_failures(void) {
+    FakeProcs f;
+    UiOps ops = {fake_loaded, fake_inject, fake_parent, &f};
+    UiTracker t;
+    DWORD kids[] = {11, 12, 13};
+    memset(&f, 0, sizeof(f));
+    memset(&t, 0, sizeof(t));
+    f.loaded[f.nloaded++] = 11;          /* left by a previous host */
+    f.refuse[f.nrefuse++] = 13;          /* e.g. a protected helper */
+    ui_tracker_sync(&t, 10, kids, 3, 1000);
+    for (int round = 0; round < 5; round++) ui_round_inject(&t, &ops, 2000 + round);
+    CHECK(t.child[0].injected && t.child[1].injected && !t.child[2].injected);
+    CHECK(f.ninjected == 1 && f.injected[0] == 12);     /* 11 never re-injected */
+    CHECK(t.child[2].failures == NEX_UI_INJECT_MAX_FAILURES); /* capped, not 5 */
+    CHECK(t.first_injected_at == 2000);
+    printf("PASS ui round: loaded children are not re-injected, failures stop at the cap\n");
+}
+
+/* While the shell launcher is still alive, find_main_client may return it and
+   the real main (audio) process shows up as its "child". */
+static void test_round_skips_child_that_is_a_main_process(void) {
+    FakeProcs f;
+    UiOps ops = {fake_loaded, fake_inject, fake_parent, &f};
+    UiTracker t;
+    NexUiRouteInput in;
+    DWORD kids[] = {20};
+    memset(&f, 0, sizeof(f));
+    memset(&t, 0, sizeof(t));
+    f.client_parent[f.nparent++] = 20;
+    ui_tracker_sync(&t, 5, kids, 1, 1000);
+    ui_round_inject(&t, &ops, 1100);
+    ui_round_inject(&t, &ops, 1200);
+    CHECK(f.ninjected == 0);
+    CHECK(t.child[0].skip && !t.child[0].injected && t.child[0].failures == 0);
+    ui_tracker_route_input(&t, 1, 1300, &in);
+    CHECK(!in.renderer_injected && in.inject_failures == 0);
+    printf("PASS ui round: a child that is itself a client main process is left alone\n");
+}
+
+/* ---- crash-loop guard ----------------------------------------------------- */
+static void test_crash_guard_trips_after_two_quick_exits(void) {
+    UiGuard g;
+    memset(&g, 0, sizeof(g));
+    CHECK(!ui_guard_client_gone(&g, 0, 5000));            /* nexui never ran there */
+    CHECK(g.quick_exits == 0);
+    CHECK(!ui_guard_client_gone(&g, 10000, 12000));       /* died 2 s after injection */
+    CHECK(g.quick_exits == 1 && !g.tripped);
+    CHECK(!ui_guard_client_gone(&g, 20000, 60000));       /* lived 40 s: streak resets */
+    CHECK(g.quick_exits == 0);
+    CHECK(!ui_guard_client_gone(&g, 70000, 71000));
+    CHECK(ui_guard_client_gone(&g, 80000, 80000 + UI_GUARD_WINDOW_MS - 1)); /* second in a row */
+    CHECK(g.tripped);
+    CHECK(!ui_guard_client_gone(&g, 90000, 90500));        /* trips once */
+    printf("PASS crash guard: two quick exits in a row after injection stop nexui\n");
+}
+
+static void test_route_reason_codes(void) {
+    NexUiRouteInput in;
+    memset(&in, 0, sizeof(in));
+    in.dll_present = 1; in.renderer_injected = 1; in.ms_since_renderer_injected = 20000;
+    CHECK(ui_route_reason_code(&in, 0) == UI_REASON_TIMEOUT);
+    CHECK(ui_route_reason_code(&in, 1) == UI_REASON_GUARD);
+    in.renderer_unsupported = 1;
+    CHECK(ui_route_reason_code(&in, 0) == UI_REASON_UNSUPPORTED);
+    in.dll_present = 0;
+    CHECK(ui_route_reason_code(&in, 0) == UI_REASON_MISSING);
+    in.dll_present = 1; in.renderer_unsupported = 0; in.inject_failures = 3;
+    CHECK(ui_route_reason_code(&in, 0) == UI_REASON_INJECT_FAILED);
+    CHECK(strstr(ui_route_reason_text(UI_REASON_GUARD), "停用") != NULL);
+    printf("PASS route reasons: guard, missing, unsupported, failure, timeout\n");
+}
+
+/* After the 20 s timeout nexui may still load the panel on the page's next
+   native call; telling the user to quit the client would be wrong. */
+static void test_cdp_unavailable_hint_for_timeout(void) {
+    const char *t = ui_cdp_unavailable_hint(UI_REASON_TIMEOUT);
+    const char *m = ui_cdp_unavailable_hint(UI_REASON_MISSING);
+    CHECK(strstr(t, "稍后") != NULL && strstr(t, "退出网易云") == NULL);
+    CHECK(strstr(m, "退出网易云") != NULL);
+    printf("PASS CDP-unavailable hint does not send the user away while nexui may still load\n");
+}
+
 int main(void) {
     test_find_child_pids();
     test_ui_event_exists();
@@ -105,6 +214,11 @@ int main(void) {
     test_ui_child_already_loaded_is_not_reinjected();
     test_route_input_from_tracker();
     test_poll_interval_backs_off_outside_wait();
+    test_round_skips_loaded_and_caps_failures();
+    test_round_skips_child_that_is_a_main_process();
+    test_crash_guard_trips_after_two_quick_exits();
+    test_route_reason_codes();
+    test_cdp_unavailable_hint_for_timeout();
     printf("%s: %d failure(s)\n", g_fail ? "FAILED" : "ALL TESTS PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -123,7 +123,9 @@ console.log('PASS host contract: visible launch and injection hand-off');
   check(source.split('inject_dll(pid, kSinkDll)').length === 2, 'nexsink.dll must be injected from one place only');
   const uiStart = source.indexOf('static DWORD WINAPI ui_thread');
   const uiBody = source.slice(uiStart, uiStart + source.slice(uiStart).search(/\r?\n}\r?\n/));
-  check(uiStart > 0 && uiBody.includes('kUiDll'), 'ui_thread must inject the UI module');
+  check(uiStart > 0 && uiBody.includes('ui_round_inject'), 'ui_thread must run the injection round');
+  check(/static int ui_op_inject\([^)]*\) \{[^}]*inject_dll\(pid, kUiDll\)/.test(source), 'the UI chain must inject nexui.dll');
+  check(!/static int ui_op_inject\([^)]*\) \{[^}]*kSinkDll/.test(source), 'the UI chain must not inject the audio module');
   check(!uiBody.includes('kSinkDll'), 'the UI thread must not touch the audio module');
 }
 

@@ -179,6 +179,17 @@ static void test_hooks_need_current_context(void) {
     printf("PASS hooks are installed only when get_current_context resolved\n");
 }
 
+/* Rewriting an import slot must never take execute rights away from the page. */
+static void test_writable_protect_keeps_execute(void) {
+    CHECK(nexui_writable_protect(PAGE_READONLY) == PAGE_READWRITE);
+    CHECK(nexui_writable_protect(PAGE_READWRITE) == PAGE_READWRITE);
+    CHECK(nexui_writable_protect(PAGE_WRITECOPY) == PAGE_READWRITE);
+    CHECK(nexui_writable_protect(PAGE_EXECUTE_READ) == PAGE_EXECUTE_READWRITE);
+    CHECK(nexui_writable_protect(PAGE_EXECUTE_WRITECOPY) == PAGE_EXECUTE_READWRITE);
+    CHECK(nexui_writable_protect(PAGE_EXECUTE) == PAGE_EXECUTE_READWRITE);
+    printf("PASS import slot rewrite keeps execute rights\n");
+}
+
 int main(int argc, char **argv) {
     test_event_names();
     test_route_rules();
@@ -190,6 +201,7 @@ int main(int argc, char **argv) {
     test_empty_script_is_not_usable();
     test_cef_version_gate();
     test_hooks_need_current_context();
+    test_writable_protect_keeps_execute();
     if (argc > 1) {
         test_dll_inert_outside_renderer(argv[1]);
     } else {

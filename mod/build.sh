@@ -88,8 +88,7 @@ build_ui() {
     # 注入进渲染子进程的界面模块：改 cloudmusic.dll 的 libcef 导入，在主页面里
     # 执行 ui/panel.js 与 ui/simplify.js，不需要 9333。与 nexsink.dll 互不依赖。
     "$CC" cc "${FLAGS[@]}" -shared -o "$OUT_DIR/nexui.dll" "$MOD_DIR/src/nexui.c"
-    printf '已构建到 %s：nexui.dll
-' "$OUT_DIR"
+    printf '已构建到 %s：nexui.dll\n' "$OUT_DIR"
 }
 
 build_host() {

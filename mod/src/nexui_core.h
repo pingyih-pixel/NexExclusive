@@ -102,6 +102,16 @@ NEX_UI_FN wchar_t *nexui_decode_script(const char *bytes, size_t n, size_t *out_
     return w;
 }
 
+/* Protection to use while rewriting an import slot. If the page was
+   executable it stays executable: other code on the same page may be running. */
+NEX_UI_FN DWORD nexui_writable_protect(DWORD old) {
+    DWORD base = old & 0xFF;
+    if (base == PAGE_EXECUTE || base == PAGE_EXECUTE_READ ||
+        base == PAGE_EXECUTE_READWRITE || base == PAGE_EXECUTE_WRITECOPY)
+        return PAGE_EXECUTE_READWRITE;
+    return PAGE_READWRITE;
+}
+
 /* Replace module's import of import_dll!name with hook. The first original
    pointer is kept in *original when it is still NULL. Returns 1 when a slot
    was rewritten, 0 when module does not import that name by name. */
@@ -130,7 +140,12 @@ NEX_UI_FN int nexui_iat_patch(HMODULE module, const char *import_dll, const char
             if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
             if (strcmp(((IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData))->Name, name) != 0)
                 continue;
-            if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old)) continue;
+            {
+                MEMORY_BASIC_INFORMATION mbi;
+                DWORD want = PAGE_READWRITE;
+                if (VirtualQuery(slot, &mbi, sizeof(mbi))) want = nexui_writable_protect(mbi.Protect);
+                if (!VirtualProtect(slot, sizeof(void *), want, &old)) continue;
+            }
             if (original && !*original) *original = *slot;
             InterlockedExchangePointer(slot, hook);
             VirtualProtect(slot, sizeof(void *), old, &old);

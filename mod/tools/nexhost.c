@@ -1782,7 +1782,7 @@ static int ui_event_exists(const wchar_t *kind, DWORD pid) {
 }
 
 #define UI_MAX_CHILDREN 32
-typedef struct UiChild { DWORD pid; int injected; int failures; } UiChild;
+typedef struct UiChild { DWORD pid; int injected; int failures; int skip; } UiChild;
 typedef struct UiTracker {
     DWORD main_pid;
     UiChild child[UI_MAX_CHILDREN];
@@ -1814,6 +1814,7 @@ static void ui_tracker_sync(UiTracker *t, DWORD main_pid, const DWORD *children,
         t->child[t->count].pid = children[j];
         t->child[t->count].injected = 0;
         t->child[t->count].failures = 0;
+        t->child[t->count].skip = 0;
         t->count++;
     }
 }
@@ -1824,6 +1825,7 @@ static void ui_tracker_route_input(const UiTracker *t, int dll_present, ULONGLON
     memset(out, 0, sizeof(*out));
     out->dll_present = dll_present;
     for (i = 0; i < t->count; i++) {
+        if (t->child[i].skip) continue;
         if (t->child[i].injected) out->renderer_injected = 1;
         if (ui_event_exists(L"Ready", t->child[i].pid)) out->renderer_ready = 1;
         if (ui_event_exists(L"Unsupported", t->child[i].pid)) out->renderer_unsupported = 1;
@@ -1835,13 +1837,6 @@ static void ui_tracker_route_input(const UiTracker *t, int dll_present, ULONGLON
         out->ms_since_renderer_injected = (unsigned long)(now - t->first_injected_at);
 }
 
-static const char *ui_route_reason(const NexUiRouteInput *in) {
-    if (!in->dll_present) return "缺少 nexui.dll";
-    if (in->renderer_unsupported) return "渲染进程不支持（见 nexui.log）";
-    if (in->inject_failures >= NEX_UI_INJECT_MAX_FAILURES) return "注入渲染进程失败";
-    return "20 秒内渲染进程未就绪";
-}
-
 static volatile LONG g_ui_route = NEX_UI_ROUTE_WAIT;
 
 /* Fast only while waiting for a renderer: a CDP route can last the whole
@@ -1851,15 +1846,109 @@ static DWORD ui_poll_interval_ms(int route) {
     return route == NEX_UI_ROUTE_WAIT ? 100 : 1000;
 }
 
+/* ---- one round of injection ------------------------------------------------ */
+/* Process operations behind a table so the round's rules are testable. */
+typedef struct UiOps {
+    int (*loaded)(void *ctx, DWORD pid);              /* nexui.dll already in pid  */
+    int (*inject)(void *ctx, DWORD pid);              /* load nexui.dll into pid   */
+    int (*has_client_children)(void *ctx, DWORD pid); /* pid is itself a main      */
+    void *ctx;
+} UiOps;
+
+/* Each child is tried until it holds nexui.dll or reaches the failure cap. A
+   child that has cloudmusic.exe children of its own is a main process seen
+   through the shell launcher: it hosts the audio module and is left alone. */
+static void ui_round_inject(UiTracker *t, const UiOps *ops, ULONGLONG now) {
+    int i;
+    for (i = 0; i < t->count; i++) {
+        UiChild *c = &t->child[i];
+        if (c->skip || c->injected || c->failures >= NEX_UI_INJECT_MAX_FAILURES) continue;
+        if (ops->has_client_children(ops->ctx, c->pid)) { c->skip = 1; continue; }
+        if (ops->loaded(ops->ctx, c->pid) || ops->inject(ops->ctx, c->pid)) {
+            c->injected = 1;
+            if (!t->first_injected_at) t->first_injected_at = now;
+        } else {
+            c->failures++;
+        }
+    }
+}
+
+static int ui_op_loaded(void *ctx, DWORD pid) { (void)ctx; return module_loaded(pid, L"nexui.dll"); }
+static int ui_op_inject(void *ctx, DWORD pid) { (void)ctx; return inject_dll(pid, kUiDll); }
+static int ui_op_has_client_children(void *ctx, DWORD pid) {
+    DWORD one[1];
+    (void)ctx;
+    return find_child_pids(pid, L"cloudmusic.exe", one, 1) > 0;
+}
+
+/* ---- crash-loop guard ------------------------------------------------------- */
+/* In this client a dead renderer takes the whole client down and the watchdog
+   relaunches it. If nexui.dll were the cause, every relaunch would inject it
+   again. Two clients in a row that end within the window after their first
+   injection stop nexui.dll for the rest of this host session. */
+#define UI_GUARD_WINDOW_MS 15000
+#define UI_GUARD_LIMIT 2
+typedef struct UiGuard { int quick_exits; int tripped; } UiGuard;
+
+/* Returns 1 on the call that trips the guard. */
+static int ui_guard_client_gone(UiGuard *g, ULONGLONG first_injected_at, ULONGLONG gone_at) {
+    if (!first_injected_at) return 0;
+    if (gone_at >= first_injected_at && gone_at - first_injected_at < UI_GUARD_WINDOW_MS)
+        g->quick_exits++;
+    else
+        g->quick_exits = 0;
+    if (!g->tripped && g->quick_exits >= UI_GUARD_LIMIT) {
+        g->tripped = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- route reasons ------------------------------------------------------------ */
+enum { UI_REASON_NONE = 0, UI_REASON_MISSING, UI_REASON_UNSUPPORTED, UI_REASON_INJECT_FAILED,
+       UI_REASON_TIMEOUT, UI_REASON_GUARD };
+
+static int ui_route_reason_code(const NexUiRouteInput *in, int guard_tripped) {
+    if (guard_tripped) return UI_REASON_GUARD;
+    if (!in->dll_present) return UI_REASON_MISSING;
+    if (in->renderer_unsupported) return UI_REASON_UNSUPPORTED;
+    if (in->inject_failures >= NEX_UI_INJECT_MAX_FAILURES) return UI_REASON_INJECT_FAILED;
+    return UI_REASON_TIMEOUT;
+}
+
+static const char *ui_route_reason_text(int code) {
+    switch (code) {
+    case UI_REASON_GUARD: return "客户端两次在注入 nexui.dll 后很快退出，本次运行已停用 nexui.dll";
+    case UI_REASON_MISSING: return "缺少 nexui.dll";
+    case UI_REASON_UNSUPPORTED: return "渲染进程不支持（见 nexui.log）";
+    case UI_REASON_INJECT_FAILED: return "注入渲染进程失败";
+    default: return "20 秒内渲染进程未就绪";
+    }
+}
+
+/* Second half of the watchdog's "panel unavailable" line when CDP is out too. */
+static const char *ui_cdp_unavailable_hint(int code) {
+    if (code == UI_REASON_TIMEOUT)
+        return "nexui.dll 仍在等待页面的下一次调用，面板可能稍后出现，操作一下界面会更快";
+    return "需要设置面板时，退出网易云后由 NexExclusive 重新拉起";
+}
+
+static volatile LONG g_ui_reason = UI_REASON_NONE;
+
 static DWORD WINAPI ui_thread(LPVOID unused) {
     static UiTracker tracker;
+    static UiGuard guard;
+    const UiOps ops = {ui_op_loaded, ui_op_inject, ui_op_has_client_children, NULL};
     int last_route = -1;
     (void)unused;
     for (;;) {
         DWORD kids[UI_MAX_CHILDREN];
         DWORD main_pid = find_main_client();
-        int i, n, route, dll_present;
+        int n, route, reason, dll_present;
         NexUiRouteInput in;
+        if (tracker.main_pid && tracker.main_pid != main_pid &&
+            ui_guard_client_gone(&guard, tracker.first_injected_at, GetTickCount64()))
+            host_log("界面链路：%s，改走 CDP", ui_route_reason_text(UI_REASON_GUARD));
         if (!main_pid) {
             memset(&tracker, 0, sizeof(tracker));
             InterlockedExchange(&g_ui_route, NEX_UI_ROUTE_WAIT);
@@ -1869,25 +1958,18 @@ static DWORD WINAPI ui_thread(LPVOID unused) {
         }
         n = find_child_pids(main_pid, L"cloudmusic.exe", kids, UI_MAX_CHILDREN);
         ui_tracker_sync(&tracker, main_pid, kids, n, GetTickCount64());
-        dll_present = GetFileAttributesA(kUiDll) != INVALID_FILE_ATTRIBUTES;
-        for (i = 0; dll_present && i < tracker.count; i++) {
-            UiChild *c = &tracker.child[i];
-            if (c->injected || c->failures >= NEX_UI_INJECT_MAX_FAILURES) continue;
-            if (module_loaded(c->pid, L"nexui.dll") || inject_dll(c->pid, kUiDll)) {
-                c->injected = 1;
-                if (!tracker.first_injected_at) tracker.first_injected_at = GetTickCount64();
-            } else {
-                c->failures++;
-            }
-        }
+        dll_present = !guard.tripped && GetFileAttributesA(kUiDll) != INVALID_FILE_ATTRIBUTES;
+        if (dll_present) ui_round_inject(&tracker, &ops, GetTickCount64());
         ui_tracker_route_input(&tracker, dll_present, GetTickCount64(), &in);
         route = nex_ui_route_decide(&in);
+        reason = route == NEX_UI_ROUTE_CDP ? ui_route_reason_code(&in, guard.tripped) : UI_REASON_NONE;
+        InterlockedExchange(&g_ui_reason, reason);
         if (route != last_route) {
             if (route == NEX_UI_ROUTE_RENDERER)
                 host_log("界面链路：渲染进程就绪，面板由 nexui.dll 加载（客户端 pid=%lu）",
                          (unsigned long)main_pid);
             else if (route == NEX_UI_ROUTE_CDP)
-                host_log("界面链路：回退到 CDP（%s）", ui_route_reason(&in));
+                host_log("界面链路：回退到 CDP（%s）", ui_route_reason_text(reason));
             else
                 host_log("界面链路：等待渲染进程（客户端 pid=%lu）", (unsigned long)main_pid);
             last_route = route;
@@ -3218,8 +3300,8 @@ static void watchdog_tick(void) {
                 host_log("CDP 端口未就绪（客户端可能刚启动）");
             else
                 host_log("面板不可用：当前客户端 pid=%lu 没有开放 9333；音频不受影响，"
-                         "不会为此重启客户端。需要设置面板时，退出网易云后由 NexExclusive 重新拉起",
-                         (unsigned long)pid);
+                         "不会为此重启客户端。%s",
+                         (unsigned long)pid, ui_cdp_unavailable_hint((int)g_ui_reason));
         }
     }
 }
