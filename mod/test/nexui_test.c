@@ -4,6 +4,7 @@
 #include <wchar.h>
 
 #include "../src/nexui_shared.h"
+#include "../src/nexui_core.h"
 
 static int failures;
 #define CHECK(expr) do { if (!(expr)) { \
@@ -57,11 +58,55 @@ static void test_route_ready_after_timeout_wins(void) {
     printf("PASS route: a renderer that becomes ready after the CDP fallback takes over again\n");
 }
 
+/* ---- renderer-side logic -------------------------------------------------- */
+static void test_renderer_detection(void) {
+    CHECK(nexui_is_renderer(L"cloudmusic.exe --type=renderer --no-sandbox"));
+    CHECK(nexui_is_renderer(L"\"cloudmusic.exe\" --lang=zh --type=renderer"));
+    CHECK(nexui_is_renderer(L"cloudmusic.exe \"--type=renderer\" --no-sandbox"));
+    CHECK(!nexui_is_renderer(L"cloudmusic.exe --type=gpu-process"));
+    CHECK(!nexui_is_renderer(L"cloudmusic.exe --type=renderer-helper"));
+    CHECK(!nexui_is_renderer(L"cloudmusic.exe --xtype=renderer"));
+    CHECK(!nexui_is_renderer(L"cloudmusic.exe"));
+    CHECK(!nexui_is_renderer(NULL));
+    printf("PASS renderer detection: exact --type=renderer token only\n");
+}
+
+static void test_layout_and_target(void) {
+    CHECK(nexui_layout_ok(112, 240));
+    CHECK(!nexui_layout_ok(120, 240));
+    CHECK(!nexui_layout_ok(112, 232));
+    CHECK(nexui_should_inject(1, "orpheus://orpheus/pub/app.html", 0));
+    CHECK(!nexui_should_inject(1, "orpheus://orpheus/pub/app.html", 1));
+    CHECK(!nexui_should_inject(0, "orpheus://orpheus/pub/app.html", 0));
+    CHECK(!nexui_should_inject(1, "https://music.163.com/", 0));
+    CHECK(!nexui_should_inject(1, NULL, 0));
+    printf("PASS CEF 91 layout check and main orpheus:// frame target\n");
+}
+
+static DWORD WINAPI fake_tick(void) { return 12345; }
+
+static void test_iat_patch_own_import(void) {
+    void *orig = NULL;
+    HMODULE self = GetModuleHandleW(NULL);
+    CHECK(nexui_iat_patch(self, "KERNEL32.dll", "GetTickCount", (void *)fake_tick, &orig) == 1);
+    CHECK(GetTickCount() == 12345);
+    CHECK(orig != NULL);
+    CHECK(nexui_iat_patch(self, "kernel32.dll", "GetTickCount", orig, NULL) == 1);
+    CHECK(GetTickCount() != 12345);
+    CHECK(nexui_iat_patch(self, "kernel32.dll", "NoSuchExport", (void *)fake_tick, NULL) == 0);
+    CHECK(nexui_iat_patch(self, "libcef.dll", "cef_v8context_get_current_context",
+                          (void *)fake_tick, NULL) == 0);
+    printf("PASS import table patch: hook, restore, absent names untouched\n");
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     test_event_names();
     test_route_rules();
     test_route_ready_after_timeout_wins();
+    test_renderer_detection();
+    test_layout_and_target();
+    test_iat_patch_own_import();
     printf("%s: %d failure(s)\n", failures ? "FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }
