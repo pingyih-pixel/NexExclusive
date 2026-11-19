@@ -20,7 +20,7 @@
 git clone https://github.com/pingyih-pixel/NexExclusive.git
 cd NexExclusive
 
-bash mod/build.sh all     # → mod/NexExclusive.exe、mod/NexAudioHost.exe、mod/nexsink.dll，以及配置和界面脚本
+bash mod/build.sh all     # → mod/NexExclusive.exe、mod/NexAudioHost.exe、mod/nexsink.dll、mod/nexui.dll，以及配置和界面脚本
 bash mod/build.sh test    # 19 组回归，不开设备、不注入进程
 node mod/ui/panel.contract.test.js
 node --check mod/ui/panel.js
@@ -28,7 +28,7 @@ node --check mod/ui/simplify.js
 bash release.sh           # → dist/NexExclusive-<版本>.zip + SHA256SUMS.txt
 ```
 
-`build.sh` 还支持单独构建 `sink`（只有 DLL）、`host`（宿主 exe）或 `audiohost`（独立 WASAPI 端点进程）。产物默认落在 `mod/`，用 `OUT_DIR=/绝对路径` 可以改，必须是绝对路径。
+`build.sh` 还支持单独构建 `sink`（只有音频 DLL）、`ui`（只有界面 DLL `nexui.dll`）、`host`（宿主 exe）或 `audiohost`（独立 WASAPI 端点进程）。产物默认落在 `mod/`，用 `OUT_DIR=/绝对路径` 可以改，必须是绝对路径。
 
 `release.sh 1.0.1` 可以临时指定版本号，不改源码。不带参数时，版本号取自 `mod/tools/nexhost.c` 里的 `APP_VERSION`，那里是版本号的唯一来源。
 
@@ -56,17 +56,22 @@ ZIG=/c/zig/zig-x86_64-windows-0.17.1 bash mod/build.sh all
 | `mod/src/sink_lifecycle.inc` | 设备「代」的切换、停止与拆除 |
 | `mod/src/sink_endpoint.inc` | 格式协商、迁移、接管 |
 | `mod/src/sink_hooks.inc` | `IAudioClient` / `IMMDevice` 的钩子与看门狗 |
-| `mod/tools/nexhost.c` | 宿主 exe：安装卸载、托盘、注入、本机配置服务、CDP 界面注入 |
+| `mod/src/nexui.c` | 界面 DLL：只在渲染子进程里动作，改 `cloudmusic.dll` 的 5 个 libcef 导入，在主页面执行 `ui/panel.js` 与 `ui/simplify.js` |
+| `mod/src/nexui_core.h` / `nexui_cef.h` | 界面 DLL 的纯逻辑（渲染进程判定、CEF 91 布局检查、导入表改写）与 CEF 91 C API 结构体子集 |
+| `mod/src/nexui_shared.h` | 宿主与界面 DLL 的约定：就绪/不支持事件名、界面路由决策 |
+| `mod/tools/nexhost.c` | 宿主 exe：安装卸载、托盘、音频注入、界面链路（子进程跟踪、注入 `nexui.dll`）、本机配置服务、CDP 回退 |
 | `mod/tools/nexaudiolink.h` / `nexaudiohost.c` | 独立音频宿主协议与 WASAPI 端点进程 |
 | `mod/ui/` | 注入客户端页面的 `panel.js` 与 `simplify.js` |
 | `mod/test/audio_policy_test.cpp` | AudioPolicy 的 C++ 测试：位深与采样率顺序、统一候选计划、假端点搜索（含设备占用）、配置规范化、格式合法性、抖动 |
 | `mod/test/regression.c` | DLL 回归，直接包含 `nexsink.c`，所以能测到内部的静态函数 |
+| `mod/test/nexui_test.c` | 界面 DLL：事件名、路由规则、渲染进程判定、布局检查、导入表改写，以及 DLL 在非渲染进程里不动作 |
+| `mod/test/nexhost_ui_test.c` | 宿主界面链路：子进程查找、事件检测、子进程集合与路由输入 |
 
 回归测试覆盖 DLL 一侧：vtable、环形缓冲、重采样、生命周期、闸门。宿主一侧的安装、卸载、托盘、单实例目前靠手工验证。
 
 ## 发布包内容
 
-发布包包含 `NexExclusive.exe`、`NexAudioHost.exe`、`nexsink.dll`、`hook.cfg`、`ui.json`、`ui/panel.js`、`ui/simplify.js`。`release.sh` 会另外生成 `README.txt`、校验和与 Release 说明。
+发布包包含 `NexExclusive.exe`、`NexAudioHost.exe`、`nexsink.dll`、`nexui.dll`、`hook.cfg`、`ui.json`、`ui/panel.js`、`ui/simplify.js`。`release.sh` 会另外生成 `README.txt`、校验和与 Release 说明。
 
 编译成功、文件却消失时，基本是杀软隔离了 `NexExclusive.exe`。在 PowerShell 里查一下：
 

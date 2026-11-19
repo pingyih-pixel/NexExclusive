@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 打发布包：编译 → 只挑出运行时要的 7 个文件 → 生成包内清单 → 加安装说明 → 压 zip → 出校验和与
+# 打发布包：编译 → 只挑出运行时要的 8 个文件 → 生成包内清单 → 加安装说明 → 压 zip → 出校验和与
 # Release 说明。产物全在 dist/ 下，不碰构建目录，也不会把 .pdb / 测试工具塞进去。
 #
 #   ./release.sh              用 nexhost.c 里的 APP_VERSION
@@ -43,9 +43,9 @@ rm -rf -- "$STAGE" "$BUILD"
 mkdir -p -- "$STAGE" "$BUILD"
 OUT_DIR="$BUILD" bash "$MOD_DIR/build.sh" all
 
-# 发布包里只要这 7 个。player.exe / inject*.exe / *_eps.exe 是开发和诊断用的，
+# 发布包里只要这 8 个。player.exe / inject*.exe / *_eps.exe 是开发和诊断用的，
 # 放进去只会让用户困惑，也会让杀软多几个可疑样本。
-FILES=(NexExclusive.exe NexAudioHost.exe nexsink.dll hook.cfg ui.json ui/panel.js ui/simplify.js)
+FILES=(NexExclusive.exe NexAudioHost.exe nexsink.dll nexui.dll hook.cfg ui.json ui/panel.js ui/simplify.js)
 printf '==> 收集文件\n'
 for f in "${FILES[@]}"; do
     if [[ ! -f "$BUILD/$f" ]]; then
@@ -95,12 +95,13 @@ NexExclusive $VER —— 给网易云音乐客户端加上 WASAPI 独占输出
 【杀软报毒】
   这个程序会往网易云进程里加载自己的 DLL，行为特征和注入类木马相似，
   Windows Defender 有可能报 Behavior:Win32/DefenseEvasion.A!ml 并直接隔离。
-  这是误报。要用的话，把这两个文件加进排除项（需要管理员权限）：
+  这是误报。要用的话，把这三个文件加进排除项（需要管理员权限）：
 
     Add-MpPreference -ExclusionPath "\$env:LOCALAPPDATA\NexExclusive\NexExclusive.exe"
     Add-MpPreference -ExclusionPath "\$env:LOCALAPPDATA\NexExclusive\nexsink.dll"
+    Add-MpPreference -ExclusionPath "\$env:LOCALAPPDATA\NexExclusive\nexui.dll"
 
-  从解压目录直接运行的话，把那个目录下的同名两个文件也加上。
+  从解压目录直接运行的话，把那个目录下的同名三个文件也加上。
   不要排除整个目录——目录对当前用户可写，整体排除等于让放进去的任何文件都不再被扫描。
 
   不想加排除项就别用——别为了这个关掉实时保护。
@@ -156,11 +157,12 @@ cat > "$NOTES" <<EOF
 木马相似，Defender 的机器学习模型会判成 \`Behavior:Win32/DefenseEvasion.A!ml\`
 并直接隔离 exe（连带删掉快捷方式和自启项）。这是误报，但确实会挡住安装。
 
-要用的话需要给这两个文件加排除项（管理员权限）：
+要用的话需要给这三个文件加排除项（管理员权限）：
 
 \`\`\`powershell
 Add-MpPreference -ExclusionPath "\$env:LOCALAPPDATA\NexExclusive\NexExclusive.exe"
 Add-MpPreference -ExclusionPath "\$env:LOCALAPPDATA\NexExclusive\nexsink.dll"
+Add-MpPreference -ExclusionPath "\$env:LOCALAPPDATA\NexExclusive\nexui.dll"
 \`\`\`
 
 不要排除整个目录——目录对当前用户可写，整体排除会让放进去的任何文件都不再被扫描。
@@ -173,7 +175,7 @@ $NAME.zip    $SIZE KB
 sha256       $SHA
 \`\`\`
 
-包内：\`NexExclusive.exe\`、\`NexAudioHost.exe\`、\`nexsink.dll\`、\`hook.cfg\`、\`ui.json\`、\`ui/\`、\`manifest.txt\`、\`README.txt\`。
+包内：\`NexExclusive.exe\`、\`NexAudioHost.exe\`、\`nexsink.dll\`、\`nexui.dll\`、\`hook.cfg\`、\`ui.json\`、\`ui/\`、\`manifest.txt\`、\`README.txt\`。
 
 ## 验证环境
 

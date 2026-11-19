@@ -7,7 +7,8 @@
 - `NexExclusive.exe` 是常驻宿主，读取 `hook.cfg`，寻找 `cloudmusic.exe`，注入 `nexsink.dll`，提供 `127.0.0.1:9334` 配置接口，并在客户端重启后再次处理。
 - `nexsink.dll` 在网易云进程内挂接 `IMMDevice` 与 `IAudioClient`，负责客户端 PCM 获取、格式协商、转换、缓冲和端点迁移。
 - `NexAudioHost.exe` 是实验性的独立 WASAPI 端点进程。它读取共享 PCM 环、打开端点、提交设备缓冲并回写状态。
-- `ui/panel.js` 与 `ui/simplify.js` 由宿主通过网易云的 CDP 端口 `127.0.0.1:9333` 注入。界面链路与音频链路相互独立；面板消失不等于 DLL 没有加载。
+- `nexui.dll` 由宿主的界面线程注入主进程的每个子进程，只在渲染进程里动作：在网易云主页面里执行 `ui/panel.js` 与 `ui/simplify.js`，不需要 9333。它用命名事件 `Local\NexUI-Ready-<pid>`、`Local\NexUI-Unsupported-<pid>` 告诉宿主结果，日志写在 `nexui.log`。
+- 渲染进程报不支持、注入失败或 20 秒内未就绪时，宿主回退到 CDP 端口 `127.0.0.1:9333` 注入同样的脚本。同目录放一个 `nexui.disable` 文件可以强制走 CDP。界面链路与音频链路相互独立；面板消失不等于音频 DLL 没有加载。
 
 ## 唯一候选与安装目录
 
@@ -30,7 +31,7 @@ Get-Process NexExclusive,NexAudioHost,cloudmusic -ErrorAction SilentlyContinue |
 
 ## 启动 Pingyi 会话
 
-优先使用当前 Pingyi 桌面账户已经打开的网易云窗口。需要得到设置页时，由宿主启动带 `--remote-debugging-port=9333` 的客户端；普通资源管理器启动的实例常常没有 CDP 端口，音频 DLL 仍可能正常工作，但面板不会出现。
+优先使用当前 Pingyi 桌面账户已经打开的网易云窗口。设置页默认由 `nexui.dll` 在页面里加载，普通资源管理器启动、没有 CDP 端口的实例也会出现面板；宿主后启动时，面板要等页面下一次调用原生接口才出现，空闲页面可能要一分钟左右，操作一下界面会更快。宿主拉起客户端时仍带 `--remote-debugging-port=9333`，供回退使用。
 
 音频测试的最小顺序：
 
@@ -69,7 +70,8 @@ sink: hardware started ...
 
 | 现象 | 先看什么 |
 | --- | --- |
-| 没有“NexExclusive”入口 | `host.log` 是否有 `界面脚本已就位`；没有则检查 9333 和 CDP 页面目标 |
+| 没有“NexExclusive”入口 | `host.log` 的 `界面链路：` 行。`渲染进程就绪` 时看 `nexui.log` 有没有 `panel loaded`；`回退到 CDP` 时看括号里的原因，再检查 9333 和 CDP 页面目标 |
+| `nexui.log` 有 `unsupported` | 渲染进程挂接不可用（CEF 版本或结构体大小变了等），宿主会走 CDP；原因写在同一行 |
 | 有面板，没有 `sink ENGAGED` | 页面脚本已注入，但尚未出现新的音频初始化或播放调用 |
 | 有 `sink ENGAGED`，没有面板 | 音频 DLL 已工作，UI 注入链路单独失败 |
 | `OpenProcess` 错误 5 | 结束普通权限宿主，再让宿主与网易云处于同一完整性级别 |

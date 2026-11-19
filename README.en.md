@@ -92,7 +92,7 @@ The same settings live in `hook.cfg` as plain `key=value`; restart the client to
 
 When the client is not running, the host `NexExclusive.exe` starts it with `--remote-debugging-port=9333`, then loads `nexsink.dll` into the client process using `CreateRemoteThread` and `LoadLibraryA`. Inside the process the DLL hooks the `IMMDevice` and `IAudioClient` vtables: when the client negotiates its output format, the DLL answers with the device's real exclusive-mode capabilities, and buffering, resampling and the hand-over on changes also happen there.
 
-The host injects the settings panel into the client page through the local CDP port (9333). The panel talks to the host through a config endpoint on `127.0.0.1:9334`, which reads and writes `hook.cfg` and `ui.json`.
+The settings panel is loaded inside the client page by `nexui.dll`: the host injects it into the client's renderer child process, where it runs the panel scripts without a debugging port. When that hook is unavailable (for example after the client changes its CEF version), the host falls back to the local CDP port (9333) and injects the same scripts. The panel talks to the host through a config endpoint on `127.0.0.1:9334`, which reads and writes `hook.cfg` and `ui.json`. The audio DLL and the UI DLL do not depend on each other.
 
 While the program runs, ports 9333 and 9334 are open on the loopback address, and other processes on the same machine can reach them. All network traffic of the host stays on loopback, and the DLL itself contains no network code. The client's files are not modified.
 

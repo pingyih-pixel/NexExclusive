@@ -42,7 +42,7 @@
 /* 自带文件一律从 exe 所在目录推导。这里原来躺着 7 条写死的开发机绝对路径
    （<项目目录>\mod\...），换台机器就全失效——正是「别人拿到能编译、但跑
    不起来」的根因。所以发布包就是 OUT_DIR 本身，扁平结构：
-     NexExclusive.exe  nexsink.dll  hook.cfg  ui.json  ui\panel.js  ui\simplify.js
+     NexExclusive.exe  nexsink.dll  nexui.dll  hook.cfg  ui.json  ui\panel.js  ui\simplify.js
    客户端不归我们管，它的位置要探测，见 resolve_client()。 */
 extern IMAGE_DOS_HEADER __ImageBase;
 
@@ -2782,7 +2782,7 @@ static int stop_client_processes(void) {
 
 static void remove_install_tree(const wchar_t *dir) {
     static const wchar_t *files[] = {
-        L"NexExclusive.exe", L"NexAudioHost.exe", L"nexsink.dll", L"hook.cfg",
+        L"NexExclusive.exe", L"NexAudioHost.exe", L"nexsink.dll", L"nexui.dll", L"hook.cfg",
         L"ui.json", L"manifest.txt", L"ui\\panel.js", L"ui\\simplify.js"
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
@@ -2796,10 +2796,10 @@ static void remove_install_tree(const wchar_t *dir) {
 
 static int install_payload_atomic(const wchar_t *src, const wchar_t *dst) {
     static const wchar_t *base_files[] = {
-        L"NexExclusive.exe", L"NexAudioHost.exe", L"nexsink.dll", L"hook.cfg",
+        L"NexExclusive.exe", L"NexAudioHost.exe", L"nexsink.dll", L"nexui.dll", L"hook.cfg",
         L"ui.json", L"ui\\panel.js", L"ui\\simplify.js"
     };
-    const wchar_t *files[8];
+    const wchar_t *files[9];
     size_t count = sizeof(base_files) / sizeof(base_files[0]);
     for (size_t i = 0; i < count; i++) files[i] = base_files[i];
     WCHAR source_manifest[MAX_PATH];
@@ -2976,10 +2976,10 @@ static int do_uninstall(void) {
 
     /* 删文件。自己正在运行，删不掉，标记重启后删。 */
     static const wchar_t *files[] = {
-        L"nexsink.dll", L"NexAudioHost.exe", L"hook.cfg", L"ui.json", L"host.cfg",
+        L"nexsink.dll", L"nexui.dll", L"NexAudioHost.exe", L"hook.cfg", L"ui.json", L"host.cfg",
         L"manifest.txt",
         L"ui\\panel.js", L"ui\\simplify.js",
-        L"host.log", L"sink.log", L"sink.prev.log",
+        L"host.log", L"sink.log", L"sink.prev.log", L"nexui.log", L"nexui.prev.log",
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
         WCHAR p[MAX_PATH];

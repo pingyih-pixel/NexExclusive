@@ -126,3 +126,18 @@ console.log('PASS host contract: visible launch and injection hand-off');
   check(uiStart > 0 && uiBody.includes('kUiDll'), 'ui_thread must inject the UI module');
   check(!uiBody.includes('kSinkDll'), 'the UI thread must not touch the audio module');
 }
+
+/* nexui.dll ships, installs and uninstalls with the rest of the package. */
+{
+  const body = (name) => {
+    const at = source.indexOf(name);
+    return at < 0 ? '' : source.slice(at, at + source.slice(at).search(/\r?\n}\r?\n/));
+  };
+  check(body('static void remove_install_tree(').includes('L"nexui.dll"'), 'remove_install_tree must delete nexui.dll');
+  check(body('static int install_payload_atomic(').includes('L"nexui.dll"'), 'install must copy nexui.dll');
+  const uninstall = body('static int do_uninstall(');
+  check(uninstall.includes('L"nexui.dll"') && uninstall.includes('L"nexui.log"') && uninstall.includes('L"nexui.prev.log"'),
+    'uninstall must remove nexui.dll and its logs');
+  const release = fs.readFileSync(path.join(__dirname, '..', '..', 'release.sh'), 'utf8');
+  check(/^FILES=\(.*\bnexui\.dll\b.*\)$/m.test(release), 'release package must include nexui.dll');
+}
