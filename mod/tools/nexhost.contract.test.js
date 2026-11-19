@@ -143,3 +143,15 @@ console.log('PASS host contract: visible launch and injection hand-off');
   const release = fs.readFileSync(path.join(__dirname, '..', '..', 'release.sh'), 'utf8');
   check(/^FILES=\(.*\bnexui\.dll\b.*\)$/m.test(release), 'release package must include nexui.dll');
 }
+
+/* The host carries its own icon (tray, Explorer, shortcuts) instead of the
+   stock application icon, and falls back to it if the resource is missing. */
+{
+  const rc = fs.readFileSync(path.join(__dirname, 'nexhost.rc.in'), 'utf8');
+  const build = fs.readFileSync(path.join(__dirname, '..', 'build.sh'), 'utf8');
+  check(/ICON\s+"nexhost\.ico"/.test(rc), 'resource script must embed nexhost.ico');
+  check(fs.existsSync(path.join(__dirname, 'nexhost.ico')), 'nexhost.ico must be in the repository');
+  check(build.includes('nexhost.ico'), 'build.sh must stage nexhost.ico next to the resource script');
+  check(source.includes('MAKEINTRESOURCEW(IDI_NEXHOST)'), 'tray must load the embedded icon');
+  check(source.includes('MAKEINTRESOURCEW(32512)'), 'tray must fall back to the stock icon');
+}

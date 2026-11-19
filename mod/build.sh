@@ -114,6 +114,8 @@ build_host() {
     # 版本占位符两边都有（assemblyIdentity 的 version），只换一边会得到一个
     # version="@V1@..." 的清单，Windows 拒绝加载，报「并行配置不正确」。
     cp -- "$MOD_DIR/tools/nexhost.manifest" "$OUT_DIR/nexhost.manifest"
+    # 图标同理：rc 按相对路径找 nexhost.ico。
+    cp -- "$MOD_DIR/tools/nexhost.ico" "$OUT_DIR/nexhost.ico"
     sed -i -e "s/@V1@/$v1/g" -e "s/@V2@/$v2/g" -e "s/@V3@/$v3/g" "$OUT_DIR/nexhost.manifest"
     sed -e "s/@V1@/$v1/g" -e "s/@V2@/$v2/g" -e "s/@V3@/$v3/g" \
         "$MOD_DIR/tools/nexhost.rc.in" > "$rc"
@@ -123,7 +125,7 @@ build_host() {
         -o "$OUT_DIR/NexExclusive.exe" "$MOD_DIR/tools/nexhost.c" "$res" \
         -lws2_32 -lole32 -loleaut32 -ladvapi32 -lshell32 -luser32 -lgdi32 \
         -lversion -lcomdlg32 -lbcrypt
-    rm -f -- "$rc" "$res" "$OUT_DIR/nexhost.manifest"
+    rm -f -- "$rc" "$res" "$OUT_DIR/nexhost.manifest" "$OUT_DIR/nexhost.ico"
     # 配置只在缺失时复制——用户可能改过；界面脚本是代码，每次都覆盖。
     local f
     for f in hook.cfg ui.json; do

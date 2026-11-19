@@ -271,6 +271,16 @@ static void test_cfg_round_trip(void) {
     printf("PASS cfg round trip: hook.cfg written by the panel API reads back unchanged\n");
 }
 
+/* Versions with end-to-end evidence (audio, panel, nexui) are not logged as
+   "unverified, injection may fail". */
+static void test_verified_client_versions(void) {
+    CHECK(client_version_known(L"3.1.42.205594"));
+    CHECK(client_version_known(L"3.1.43.205627"));
+    CHECK(!client_version_known(L"3.1.44.1"));
+    CHECK(!client_version_known(L""));
+    printf("PASS client versions: 3.1.42.205594 and 3.1.43.205627 are verified\n");
+}
+
 int main(void) {
     test_find_child_pids();
     test_ui_event_exists();
@@ -287,6 +297,7 @@ int main(void) {
     test_cfg_defaults_match_policy();
     test_cfg_sanitize();
     test_cfg_round_trip();
+    test_verified_client_versions();
     printf("%s: %d failure(s)\n", g_fail ? "FAILED" : "ALL TESTS PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

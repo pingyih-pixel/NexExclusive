@@ -43,3 +43,7 @@ END
 
 /* 清单：asInvoker + per-monitor DPI + 公共控件 v6。 */
 1 24 "nexhost.manifest"
+
+/* 图标：托盘、资源管理器与快捷方式共用。第一个 ICON 资源就是 exe 的文件图标。
+   由 mod/tools/make_icon.py 生成；nexhost.c 里的 IDI_NEXHOST 与这里的 100 对应。 */
+100 ICON "nexhost.ico"

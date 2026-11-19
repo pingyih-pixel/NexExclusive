@@ -3146,7 +3146,14 @@ static int do_uninstall(void) {
    「这个版本我们没验过」，而不是让用户对着「没效果」自己猜。 */
 static const wchar_t *kVerified[] = {
     L"3.1.42.205594",
+    L"3.1.43.205627",   /* 2026-11-19/20: exclusive output, nexui panel, 6c, PCM capture */
 };
+static int client_version_known(const wchar_t *ver) {
+    if (!ver || !ver[0]) return 0;
+    for (size_t i = 0; i < sizeof(kVerified) / sizeof(kVerified[0]); i++)
+        if (_wcsicmp(ver, kVerified[i]) == 0) return 1;
+    return 0;
+}
 static void client_version(wchar_t *out, size_t n) {
     out[0] = 0;
     DWORD dummy = 0;
@@ -3190,9 +3197,7 @@ static void check_client_version(void) {
     WCHAR ver[64];
     client_version(ver, 64);
     if (!ver[0]) { host_log("客户端版本读取失败，按未知处理"); return; }
-    int known = 0;
-    for (size_t i = 0; i < sizeof(kVerified) / sizeof(kVerified[0]); i++)
-        if (_wcsicmp(ver, kVerified[i]) == 0) known = 1;
+    int known = client_version_known(ver);
     char v8[64];
     WideCharToMultiByte(CP_ACP, 0, ver, -1, v8, sizeof(v8), NULL, NULL);
     if (known) host_log("客户端版本 %s（已验证）", v8);
@@ -3341,6 +3346,8 @@ static void watchdog_tick(void) {
     }
 }
 
+#define IDI_NEXHOST 100   /* nexhost.rc.in: 100 ICON "nexhost.ico" */
+
 static void tray_add(HWND hwnd) {
     memset(&g_nid, 0, sizeof(g_nid));
     g_nid.cbSize = sizeof(g_nid);
@@ -3348,9 +3355,13 @@ static void tray_add(HWND hwnd) {
     g_nid.uID = TRAY_ID;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY_EVENT;
-    /* IDI_APPLICATION 在非 UNICODE 编译下展开成 MAKEINTRESOURCEA，给 LoadIconW
+    /* 自带图标按托盘尺寸加载；资源缺失（例如测试用的裸编译）时退回系统默认图标。
+       IDI_APPLICATION 在非 UNICODE 编译下展开成 MAKEINTRESOURCEA，给 LoadIconW
        会报指针类型不匹配，所以直接写宽版本 */
-    g_nid.hIcon = LoadIconW(NULL, MAKEINTRESOURCEW(32512));
+    g_nid.hIcon = (HICON)LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_NEXHOST),
+                                    IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                    GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+    if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(NULL, MAKEINTRESOURCEW(32512));
     wcsncpy(g_nid.szTip, L"NexExclusive — WASAPI 独占播放", 127);
     g_nid.szTip[127] = 0;
     g_tray_up = Shell_NotifyIconW(NIM_ADD, &g_nid) != FALSE;

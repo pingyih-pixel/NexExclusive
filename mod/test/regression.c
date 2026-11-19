@@ -2205,16 +2205,77 @@ static void test_drain_window_count(void) {
     printf("PASS drain stats: empty-buffer is reported per window, with the running total beside it\n");
 }
 
+/* ---- ROADMAP 4: multichannel layouts keep every channel in its place -------- */
+static void test_multichannel_conversion_keeps_channels(void) {
+    const int chans[] = {6, 8};
+    for (int k = 0; k < 2; k++) {
+        const int ch = chans[k];
+        short src[8 * 4];
+        BYTE dst[8 * 4 * 3];
+        memset(&g_sink, 0, sizeof(g_sink));
+        g_sink.in_channels = ch;
+        g_sink.in_container_bits = 16;
+        g_sink.in_valid_bits = 16;
+        g_sink.out_container_bits = 24;
+        g_sink.out_valid_bits = 24;
+        g_sink.out_bits = 24;
+        for (int f = 0; f < 4; f++)
+            for (int c = 0; c < ch; c++) src[f * ch + c] = (short)(1000 * (c + 1) + f);
+        convert((const BYTE *)src, dst, 4);
+        for (int f = 0; f < 4; f++)
+            for (int c = 0; c < ch; c++) {
+                const BYTE *p = dst + ((size_t)f * ch + c) * 3;
+                int v = p[0] | (p[1] << 8) | (p[2] << 16);
+                if (v & 0x800000) v |= ~0xFFFFFF;
+                CHECK(v == src[f * ch + c] * 256);
+            }
+    }
+    memset(&g_sink, 0, sizeof(g_sink));
+    printf("PASS multichannel conversion: 5.1 and 7.1 samples stay on their channels\n");
+}
+
+/* Each channel carries a different level through the resampler; any channel
+   interleaving error shows up as a level landing on the wrong channel. */
+static void test_multichannel_resample_keeps_channels(void) {
+    const int ch = 8, in_rate = 96000, out_rate = 48000, in_frames = 9600;
+    double *in = (double *)calloc((size_t)in_frames * ch, sizeof(double));
+    double *out = (double *)calloc((size_t)in_frames * ch, sizeof(double));
+    int out_n = 0, ready;
+    CHECK(in && out);
+    if (!in || !out) { free(in); free(out); return; }
+    CHECK(src_init(in_rate, out_rate, ch));
+    for (int f = 0; f < in_frames; f++)
+        for (int c = 0; c < ch; c++) in[(size_t)f * ch + c] = 0.1 * (c + 1);
+    CHECK(src_push(in, in_frames, ch) == in_frames);
+    while ((ready = src_ready(ch)) > 0 && out_n + ready <= in_frames) {
+        src_pull(out + (size_t)out_n * ch, ready, ch);
+        out_n += ready;
+    }
+    CHECK(out_n > 2000);
+    if (out_n > 2000) {
+        const double *last = out + (size_t)(out_n - 1) * ch;
+        for (int c = 0; c < ch; c++) CHECK(fabs(last[c] - 0.1 * (c + 1)) < 1e-6);
+    }
+    src_free();
+    free(in); free(out);
+    printf("PASS multichannel resample: 8 channels at different levels stay separate (96k->48k)\n");
+}
+
 static void test_src_response(void) {
     static const struct { int in, out; const char *name; } ratios[] = {
         {44100, 48000, "44.1k->48k"},
         {48000, 44100, "48k->44.1k"},
         {88200, 96000, "88.2k->96k"},
         {192000, 96000, "192k->96k"},
+        /* ROADMAP 4: the top of the candidate pool, never measured on a device */
+        {384000, 96000, "384k->96k"},
+        {352800, 88200, "352.8k->88.2k"},
+        {352800, 96000, "352.8k->96k"},
     };
+    const int nratios = (int)(sizeof(ratios) / sizeof(ratios[0]));
     printf("SRC passband / stopband (dB, 0 = unity)\n");
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < nratios; i++) {
         const int in = ratios[i].in, out = ratios[i].out;
         const double cut = out < in ? (double)out / (double)in : 1.0;
 
@@ -2417,6 +2478,8 @@ int main(void) {
     test_float_pipeline_keeps_32_bit_precision();
     test_auto_dither_keeps_exact_samples();
     test_drain_window_count();
+    test_multichannel_conversion_keeps_channels();
+    test_multichannel_resample_keeps_channels();
     test_drain_thread_registers_mmcss();
     test_negotiate_busy_is_not_remembered();
     test_config_values_are_normalized_by_policy();
