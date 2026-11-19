@@ -75,6 +75,16 @@ static void dump_frames(const BYTE *p, UINT32 frames) {
    buffer seen here means the drain thread arrived after the device had already
    run out. */
 static UINT32 g_writes, g_starve, g_max_gap;
+static UINT32 g_starve_reported;   /* g_starve at the previous report */
+
+/* The underrun counter runs for the life of the drain thread; the periodic
+   report shows how many happened in that window, with the total beside it,
+   so one old underrun is not read as a new one every ten seconds. */
+static UINT32 drain_window_count(UINT32 total, UINT32 *reported) {
+    UINT32 window = total - *reported;
+    *reported = total;
+    return window;
+}
 static DWORD  g_last_write, g_last_report;
 static UINT64 g_last_submit_qpc, g_max_gap_qpc;
 
@@ -264,11 +274,12 @@ static HRESULT drain_once(SinkGen *g) {
                 state = nex_audio_state_name(remote_state());
             }
             QueryPerformanceFrequency(&qpc_freq);
-            log_line("drain: gen=%llu writes=%lu empty-buffer=%lu max gap=%lu ms "
+            UINT32 starve_window = drain_window_count(g_starve, &g_starve_reported);
+            log_line("drain: gen=%llu writes=%lu empty-buffer=%lu (total %lu) max gap=%lu ms "
                      "max_gap_qpc=%llu qpc_hz=%llu ring_used=%llu padding=%lu "
                      "backpressure=%llu state=%s",
                      (unsigned long long)g->id,
-                     (unsigned long)g_writes,(unsigned long)g_starve,
+                     (unsigned long)g_writes,(unsigned long)starve_window,(unsigned long)g_starve,
                      (unsigned long)g_max_gap,
                      (unsigned long long)g_max_gap_qpc,
                      (unsigned long long)qpc_freq.QuadPart,
@@ -336,6 +347,7 @@ static DWORD WINAPI drain_thread(LPVOID param) {
     g_max_gap_qpc = 0;
     g_writes = 0;
     g_starve = 0;
+    g_starve_reported = 0;
     while(g->running && !g->retired) {
         HRESULT hr=drain_once(g);
         if(g->retired) break;

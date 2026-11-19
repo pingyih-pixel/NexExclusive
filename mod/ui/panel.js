@@ -465,6 +465,23 @@
       launcher.setAttribute('aria-expanded', value);
     }
     if (open) syncSourcePlayId();
+    if (open) reloadConfigIfClean();
+  }
+
+  /* hook.cfg can change outside this page (a hand edit, another client
+     window). Re-read it when the settings window opens, but never over
+     changes the user has not saved yet. */
+  function reloadConfigIfClean() {
+    if (pendingConfig || saveInFlight) return;
+    fetch(API, { method: 'GET' })
+      .then(function (response) { return response.ok ? response.json() : Promise.reject(response.status); })
+      .then(function (cfg) {
+        if (pendingConfig || saveInFlight) return;
+        state = Object.assign({}, DEFAULTS, cfg);
+        setBadge(true);
+        renderCurrentPanel();
+      })
+      .catch(function () {});
   }
 
   function makeModuleDraggable(module) {

@@ -2196,6 +2196,15 @@ static void test_auto_dither_keeps_exact_samples(void) {
     printf("PASS auto dither: exact samples pass unchanged, real fractional content is dithered\n");
 }
 
+/* ---- 6b: underruns per report window ---------------------------------------- */
+static void test_drain_window_count(void) {
+    UINT32 reported = 0;
+    CHECK(drain_window_count(5, &reported) == 5 && reported == 5);
+    CHECK(drain_window_count(5, &reported) == 0 && reported == 5);
+    CHECK(drain_window_count(7, &reported) == 2 && reported == 7);
+    printf("PASS drain stats: empty-buffer is reported per window, with the running total beside it\n");
+}
+
 static void test_src_response(void) {
     static const struct { int in, out; const char *name; } ratios[] = {
         {44100, 48000, "44.1k->48k"},
@@ -2407,6 +2416,7 @@ int main(void) {
     test_dither_policy();
     test_float_pipeline_keeps_32_bit_precision();
     test_auto_dither_keeps_exact_samples();
+    test_drain_window_count();
     test_drain_thread_registers_mmcss();
     test_negotiate_busy_is_not_remembered();
     test_config_values_are_normalized_by_policy();

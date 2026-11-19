@@ -352,8 +352,24 @@ static void source_uppercase(char *out, size_t n, const char *format) {
 static const char *kCfgKeys[] = {"enable","bits","rate","buffer","compat","dither","fade_ms","shared_fallback","src_prefer","hifi","audiohost"};
 #define CFG_N ((int)(sizeof(kCfgKeys)/sizeof(kCfgKeys[0])))
 
+/* Same defaults as nex_audio_policy_config_defaults(): bits=0 follows the
+   source and the opening fade is off, so a hook.cfg without those keys shows
+   the panel what the audio module will actually do. */
 static void cfg_defaults(int *v) {
-    v[0]=1; v[1]=24; v[2]=0; v[3]=0; v[4]=1; v[5]=2; v[6]=5; v[7]=0; v[8]=0; v[9]=0; v[10]=0;
+    v[0]=1; v[1]=0; v[2]=0; v[3]=0; v[4]=1; v[5]=2; v[6]=0; v[7]=0; v[8]=0; v[9]=0; v[10]=0;
+}
+
+/* Values posted by the panel that the audio module would reject fall back to
+   the defaults here, so hook.cfg never holds something the panel cannot show. */
+static void cfg_sanitize(int *v) {
+    int d[CFG_N];
+    cfg_defaults(d);
+    if (v[1] != 0 && v[1] != 16 && v[1] != 24 && v[1] != 32) v[1] = d[1];
+    if (v[5] < 0 || v[5] > 2) v[5] = d[5];
+    if (v[6] < 0 || v[6] > 100) v[6] = d[6];
+    if (v[8] != 0 && v[8] != 1) v[8] = d[8];
+    if (v[9] != 0 && v[9] != 1) v[9] = d[9];
+    if (v[10] != 0 && v[10] != 1) v[10] = d[10];
 }
 
 static void cfg_read(int *v) {
@@ -2528,12 +2544,7 @@ static DWORD WINAPI http_thread(LPVOID unused) {
             int v[CFG_N];
             cfg_read(v);
             for (int i = 0; i < CFG_N; i++) json_get_int(body_buf, kCfgKeys[i], &v[i]);
-            if (v[1] != 0 && v[1] != 16 && v[1] != 24 && v[1] != 32) v[1] = 0;
-            if (v[5] < 0 || v[5] > 2) v[5] = 2;
-            if (v[6] < 0 || v[6] > 100) v[6] = 0;
-            if (v[8] != 0 && v[8] != 1) v[8] = 0;
-            if (v[9] != 0 && v[9] != 1) v[9] = 0;
-            if (v[10] != 0 && v[10] != 1) v[10] = 0;
+            cfg_sanitize(v);
             if (!cfg_write(v)) http_reply(c, 500, "{\"error\":\"config write failed\"}");
             else {
                 cfg_to_json(v, out, sizeof(out));

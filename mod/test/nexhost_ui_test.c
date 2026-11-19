@@ -219,6 +219,58 @@ static void test_inject_outcome(void) {
     printf("PASS inject outcome: a timeout is not success and keeps the path buffer\n");
 }
 
+/* ---- panel <-> hook.cfg ----------------------------------------------------- */
+static void test_cfg_defaults_match_policy(void) {
+    int v[CFG_N];
+    cfg_defaults(v);
+    CHECK(v[1] == 0);   /* bits: follow the source */
+    CHECK(v[6] == 0);   /* fade_ms: off */
+    CHECK(v[5] == 2 && v[4] == 1 && v[9] == 0 && v[10] == 0);
+    printf("PASS cfg defaults match the audio policy defaults\n");
+}
+
+static void test_cfg_sanitize(void) {
+    int v[CFG_N];
+    cfg_defaults(v);
+    v[1] = 20; v[5] = 7; v[6] = 500; v[8] = 3; v[9] = 5; v[10] = 2;
+    cfg_sanitize(v);
+    CHECK(v[1] == 0 && v[5] == 2 && v[6] == 0 && v[8] == 0 && v[9] == 0 && v[10] == 0);
+    v[1] = 16; v[6] = 10;
+    cfg_sanitize(v);
+    CHECK(v[1] == 16 && v[6] == 10);
+    v[1] = 0;
+    cfg_sanitize(v);
+    CHECK(v[1] == 0);
+    printf("PASS cfg sanitize: out-of-range panel values fall back to the defaults\n");
+}
+
+static void test_cfg_round_trip(void) {
+    char temp[MAX_PATH], saved[MAX_PATH];
+    int w[CFG_N] = {1, 0, 96000, 1024, 1, 2, 0, 0, 1, 0, 0};
+    int r[CFG_N];
+    FILE *f;
+    GetTempPathA(MAX_PATH, temp);
+    snprintf(saved, sizeof(saved), "%s", kHookCfg);
+    snprintf(kHookCfg, sizeof(kHookCfg), "%sNexExclusive-cfg-%lu.cfg", temp,
+             (unsigned long)GetCurrentProcessId());
+    CHECK(cfg_write(w));
+    cfg_read(r);
+    CHECK(memcmp(w, r, sizeof(w)) == 0);
+    {
+        char *text = read_file(kHookCfg);
+        CHECK(text && strstr(text, "src_prefer=simplicity") && strstr(text, "bits=0"));
+        free(text);
+    }
+    /* a hand-edited file with only some keys: the rest are the defaults */
+    f = fopen(kHookCfg, "wb");
+    if (f) { fputs("bits=16\r\nrate=44100\r\n", f); fclose(f); }
+    cfg_read(r);
+    CHECK(r[1] == 16 && r[2] == 44100 && r[6] == 0 && r[5] == 2);
+    DeleteFileA(kHookCfg);
+    snprintf(kHookCfg, sizeof(kHookCfg), "%s", saved);
+    printf("PASS cfg round trip: hook.cfg written by the panel API reads back unchanged\n");
+}
+
 int main(void) {
     test_find_child_pids();
     test_ui_event_exists();
@@ -232,6 +284,9 @@ int main(void) {
     test_route_reason_codes();
     test_cdp_unavailable_hint_for_timeout();
     test_inject_outcome();
+    test_cfg_defaults_match_policy();
+    test_cfg_sanitize();
+    test_cfg_round_trip();
     printf("%s: %d failure(s)\n", g_fail ? "FAILED" : "ALL TESTS PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

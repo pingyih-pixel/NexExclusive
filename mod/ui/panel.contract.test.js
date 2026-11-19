@@ -250,3 +250,8 @@ check(source.includes('repacked'), 'panel must recognise the [repacked] path tag
 check(source.includes('+fade'), 'panel must recognise a +fade path tag');
 check(source.includes('开头淡入会改动'), 'panel must say that the opening fade changes samples');
 check(/bits:\s*0,/.test(source) && /fade_ms:\s*0,/.test(source), 'panel defaults must be bits=0 and fade_ms=0');
+
+/* Two-way sync: opening the settings window re-reads hook.cfg unless the
+   user has unsaved changes, so an edit made outside the panel shows up. */
+check(source.includes('function reloadConfigIfClean'), 'panel must be able to re-read hook.cfg');
+check(/if \(open\)[^;]*reloadConfigIfClean\(\)/.test(source), 'opening the settings window must re-read hook.cfg');
