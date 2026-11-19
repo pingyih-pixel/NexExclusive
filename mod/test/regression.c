@@ -2147,6 +2147,55 @@ static void test_drain_thread_registers_mmcss(void) {
     printf("PASS drain thread: MMCSS %s task\n", task ? task : "(none)");
 }
 
+/* ---- auto dither leaves samples that are already exact alone --------------- */
+/* A 32-bit client stream that only carries 24 bits of data reduces to 24 bits
+   without loss. Auto dither must not add noise to it; forced dither still does. */
+static void test_auto_dither_keeps_exact_samples(void) {
+    BYTE a[3], b[3];
+    const double exact = (double)0x123456 / 8388608.0;
+    int forced_moved = 0, auto_moved = 0;
+    for (int i = 0; i < 64; i++) {
+        sample_write(exact, a, 24, 24, 0, SINK_DITHER_AUTO);
+        CHECK(a[0] == 0x56 && a[1] == 0x34 && a[2] == 0x12);
+        sample_write(exact, b, 24, 24, 0, SINK_DITHER_FORCED);
+        if (b[0] != 0x56 || b[1] != 0x34 || b[2] != 0x12) forced_moved = 1;
+    }
+    CHECK(forced_moved);
+
+    memset(&g_sink, 0, sizeof(g_sink));
+    g_sink.in_channels = 2;
+    g_sink.in_container_bits = 32;
+    g_sink.in_valid_bits = 32;
+    g_sink.out_container_bits = 24;
+    g_sink.out_valid_bits = 24;
+    g_sink.out_bits = 24;
+    g_sink.dither = SINK_DITHER_AUTO;
+    {
+        const int src[8] = {0x12345600, -0x76543200, 0x7FFFFF00, (int)0x80000000,
+                            0x00000100, -0x00000100, 0x40000000, 0};
+        BYTE dst[8 * 3];
+        convert((const BYTE *)src, dst, 4);
+        for (int i = 0; i < 8; i++) {
+            int v = dst[i * 3] | (dst[i * 3 + 1] << 8) | (dst[i * 3 + 2] << 16);
+            if (v & 0x800000) v |= ~0xFFFFFF;
+            CHECK(v == (src[i] >> 8));
+        }
+    }
+    {
+        /* real 32-bit content: half an output LSB below the grid -> dithered */
+        const int src[2] = {0x12345680, 0x12345680};
+        BYTE first[6], dst[6];
+        convert((const BYTE *)src, first, 1);
+        for (int i = 0; i < 64 && !auto_moved; i++) {
+            convert((const BYTE *)src, dst, 1);
+            if (memcmp(first, dst, sizeof(dst)) != 0) auto_moved = 1;
+        }
+        CHECK(auto_moved);
+    }
+    memset(&g_sink, 0, sizeof(g_sink));
+    printf("PASS auto dither: exact samples pass unchanged, real fractional content is dithered\n");
+}
+
 static void test_src_response(void) {
     static const struct { int in, out; const char *name; } ratios[] = {
         {44100, 48000, "44.1k->48k"},
@@ -2357,6 +2406,7 @@ int main(void) {
     test_src_prefer_order();
     test_dither_policy();
     test_float_pipeline_keeps_32_bit_precision();
+    test_auto_dither_keeps_exact_samples();
     test_drain_thread_registers_mmcss();
     test_negotiate_busy_is_not_remembered();
     test_config_values_are_normalized_by_policy();

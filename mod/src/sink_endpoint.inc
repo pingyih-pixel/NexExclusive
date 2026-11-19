@@ -407,6 +407,14 @@ static HANDLE acquire_endpoint_gate(IMMDevice *dev, HRESULT *why) {
    released. */
 static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound);
 
+/* 0 = off, SINK_DITHER_FORCED, or SINK_DITHER_AUTO (skips exact samples). */
+static int sink_dither_mode(int in_float, int in_valid, int out_float, int out_valid,
+                            int mode, int fade_ms) {
+    if (!nex_audio_policy_dither_selected(in_float, in_valid, out_float, out_valid, mode, fade_ms))
+        return 0;
+    return mode == 1 ? SINK_DITHER_FORCED : SINK_DITHER_AUTO;
+}
+
 /* Move the live stream to whatever is now the default output (device removed). */
 static HRESULT sink_retarget(const char *reason) {
     return sink_retarget_endpoint(reason, 0);
@@ -495,7 +503,7 @@ static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
 
     /* Same rule as the first engage: depth reduction only, and only when the
        integer-domain opening ramp is off (see the note in sink_engage). */
-    g_sink.dither = nex_audio_policy_dither_selected(g_sink.in_is_float, g_sink.in_valid_bits,
+    g_sink.dither = sink_dither_mode(g_sink.in_is_float, g_sink.in_valid_bits,
                                     fl, valid, g_dither, g_fade_ms);
 
     /* The resampler is rebuilt from scratch: its history belongs to the old
@@ -703,7 +711,7 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
        noise is multiplied by the ramp and stops being triangular for the first
        few milliseconds. Moving the ramp into the float path ahead of quantise
        would let this condition drop; until then the config decides. */
-    g_sink.dither = nex_audio_policy_dither_selected(g_sink.in_is_float, g_sink.in_valid_bits,
+    g_sink.dither = sink_dither_mode(g_sink.in_is_float, g_sink.in_valid_bits,
                                     used_float, used_bits, g_dither, g_fade_ms);
 
     if (g_sink.resample &&

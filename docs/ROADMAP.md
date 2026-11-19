@@ -123,9 +123,9 @@ AudioQuest DragonFly MM3A（额外支持 88.2）。
 
 **范围**：新旧音频 DLL 都有。旧版日志中同格式交接 619 次，出现 8 次 `Start -> no device generation`；新版实测 5 首里出现 1 次。相关代码在 `mod/src/sink_lifecycle.inc`（放弃一代的分支）与 `mod/src/sink_hooks.inc`（`Start` 无代可用时的处理），AudioPolicy 与 nexui 的改动没有涉及。`mod/test/regression.c` 的生命周期压力测试偶发失败（1811、1814 行，约十次一次），可能是同一处竞态。
 
-- [ ] 用回归测试复现：同格式交接后 `Stop` 时输出线程卡在 `GetBuffer`，再 `Start`
-- [ ] 放弃一代之后，`Start` 能重建输出，而不是返回 `no device generation`
-- [ ] 查清并消除生命周期压力测试的偶发失败
+- [x] 用回归测试复现：同格式交接后 `Stop` 时输出线程卡在 `GetBuffer`，再 `Start`
+- [x] 放弃一代之后，`Start` 能重建输出，而不是返回 `no device generation`（同时放弃期间时钟保持最后位置）
+- [x] 查清并消除生命周期压力测试的偶发失败（同一缺陷；负载下 120 次、串行 50 次全部通过）
 
 **验收**：连续切换同格式歌曲 50 次以上，没有无声段；压力测试连续运行 50 次全部通过。
 

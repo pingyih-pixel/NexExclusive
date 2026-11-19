@@ -91,12 +91,18 @@ static double sample_read(const BYTE *p, int container, int valid, int is_float)
     if (valid < 32) x >>= (32 - valid);
     return (double)x / ldexp(1.0, valid - 1);
 }
+#define SINK_DITHER_FORCED 1   /* dither=1: every sample */
+#define SINK_DITHER_AUTO   2   /* dither=2: only samples that are not already exact */
 static void sample_write(double v, BYTE *p, int container, int valid, int is_float, int dither) {
     if (!isfinite(v)) v = 0.0;
     if (is_float) { float f = (float)v; memcpy(p,&f,4); return; }
     double scale = ldexp(1.0,valid-1);
     v *= scale;
-    if (dither) v += rnd01()-rnd01();
+    /* Auto dither only where the value falls between output steps: a 32-bit
+       stream that carries 24 bits of data, or float carrying 16/24-bit data,
+       lands exactly on the grid and is reduced without loss. */
+    if (dither == SINK_DITHER_FORCED || (dither == SINK_DITHER_AUTO && v != floor(v)))
+        v += rnd01()-rnd01();
     if (v > scale-1) v = scale-1;
     if (v < -scale) v = -scale;
     INT64 q = (INT64)llrint(v);
