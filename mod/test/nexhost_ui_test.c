@@ -89,12 +89,22 @@ static void test_route_input_from_tracker(void) {
     printf("PASS route input: timing, ready event and failure count reach the route rule\n");
 }
 
+/* The CDP route can last for the whole client session (nexui.disable, an
+   unsupported CEF): only WAIT deserves the fast cadence. */
+static void test_poll_interval_backs_off_outside_wait(void) {
+    CHECK(ui_poll_interval_ms(NEX_UI_ROUTE_WAIT) == 100);
+    CHECK(ui_poll_interval_ms(NEX_UI_ROUTE_CDP) == 1000);
+    CHECK(ui_poll_interval_ms(NEX_UI_ROUTE_RENDERER) == 1000);
+    printf("PASS ui_thread polls fast only while waiting\n");
+}
+
 int main(void) {
     test_find_child_pids();
     test_ui_event_exists();
     test_ui_tracker_resets_on_new_main_pid();
     test_ui_child_already_loaded_is_not_reinjected();
     test_route_input_from_tracker();
+    test_poll_interval_backs_off_outside_wait();
     printf("%s: %d failure(s)\n", g_fail ? "FAILED" : "ALL TESTS PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

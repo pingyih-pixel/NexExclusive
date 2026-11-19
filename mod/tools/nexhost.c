@@ -1844,6 +1844,13 @@ static const char *ui_route_reason(const NexUiRouteInput *in) {
 
 static volatile LONG g_ui_route = NEX_UI_ROUTE_WAIT;
 
+/* Fast only while waiting for a renderer: a CDP route can last the whole
+   client session (nexui.disable, an unsupported CEF), and 1 s is still quick
+   enough to notice a renderer that becomes ready late. */
+static DWORD ui_poll_interval_ms(int route) {
+    return route == NEX_UI_ROUTE_WAIT ? 100 : 1000;
+}
+
 static DWORD WINAPI ui_thread(LPVOID unused) {
     static UiTracker tracker;
     int last_route = -1;
@@ -1886,7 +1893,7 @@ static DWORD WINAPI ui_thread(LPVOID unused) {
             last_route = route;
         }
         InterlockedExchange(&g_ui_route, route);
-        Sleep(route == NEX_UI_ROUTE_RENDERER ? 1000 : 100);
+        Sleep(ui_poll_interval_ms(route));
     }
     return 0;
 }

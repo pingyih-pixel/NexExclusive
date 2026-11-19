@@ -118,6 +118,67 @@ static void test_dll_inert_outside_renderer(const char *dll_path) {
     printf("PASS nexui.dll stays inert outside a renderer process\n");
 }
 
+/* ---- final-review fixes --------------------------------------------------- */
+/* A long route used to fail the whole conversion and yield "", so the document
+   was skipped and the host, seeing Ready, never fell back. */
+static void test_long_url_keeps_its_prefix(void) {
+    static wchar_t url[2100];
+    char out[300];
+    int i;
+    wcscpy(url, L"orpheus://orpheus/pub/app.html#/m/search/?s=");
+    for (i = (int)wcslen(url); i < 2000; i++) url[i] = (i & 1) ? 0x4E2D : L'%';
+    url[2000] = 0;
+    nexui_utf8_prefix(url, wcslen(url), out, (int)sizeof(out));
+    CHECK(strncmp(out, "orpheus://orpheus/pub/app.html", 30) == 0);
+    CHECK(strlen(out) < sizeof(out));
+    CHECK(nexui_should_inject(1, out, 0));
+    nexui_utf8_prefix(L"orpheus://x", 11, out, (int)sizeof(out));
+    CHECK(strcmp(out, "orpheus://x") == 0);
+    /* a surrogate pair is never split at the cut */
+    {
+        wchar_t pair[200];
+        char small[8];
+        for (i = 0; i < 198; i += 2) { pair[i] = 0xD83C; pair[i + 1] = 0xDFB5; }
+        pair[198] = 0;
+        nexui_utf8_prefix(pair, 198, small, (int)sizeof(small));
+        CHECK(strlen(small) % 4 == 0);
+    }
+    nexui_utf8_prefix(NULL, 0, out, (int)sizeof(out));
+    CHECK(out[0] == 0);
+    printf("PASS long URLs and messages are truncated, not dropped\n");
+}
+
+/* An empty panel.js evaluated without error and held Ready with no panel. */
+static void test_empty_script_is_not_usable(void) {
+    size_t n = 99;
+    wchar_t *w;
+    CHECK(nexui_decode_script("", 0, &n) == NULL);
+    CHECK(nexui_decode_script("\xEF\xBB\xBF", 3, &n) == NULL);
+    CHECK(nexui_decode_script(" \r\n\t", 4, &n) == NULL);
+    w = nexui_decode_script("\xEF\xBB\xBF" "var a=1;", 11, &n);
+    CHECK(w && n == 8 && wcscmp(w, L"var a=1;") == 0);
+    free(w);
+    printf("PASS empty or blank scripts are unreadable, BOM stripped\n");
+}
+
+/* Only CEF 91 is trusted: equal struct sizes do not prove equal member order. */
+static void test_cef_version_gate(void) {
+    CHECK(nexui_cef_version_ok(91));
+    CHECK(!nexui_cef_version_ok(90));
+    CHECK(!nexui_cef_version_ok(92));
+    CHECK(!nexui_cef_version_ok(0));
+    printf("PASS CEF version gate accepts 91 only\n");
+}
+
+/* on_hook always calls cef_v8context_get_current_context; without it, no hook. */
+static void test_hooks_need_current_context(void) {
+    CHECK(nexui_hooks_usable(1, 5));
+    CHECK(nexui_hooks_usable(1, 1));
+    CHECK(!nexui_hooks_usable(0, 4));
+    CHECK(!nexui_hooks_usable(1, 0));
+    printf("PASS hooks are installed only when get_current_context resolved\n");
+}
+
 int main(int argc, char **argv) {
     test_event_names();
     test_route_rules();
@@ -125,6 +186,10 @@ int main(int argc, char **argv) {
     test_renderer_detection();
     test_layout_and_target();
     test_iat_patch_own_import();
+    test_long_url_keeps_its_prefix();
+    test_empty_script_is_not_usable();
+    test_cef_version_gate();
+    test_hooks_need_current_context();
     if (argc > 1) {
         test_dll_inert_outside_renderer(argv[1]);
     } else {

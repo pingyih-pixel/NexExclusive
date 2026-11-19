@@ -66,8 +66,7 @@ static void rotate_log(void) {
 }
 
 static void narrow(const wchar_t *w, size_t len, char *out, int outn) {
-    int n = w ? WideCharToMultiByte(CP_UTF8, 0, w, (int)len, out, outn - 1, NULL, NULL) : 0;
-    out[n > 0 ? n : 0] = 0;
+    nexui_utf8_prefix(w, len, out, outn);
 }
 
 /* ---- events --------------------------------------------------------------- */
@@ -98,8 +97,6 @@ static int load_script(Script *s, const wchar_t *rel) {
     HANDLE h;
     DWORD size, got = 0;
     char *bytes;
-    const char *start;
-    int wlen;
     _snwprintf(path, MAX_PATH, L"%ls%ls", g_dir, rel);
     path[MAX_PATH - 1] = 0;
     h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -112,19 +109,9 @@ static int load_script(Script *s, const wchar_t *rel) {
         return 0;
     }
     CloseHandle(h);
-    start = bytes;
-    if (got >= 3 && (BYTE)bytes[0] == 0xEF && (BYTE)bytes[1] == 0xBB && (BYTE)bytes[2] == 0xBF) {
-        start += 3;
-        got -= 3;
-    }
-    wlen = MultiByteToWideChar(CP_UTF8, 0, start, (int)got, NULL, 0);
-    s->text = (wchar_t *)malloc(((size_t)wlen + 1) * sizeof(wchar_t));
-    if (!s->text) { free(bytes); return 0; }
-    MultiByteToWideChar(CP_UTF8, 0, start, (int)got, s->text, wlen);
-    s->text[wlen] = 0;
-    s->length = (size_t)wlen;
+    s->text = nexui_decode_script(bytes, got, &s->length);
     free(bytes);
-    return 1;
+    return s->text != NULL;
 }
 
 /* ---- libcef entry points -------------------------------------------------- */
@@ -305,10 +292,20 @@ static DWORD WINAPI nexui_thread(LPVOID unused) {
     }
     {
         int (*version_info)(int) = (int (*)(int))GetProcAddress(cef, "cef_version_info");
-        if (version_info)
-            nexui_log("CEF %d.%d.%d / Chromium %d.%d.%d.%d", version_info(0), version_info(1),
-                      version_info(2), version_info(4), version_info(5), version_info(6),
-                      version_info(7));
+        char why[64];
+        if (!version_info) {
+            give_up("cef_version_info is not exported");
+            return 0;
+        }
+        nexui_log("CEF %d.%d.%d / Chromium %d.%d.%d.%d", version_info(0), version_info(1),
+                  version_info(2), version_info(4), version_info(5), version_info(6),
+                  version_info(7));
+        if (!nexui_cef_version_ok(version_info(0))) {
+            snprintf(why, sizeof(why), "CEF %d is not the verified CEF %d", version_info(0),
+                     NEXUI_CEF_MAJOR);
+            give_up(why);
+            return 0;
+        }
     }
     real_in_context = (int (*)(void))GetProcAddress(cef, "cef_v8context_in_context");
     real_userfree_free = (void (*)(NexCefString *))GetProcAddress(cef, "cef_string_userfree_utf16_free");
@@ -316,14 +313,21 @@ static DWORD WINAPI nexui_thread(LPVOID unused) {
         give_up("cef_v8context_in_context is not exported");
         return 0;
     }
-    for (i = 0; i < NEXUI_HOOKS; i++) {
+    /* Resolve every entry point before the first slot is rewritten: each hook
+       body calls cef_v8context_get_current_context. */
+    for (i = 0; i < NEXUI_HOOKS; i++)
         *g_hooks[i].real = (void *)GetProcAddress(cef, g_hooks[i].name);
+    if (!nexui_hooks_usable(real_get_current_context != NULL, 1)) {
+        give_up("cef_v8context_get_current_context is not exported");
+        return 0;
+    }
+    for (i = 0; i < NEXUI_HOOKS; i++) {
         if (*g_hooks[i].real && nexui_iat_patch(app, "libcef.dll", g_hooks[i].name, g_hooks[i].hook, NULL))
             patched++;
         else
             nexui_log("not hooked: %s", g_hooks[i].name);
     }
-    if (!patched) {
+    if (!nexui_hooks_usable(real_get_current_context != NULL, patched)) {
         give_up("no libcef import of cloudmusic.dll could be hooked");
         return 0;
     }

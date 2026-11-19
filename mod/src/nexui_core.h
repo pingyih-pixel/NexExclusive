@@ -7,6 +7,7 @@
 #define NEX_UI_CORE_H
 
 #include <windows.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 
@@ -43,6 +44,62 @@ NEX_UI_FN int nexui_layout_ok(size_t context_size, size_t frame_size) {
 NEX_UI_FN int nexui_should_inject(int is_main_frame, const char *url_utf8, int marker_present) {
     return is_main_frame && !marker_present && url_utf8 &&
            strncmp(url_utf8, "orpheus://", 10) == 0;
+}
+
+/* The only CEF this layout was verified against. Equal struct sizes do not
+   prove equal member order, so another major version is not tried at all. */
+#define NEXUI_CEF_MAJOR 91
+
+NEX_UI_FN int nexui_cef_version_ok(int major) {
+    return major == NEXUI_CEF_MAJOR;
+}
+
+/* Every hook body calls cef_v8context_get_current_context, so it must have
+   resolved, and at least one import must actually be rewritten. */
+NEX_UI_FN int nexui_hooks_usable(int current_context_resolved, int patched) {
+    return current_context_resolved && patched > 0;
+}
+
+/* UTF-8 of the first part of w that fits in out (always NUL-terminated).
+   Truncates instead of failing, so a long URL keeps its scheme prefix. A
+   surrogate pair is never split. */
+NEX_UI_FN void nexui_utf8_prefix(const wchar_t *w, size_t len, char *out, int outn) {
+    int n;
+    size_t keep = len;
+    if (!out || outn <= 0) return;
+    out[0] = 0;
+    if (!w || !len || outn == 1) return;
+    /* A UTF-16 unit never needs more than 3 UTF-8 bytes (a pair needs 4 for 2). */
+    if (keep > (size_t)(outn - 1) / 3) keep = (size_t)(outn - 1) / 3;
+    if (keep && keep < len && w[keep - 1] >= 0xD800 && w[keep - 1] <= 0xDBFF) keep--;
+    n = keep ? WideCharToMultiByte(CP_UTF8, 0, w, (int)keep, out, outn - 1, NULL, NULL) : 0;
+    out[n > 0 ? n : 0] = 0;
+}
+
+/* UTF-8 script bytes (optional BOM) as a NUL-terminated UTF-16 string the
+   caller frees. A script with nothing but whitespace is not a script: it would
+   evaluate cleanly and claim the panel loaded. */
+NEX_UI_FN wchar_t *nexui_decode_script(const char *bytes, size_t n, size_t *out_len) {
+    size_t i;
+    int wlen, has_code = 0;
+    wchar_t *w;
+    if (out_len) *out_len = 0;
+    if (!bytes) return NULL;
+    if (n >= 3 && (BYTE)bytes[0] == 0xEF && (BYTE)bytes[1] == 0xBB && (BYTE)bytes[2] == 0xBF) {
+        bytes += 3;
+        n -= 3;
+    }
+    for (i = 0; i < n; i++)
+        if (bytes[i] != ' ' && bytes[i] != '\t' && bytes[i] != '\r' && bytes[i] != '\n') { has_code = 1; break; }
+    if (!has_code || n > 0x7FFFFFFF) return NULL;
+    wlen = MultiByteToWideChar(CP_UTF8, 0, bytes, (int)n, NULL, 0);
+    if (wlen <= 0) return NULL;
+    w = (wchar_t *)malloc(((size_t)wlen + 1) * sizeof(wchar_t));
+    if (!w) return NULL;
+    MultiByteToWideChar(CP_UTF8, 0, bytes, (int)n, w, wlen);
+    w[wlen] = 0;
+    if (out_len) *out_len = (size_t)wlen;
+    return w;
 }
 
 /* Replace module's import of import_dll!name with hook. The first original
