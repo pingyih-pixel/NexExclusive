@@ -201,6 +201,20 @@ static HRESULT STDMETHODCALLTYPE H_Start(void *self) {
        been committed. Starting it here would leave the endpoint running on an
        empty buffer, which the driver reports as an immediate underrun. */
     SinkGen *g = g_sink.gen;
+    if (!g && g_sink.engaged) {
+        /* sink_stop abandoned the previous generation to its parked drain
+           thread. The client still owns this stream and expects Start to play
+           it; rebuild the device side instead of failing, which used to leave
+           the rest of the track silent (ROADMAP 6c). */
+        HRESULT rebuilt = g_rebuild_device("start after abandoned generation");
+        if (FAILED(rebuilt)) {
+            LeaveCriticalSection(&g_control);
+            log_line("Start -> device side could not be rebuilt 0x%08lX", (unsigned long)rebuilt);
+            return rebuilt;
+        }
+        g = g_sink.gen;
+        log_line("Start: rebuilt the device side after an abandoned generation");
+    }
     if (!g) { LeaveCriticalSection(&g_control); log_line("Start -> no device generation"); return E_FAIL; }
     InterlockedExchange(&g->running, 1);
     g_sink.started = 1;

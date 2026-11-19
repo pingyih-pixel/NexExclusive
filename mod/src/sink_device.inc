@@ -542,7 +542,9 @@ static HRESULT STDMETHODCALLTYPE fc_GetPosition(void *s, UINT64 *pos, UINT64 *qp
        known position keeps the client's timeline where it was; a failure here
        would look like the track ended. */
     else if(g_sink.device_lost) { *pos=g_sink.clock_last; if(qpc)*qpc=0; }
-    else if(!g_sink.gen) hr=E_UNEXPECTED;
+    /* Same for the window between an abandoned generation (sink_stop) and its
+       rebuild in the next Start: the stream is alive, only its device is not. */
+    else if(!g_sink.gen) { *pos=g_sink.clock_last; if(qpc)*qpc=0; }
     else {
         UINT64 f=0;
         if(g_sink.gen->remote) {

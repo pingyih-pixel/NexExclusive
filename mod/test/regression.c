@@ -1706,6 +1706,16 @@ static void test_generation_abandon(void) {
 }
 
 static LONG stress_errors;
+static volatile LONG stress_noted;
+static char stress_first[160];
+/* Count a failure and remember the first one, so a rare failure says which
+   call broke instead of only that something did. */
+static void stress_fail(const char *what, HRESULT hr, int iteration) {
+    InterlockedIncrement(&stress_errors);
+    if (InterlockedCompareExchange(&stress_noted, 1, 0) == 0)
+        snprintf(stress_first, sizeof(stress_first), "%s -> 0x%08lX at iteration %d (started=%d gen=%p)",
+                 what, (unsigned long)hr, iteration, (int)g_sink.started, (void *)g_sink.gen);
+}
 static HANDLE stress_go;
 static void *stress_owner;
 static FakeObj *stress_render;
@@ -1724,12 +1734,10 @@ static DWORD WINAPI stress_producer(LPVOID arg) {
             memset(p, 0, 8);
             SwitchToThread(); /* let Reset/Stop interleave with outstanding data */
             hr = fr_ReleaseBuffer(stress_render, 1, AUDCLNT_BUFFERFLAGS_SILENT);
-            if (hr != S_OK && hr != AUDCLNT_E_DEVICE_INVALIDATED) {
-                InterlockedIncrement(&stress_errors);
-            }
+            if (hr != S_OK && hr != AUDCLNT_E_DEVICE_INVALIDATED) stress_fail("ReleaseBuffer", hr, i);
         } else if (hr != AUDCLNT_E_BUFFER_TOO_LARGE &&
                    hr != AUDCLNT_E_DEVICE_INVALIDATED) {
-            InterlockedIncrement(&stress_errors);
+            stress_fail("GetBuffer", hr, i);
         }
         if ((i & 31) == 0) SwitchToThread();
     }
@@ -1742,15 +1750,12 @@ static DWORD WINAPI stress_clock_reader(LPVOID arg) {
         UINT64 pos = 0, qpc = 0;
         UINT32 frames = 0;
         void *service = NULL;
-        if (fc_GetPosition(stress_clock, &pos, &qpc) != S_OK) {
-            InterlockedIncrement(&stress_errors);
-        }
-        if (H_GetBufferSize(stress_owner, &frames) != S_OK || frames != 16) {
-            InterlockedIncrement(&stress_errors);
-        }
-        if (H_GetService(stress_owner, &IID_IAudioRenderClient_l, &service) != S_OK) {
-            InterlockedIncrement(&stress_errors);
-        }
+        HRESULT hr = fc_GetPosition(stress_clock, &pos, &qpc);
+        if (hr != S_OK) stress_fail("GetPosition", hr, i);
+        hr = H_GetBufferSize(stress_owner, &frames);
+        if (hr != S_OK || frames != 16) stress_fail("GetBufferSize", hr, i);
+        hr = H_GetService(stress_owner, &IID_IAudioRenderClient_l, &service);
+        if (hr != S_OK) stress_fail("GetService", hr, i);
         else fr_Release(service);
         if ((i & 31) == 0) SwitchToThread();
     }
@@ -1760,13 +1765,114 @@ static DWORD WINAPI stress_lifecycle(LPVOID arg) {
     (void)arg;
     WaitForSingleObject(stress_go, INFINITE);
     for (int i = 0; i < 300; i++) {
-        if (H_Start(stress_owner) != S_OK) InterlockedIncrement(&stress_errors);
+        HRESULT hr = H_Start(stress_owner);
+        if (hr != S_OK) stress_fail("Start", hr, i);
         SwitchToThread();
-        if (H_Stop(stress_owner) != S_OK) InterlockedIncrement(&stress_errors);
-        if (H_Reset(stress_owner) != S_OK) InterlockedIncrement(&stress_errors);
+        hr = H_Stop(stress_owner);
+        if (hr != S_OK) stress_fail("Stop", hr, i);
+        hr = H_Reset(stress_owner);
+        if (hr != S_OK) stress_fail("Reset", hr, i);
     }
     return 0;
 }
+/* ---- 6c: Start after an abandoned generation ------------------------------ */
+/* Stop hands a generation whose drain thread is parked in GetBuffer to that
+   thread and drops it from the sink. The client then calls Start on the same
+   IAudioClient. Before the fix that Start returned E_FAIL ("no device
+   generation") and the track stayed silent until the next format change. */
+static int rebuild_calls;
+static void *rebuild_ac_vt[15], *rebuild_ac_obj[1];
+static void *rebuild_clock_vt[6], *rebuild_clock_obj[1];
+static HRESULT mock_rebuild_device(const char *reason) {
+    (void)reason;
+    rebuild_calls++;
+    SinkGen *g = mock_gen();
+    g->real = (IAudioClient *)rebuild_ac_obj;
+    g->real_clock = (IAudioClock *)rebuild_clock_obj;
+    g->real_frames = 32;
+    g->clock_frequency = 48000;
+    return S_OK;
+}
+static HRESULT busy_rebuild_device(const char *reason) {
+    (void)reason;
+    rebuild_calls++;
+    return AUDCLNT_E_DEVICE_IN_USE;
+}
+static void mock_rebuild_setup(void) {
+    memset(rebuild_ac_vt, 0, sizeof(rebuild_ac_vt));
+    memset(rebuild_clock_vt, 0, sizeof(rebuild_clock_vt));
+    rebuild_ac_vt[SLOT_RELEASE] = (void *)stress_ref;
+    rebuild_ac_vt[AC_GETCURRENTPADDING] = (void *)stress_padding;
+    rebuild_ac_vt[AC_STOP] = (void *)mock_stop;
+    rebuild_ac_vt[AC_RESET] = (void *)mock_reset;
+    rebuild_ac_obj[0] = rebuild_ac_vt;
+    rebuild_clock_vt[SLOT_RELEASE] = (void *)stress_ref;
+    rebuild_clock_vt[CLK_GETPOSITION] = (void *)mock_get_position;
+    rebuild_clock_obj[0] = rebuild_clock_vt;
+}
+static void test_start_rebuilds_abandoned_generation(void) {
+    HRESULT (*saved)(const char *) = g_rebuild_device;
+    HandoffClient client = { handoff_vtbl, 1 };
+    prepare_ring();
+    reset_patches();
+    mock_rebuild_setup();
+    g_sink.owner = &client;
+    g_sink.out_rate = 48000;
+    memset(&g_fake_clock, 0, sizeof(g_fake_clock));
+    g_fake_clock.vtbl = g_fake_clock_vtbl;
+    g_fake_clock.ref = 1;
+    g_fake_clock.generation = g_sink.generation;
+    g_sink.proxy_clock = &g_fake_clock;
+    /* state left by sink_stop's abandonment branch */
+    g_sink.gen = NULL;
+    g_sink.started = 0;
+
+    g_rebuild_device = mock_rebuild_device;
+    rebuild_calls = 0;
+    CHECK(H_Start(&client) == S_OK);
+    CHECK(rebuild_calls == 1);
+    CHECK(g_sink.gen != NULL && g_sink.started == 1);
+    CHECK(H_Stop(&client) == S_OK);
+    CHECK(g_sink.gen && g_sink.gen->h_thread == NULL && !g_sink.started);
+    /* an ordinary pause/resume keeps the generation: no second rebuild */
+    CHECK(H_Start(&client) == S_OK);
+    CHECK(rebuild_calls == 1);
+    CHECK(H_Stop(&client) == S_OK);
+
+    /* a rebuild that cannot get the endpoint reports why, and does not start */
+    gen_release(g_sink.gen);
+    g_sink.gen = NULL;
+    g_rebuild_device = busy_rebuild_device;
+    CHECK(H_Start(&client) == AUDCLNT_E_DEVICE_IN_USE);
+    CHECK(rebuild_calls == 2 && !g_sink.started);
+
+    g_rebuild_device = saved;
+    sink_teardown_controlled();
+    printf("PASS 6c: Start after an abandoned generation rebuilds the device side\n");
+}
+
+/* Between the abandonment in Stop and the rebuild in the next Start there is
+   no device clock. The client keeps polling it; an error there reads as "the
+   track ended", so the last position is reported instead. */
+static void test_clock_holds_position_while_generation_abandoned(void) {
+    UINT64 pos = 0, qpc = 7;
+    prepare_ring();
+    memset(&g_fake_clock, 0, sizeof(g_fake_clock));
+    g_fake_clock.vtbl = g_fake_clock_vtbl;
+    g_fake_clock.ref = 1;
+    g_fake_clock.generation = g_sink.generation;
+    g_sink.proxy_clock = &g_fake_clock;
+    g_sink.gen = NULL;
+    g_sink.clock_last = 12345678;
+    CHECK(fc_GetPosition(&g_fake_clock, &pos, &qpc) == S_OK);
+    CHECK(pos == 12345678 && qpc == 0);
+    g_sink.engaged = 0;                       /* torn down: no stream to report */
+    CHECK(fc_GetPosition(&g_fake_clock, &pos, &qpc) != S_OK);
+    g_sink.engaged = 1;
+    free_ring();
+    printf("PASS 6c: clock holds the last position while the generation is being rebuilt\n");
+}
+
 static void test_lifecycle_stress(void) {
     prepare_ring();
     reset_patches();
@@ -1794,6 +1900,8 @@ static void test_lifecycle_stress(void) {
     stress_clock = &g_fake_clock;
     mock_clock_pos = 48000;
     stress_errors = 0;
+    stress_noted = 0;
+    stress_first[0] = 0;
     stress_go = CreateEventA(NULL, TRUE, FALSE, NULL);
     HANDLE threads[3] = {
         CreateThread(NULL, 0, stress_producer, NULL, 0, NULL),
@@ -1809,9 +1917,13 @@ static void test_lifecycle_stress(void) {
         ExitProcess(1);
     }
     CHECK(stress_errors == 0);
+    if (stress_errors) fprintf(stderr, "  lifecycle stress: %ld error(s), first: %s\n",
+                               (long)stress_errors, stress_first);
     /* Stop keeps the generation so a pause/resume does not renegotiate the
        device; what must be gone is the thread. */
-    CHECK(g_sink.gen && g_sink.gen->h_thread == NULL && !g_sink.started);
+    /* Under load the final Stop may abandon the generation to its thread
+       (ROADMAP 6c); then there is no generation left to inspect. */
+    CHECK(!g_sink.started && (!g_sink.gen || g_sink.gen->h_thread == NULL));
     for (int i = 0; i < 3; i++) CloseHandle(threads[i]);
     CloseHandle(stress_go);
     CHECK(sink_teardown_controlled() == S_OK);
@@ -2183,6 +2295,9 @@ int main(void) {
     InitializeCriticalSection(&g_control);
     InitializeCriticalSection(&g_patch_lock);
     g_log[0] = 0; /* No on-disk playback log is modified by this test. */
+    /* No test may rebuild a generation on a real endpoint (ROADMAP 6c path). */
+    mock_rebuild_setup();
+    g_rebuild_device = mock_rebuild_device;
     test_fade();
     test_valid_bits_alignment();
     test_silent();
@@ -2224,6 +2339,8 @@ int main(void) {
     test_gate_waits_for_previous_holder();
     test_module_dir();
     test_lifecycle_stress();
+    test_start_rebuilds_abandoned_generation();
+    test_clock_holds_position_while_generation_abandoned();
     DeleteCriticalSection(&g_lock);
     DeleteCriticalSection(&g_control);
     DeleteCriticalSection(&g_patch_lock);

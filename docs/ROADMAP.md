@@ -111,6 +111,24 @@ AudioQuest DragonFly MM3A（额外支持 88.2）。
 - [ ] USB DAC、Realtek、HDMI、多进程争用下的实机回归
 - [ ] 解码层 PCM 捕获与独立 `audiohost`，用于源文件级 bit-perfect 证明
 
+### 6c. 同格式切歌后偶尔无声，直到下一首换格式
+
+**现象**：两首格式相同的歌连续播放（例如都是 44.1 kHz / 16 bit），切到第二首后没有声音、进度不走；直到下一首格式不同、重新建立输出才恢复。
+
+**日志顺序**（2026-11-20 03:02，`sink.log`）：
+
+1. 第二首到来时走同格式交接：`same-format client handoff kept generation 1`，`Start -> S_OK (same-format handoff joined running generation)`。
+2. 约 1 秒后客户端调用 `Stop`，输出线程正停在 `GetBuffer`：`drain thread parked at stage 2 … generation 1 abandoned`。
+3. 随后的 `Start` 失败：`Start -> no device generation`。这一首一直无声，到下一首格式变化时 `new client while owner idle … handing over` 才重建。
+
+**范围**：新旧音频 DLL 都有。旧版日志中同格式交接 619 次，出现 8 次 `Start -> no device generation`；新版实测 5 首里出现 1 次。相关代码在 `mod/src/sink_lifecycle.inc`（放弃一代的分支）与 `mod/src/sink_hooks.inc`（`Start` 无代可用时的处理），AudioPolicy 与 nexui 的改动没有涉及。`mod/test/regression.c` 的生命周期压力测试偶发失败（1811、1814 行，约十次一次），可能是同一处竞态。
+
+- [ ] 用回归测试复现：同格式交接后 `Stop` 时输出线程卡在 `GetBuffer`，再 `Start`
+- [ ] 放弃一代之后，`Start` 能重建输出，而不是返回 `no device generation`
+- [ ] 查清并消除生命周期压力测试的偶发失败
+
+**验收**：连续切换同格式歌曲 50 次以上，没有无声段；压力测试连续运行 50 次全部通过。
+
 ---
 
 ## P2 · 功能缺口

@@ -405,7 +405,16 @@ static HANDLE acquire_endpoint_gate(IMMDevice *dev, HRESULT *why) {
    the device side is replaced. Called with g_control held and the previous
    generation already stopped, because the old device handle is about to be
    released. */
+static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound);
+
+/* Move the live stream to whatever is now the default output (device removed). */
 static HRESULT sink_retarget(const char *reason) {
+    return sink_retarget_endpoint(reason, 0);
+}
+
+/* keep_bound: rebuild on the endpoint the client bound through
+   IMMDevice::Activate, falling back to the default when there is none. */
+static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
     if (!g_sink.engaged || !g_sink.owner) return E_UNEXPECTED;
 
     /* Keep the client's clock where it was: the new device starts at zero. */
@@ -418,14 +427,23 @@ static HRESULT sink_retarget(const char *reason) {
     if (was_remote) remote_close();
 
     IMMDevice *dev = NULL;
-    InterlockedIncrement(&g_internal);
-    IMMDeviceEnumerator *e = NULL;
-    if (SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
-                                   &IID_IMMDeviceEnumerator, (void **)&e)) && e) {
-        e->lpVtbl->GetDefaultAudioEndpoint(e, eRender, eConsole, &dev);
-        e->lpVtbl->Release(e);
+    if (keep_bound) {
+        EnterCriticalSection(&g_patch_lock);
+        for (int i = 0; i < 128; i++) if (g_bindings[i].client == g_sink.owner && g_bindings[i].dev) {
+            dev = g_bindings[i].dev; dev->lpVtbl->AddRef(dev); break;
+        }
+        LeaveCriticalSection(&g_patch_lock);
     }
-    InterlockedDecrement(&g_internal);
+    if (!dev) {
+        InterlockedIncrement(&g_internal);
+        IMMDeviceEnumerator *e = NULL;
+        if (SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                                       &IID_IMMDeviceEnumerator, (void **)&e)) && e) {
+            e->lpVtbl->GetDefaultAudioEndpoint(e, eRender, eConsole, &dev);
+            e->lpVtbl->Release(e);
+        }
+        InterlockedDecrement(&g_internal);
+    }
     if (!dev) {
         log_line("retarget(%s): no default endpoint to move to", reason);
         sink_teardown();
@@ -523,6 +541,16 @@ static HRESULT sink_retarget(const char *reason) {
              (double)keep_clock / 10000000.0);
     return S_OK;
 }
+
+/* Rebuild the device side for the current client after sink_stop abandoned a
+   generation whose drain thread was parked in GetBuffer. The client keeps its
+   IAudioClient, ring, proxies and timeline; only the endpoint stream is new.
+   It stays on the endpoint the client bound, as a pause would. */
+static HRESULT sink_rebuild_device(const char *reason) {
+    return sink_retarget_endpoint(reason, 1);
+}
+/* Indirection so the regression test can supply a mock device. */
+static HRESULT (*g_rebuild_device)(const char *reason) = sink_rebuild_device;
 
 static int sink_input_format_matches(const WAVEFORMATEX *fmt) {
     if (!fmt) return 0;
