@@ -99,14 +99,38 @@ static void test_iat_patch_own_import(void) {
     printf("PASS import table patch: hook, restore, absent names untouched\n");
 }
 
+/* ---- the DLL itself ------------------------------------------------------- */
+/* A test exe is not a renderer: nexui.dll must load, do nothing and create
+   neither event. The host injects it into every client child, GPU included. */
+static void test_dll_inert_outside_renderer(const char *dll_path) {
+    wchar_t name[64];
+    HANDLE r, u;
+    HMODULE m = LoadLibraryA(dll_path);
+    CHECK(m != NULL);
+    Sleep(300);
+    nex_ui_event_name(name, 64, L"Ready", GetCurrentProcessId());
+    r = OpenEventW(SYNCHRONIZE, FALSE, name);
+    nex_ui_event_name(name, 64, L"Unsupported", GetCurrentProcessId());
+    u = OpenEventW(SYNCHRONIZE, FALSE, name);
+    CHECK(r == NULL && u == NULL);
+    if (r) CloseHandle(r);
+    if (u) CloseHandle(u);
+    printf("PASS nexui.dll stays inert outside a renderer process\n");
+}
+
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
     test_event_names();
     test_route_rules();
     test_route_ready_after_timeout_wins();
     test_renderer_detection();
     test_layout_and_target();
     test_iat_patch_own_import();
+    if (argc > 1) {
+        test_dll_inert_outside_renderer(argv[1]);
+    } else {
+        fprintf(stderr, "FAIL dll inert: no nexui.dll path given\n");
+        failures++;
+    }
     printf("%s: %d failure(s)\n", failures ? "FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }

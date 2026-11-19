@@ -54,12 +54,12 @@ fi
 WIRE_DEFS=(-DNEX_AUDIO_BUILD_ID=0x$WIRE_HASH -DNEX_AUDIO_EXPECTED_BUILD_ID=0x$WIRE_HASH)
 TARGET=${1:-all}
 if (( $# > 1 )); then
-    printf '用法：%s [sink|host|audiohost|all|test]\n' "$0" >&2
+    printf '用法：%s [sink|ui|host|audiohost|all|test]\n' "$0" >&2
     exit 2
 fi
 case "$TARGET" in
-    sink|host|audiohost|all|test) ;;
-    *) printf '用法：%s [sink|host|audiohost|all|test]\n' "$0" >&2; exit 2 ;;
+    sink|ui|host|audiohost|all|test) ;;
+    *) printf '用法：%s [sink|ui|host|audiohost|all|test]\n' "$0" >&2; exit 2 ;;
 esac
 
 OUT_DIR=${OUT_DIR-$MOD_DIR}
@@ -82,6 +82,14 @@ build_sink() {
     # 独占协商、重采样、按代交接都在这里。
     "$CC" cc "${FLAGS[@]}" "${WIRE_DEFS[@]}" -shared -o "$OUT_DIR/nexsink.dll" "$MOD_DIR/src/nexsink.c" "${LIBS[@]}"
     printf '已构建到 %s：nexsink.dll\n' "$OUT_DIR"
+}
+
+build_ui() {
+    # 注入进渲染子进程的界面模块：改 cloudmusic.dll 的 libcef 导入，在主页面里
+    # 执行 ui/panel.js 与 ui/simplify.js，不需要 9333。与 nexsink.dll 互不依赖。
+    "$CC" cc "${FLAGS[@]}" -shared -o "$OUT_DIR/nexui.dll" "$MOD_DIR/src/nexui.c"
+    printf '已构建到 %s：nexui.dll
+' "$OUT_DIR"
 }
 
 build_host() {
@@ -153,15 +161,17 @@ build_test() {
         -lws2_32 -lole32 -loleaut32 -ladvapi32 -lshell32 -luser32 -lgdi32 -lversion -lcomdlg32 -lbcrypt
     "$OUT_DIR/source_probe_test.exe"
     "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/nexui_test.exe" "$MOD_DIR/test/nexui_test.c"
-    "$OUT_DIR/nexui_test.exe"
+    build_ui
+    "$OUT_DIR/nexui_test.exe" "$OUT_DIR/nexui.dll"
     "$CC" cc "${FLAGS[@]}" "${WIRE_DEFS[@]}" -o "$OUT_DIR/regression.exe" "$MOD_DIR/test/regression.c" "${LIBS[@]}"
     "$OUT_DIR/regression.exe"
 }
 
 case "$TARGET" in
     sink) build_sink ;;
+    ui)   build_ui ;;
     host) build_host ;;
     audiohost) build_audiohost ;;
-    all)  build_sink; build_host; build_audiohost ;;
+    all)  build_sink; build_ui; build_host; build_audiohost ;;
     test) build_test ;;
 esac
