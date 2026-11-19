@@ -91,3 +91,20 @@ check(!audioLink.includes('unsigned char data[NEX_AUDIO_RING_FRAMES'), 'audio co
 check(audioHost.includes('--ready'), 'audio host must signal readiness through a named event');
 
 console.log('PASS host contract: visible launch and injection hand-off');
+
+/* CDP is the panel's transport only. A client without port 9333 keeps its
+   audio module; the host reports the panel as unavailable and never restarts
+   the client to get a panel. */
+{
+  const start = source.indexOf('static void watchdog_tick(void)');
+  const end = source.indexOf('static void tray_add(HWND hwnd)');
+  check(start > 0 && end > start, 'watchdog_tick must be locatable for the CDP contract');
+  const watchdog = source.slice(start, end);
+  check(!source.includes('relaunch_client_for_cdp'), 'host must not restart the client to obtain a CDP port');
+  check(!source.includes('g_cdp_relaunch'), 'host must not keep CDP relaunch state');
+  check(!watchdog.includes('stop_client_processes'), 'watchdog must never stop a running client');
+  check(!watchdog.includes('g_injected_pid = 0;\n            g_ui_injected = 0;\n            g_last_page[0] = 0;\n            if'),
+    'a missing CDP port must not discard the audio injection state');
+  check(watchdog.includes('面板不可用'), 'a missing CDP port must be reported as panel unavailable');
+  check(watchdog.includes('音频不受影响'), 'the panel-unavailable report must state that audio is unaffected');
+}

@@ -2989,27 +2989,14 @@ static int   g_ui_injected;
 static DWORD g_last_probe;
 static DWORD g_last_ui_time;
 static DWORD g_last_restart_attempt;
-static LONG g_cdp_relaunch_inflight;
-static int g_cdp_relaunch_attempted;
 static unsigned g_cdp_miss_probes;
 
-/* Existing clients do not retroactively open Chromium's debugging port when a
-   second instance is started with --remote-debugging-port.  Once the same
-   client has missed two 15-second probes, restart it once in a worker thread;
-   the UI thread remains available for the tray and window messages. */
-static DWORD WINAPI relaunch_client_for_cdp(LPVOID unused) {
-    (void)unused;
-    host_log("9333 连续未开放，准备重启网易云并带调试端口");
-    if (stop_client_processes()) {
-        host_log("网易云已退出，重新启动并开放 9333");
-        if (!launch_client()) host_log("带 9333 启动网易云失败");
-    } else {
-        host_log("网易云未能退出，暂不重复重启");
-    }
-    InterlockedExchange(&g_cdp_relaunch_inflight, 0);
-    return 0;
-}
-
+/* Audio and panel are separate paths. The audio module is injected into
+   whatever client is running. The panel needs Chromium's debugging port, which
+   an already-running client does not open after the fact; a client without it
+   keeps playing through the module and simply has no panel. The host never
+   stops a running client to obtain one: the next client start that goes
+   through the host carries the port. */
 static void watchdog_tick(void) {
     DWORD pid = find_main_client();
     DWORD now = GetTickCount();
@@ -3024,15 +3011,10 @@ static void watchdog_tick(void) {
             g_ui_injected = 0;
             g_last_page[0] = 0;
             g_cdp_miss_probes = 0;
-            g_cdp_relaunch_attempted = 0;
             source_clear();
         }
         return;
     }
-
-    /* A relaunch worker owns the old client while it is shutting down. Do not
-       inject into a process that is about to be replaced. */
-    if (g_cdp_relaunch_inflight) return;
 
     if (pid != g_injected_pid || !module_loaded(pid, L"nexsink.dll")) {
         if (inject_dll(pid, kSinkDll)) {
@@ -3042,6 +3024,9 @@ static void watchdog_tick(void) {
         }
         g_ui_injected = 0;
         g_last_page[0] = 0;
+        /* A new client gets a full probe interval before its panel is judged. */
+        g_cdp_miss_probes = 0;
+        g_last_probe = now;
     }
 
     /* 页面重载会让 id 变化，界面脚本必须跟着重新注入 */
@@ -3063,21 +3048,17 @@ static void watchdog_tick(void) {
         }
     } else if (now - g_last_probe > 15000) {
         g_last_probe = now;
-        g_cdp_miss_probes++;
-        host_log("CDP 端口未就绪（客户端可能刚启动）");
-        if (g_cdp_miss_probes >= 2 && !g_cdp_relaunch_attempted) {
-            g_cdp_relaunch_attempted = 1;
-            g_injected_pid = 0;
-            g_ui_injected = 0;
-            g_last_page[0] = 0;
-            if (InterlockedCompareExchange(&g_cdp_relaunch_inflight, 1, 0) == 0) {
-                HANDLE worker = CreateThread(NULL, 0, relaunch_client_for_cdp, NULL, 0, NULL);
-                if (worker) CloseHandle(worker);
-                else {
-                    InterlockedExchange(&g_cdp_relaunch_inflight, 0);
-                    host_log("无法创建 9333 重启线程，错误 %lu", GetLastError());
-                }
-            }
+        /* Said twice per client, then quiet: once while it may still be
+           starting, once as the verdict. Probing itself continues, so a panel
+           that becomes reachable later is still injected. */
+        if (g_cdp_miss_probes < 2) {
+            g_cdp_miss_probes++;
+            if (g_cdp_miss_probes == 1)
+                host_log("CDP 端口未就绪（客户端可能刚启动）");
+            else
+                host_log("面板不可用：当前客户端 pid=%lu 没有开放 9333；音频不受影响，"
+                         "不会为此重启客户端。需要设置面板时，退出网易云后由 NexExclusive 重新拉起",
+                         (unsigned long)pid);
         }
     }
 }
