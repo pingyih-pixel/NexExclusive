@@ -152,6 +152,8 @@ build_test() {
     "$CC" cc "${FLAGS[@]}" "${WIRE_DEFS[@]}" -o "$OUT_DIR/source_probe_test.exe" "$MOD_DIR/test/source_probe_test.c" \
         -lws2_32 -lole32 -loleaut32 -ladvapi32 -lshell32 -luser32 -lgdi32 -lversion -lcomdlg32 -lbcrypt
     "$OUT_DIR/source_probe_test.exe"
+    "$CC" cc "${FLAGS[@]}" -o "$OUT_DIR/nexui_test.exe" "$MOD_DIR/test/nexui_test.c"
+    "$OUT_DIR/nexui_test.exe"
     "$CC" cc "${FLAGS[@]}" "${WIRE_DEFS[@]}" -o "$OUT_DIR/regression.exe" "$MOD_DIR/test/regression.c" "${LIBS[@]}"
     "$OUT_DIR/regression.exe"
 }
