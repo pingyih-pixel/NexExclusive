@@ -33,6 +33,8 @@
 #include <stdarg.h>
 #include <wchar.h>
 
+#include "../src/nexui_shared.h"
+
 /* ---- 路径与端口 --------------------------------------------------------- */
 #define CFG_PORT 9334
 #define CDP_PORT 9333
@@ -46,6 +48,7 @@ extern IMAGE_DOS_HEADER __ImageBase;
 
 static char g_base[MAX_PATH];        /* exe 目录，带尾反斜杠 */
 static char kSinkDll[MAX_PATH];
+static char kUiDll[MAX_PATH];
 static char kHookCfg[MAX_PATH];
 static char kUiJson[MAX_PATH];
 static char kSinkLog[MAX_PATH];
@@ -131,6 +134,7 @@ static int join_into(char *out, size_t n, const char *rel) {
 static int resolve_paths(void) {
     if (!module_dir(g_base, sizeof(g_base))) return 0;
     return join_into(kSinkDll,    sizeof(kSinkDll),    "nexsink.dll") &&
+           join_into(kUiDll,      sizeof(kUiDll),      "nexui.dll") &&
            join_into(kHookCfg,    sizeof(kHookCfg),    "hook.cfg") &&
            join_into(kUiJson,     sizeof(kUiJson),     "ui.json") &&
            join_into(kSinkLog,    sizeof(kSinkLog),    "sink.log") &&
@@ -1744,6 +1748,149 @@ static int module_loaded(DWORD pid, const wchar_t *name) {
     return found;
 }
 
+/* ---- 界面链路：渲染进程里的 nexui.dll ------------------------------------ */
+/* Audio and panel are separate chains. The watchdog puts nexsink.dll into the
+   main process. This thread puts nexui.dll into every child of it; the module
+   acts only in the renderer and announces Ready or Unsupported through named
+   events (nexui_shared.h). The route it derives decides whether the watchdog
+   also injects the panel over CDP. */
+static int find_child_pids(DWORD parent, const wchar_t *exe, DWORD *out, int cap) {
+    int n = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W pe;
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ParentProcessID != parent || _wcsicmp(pe.szExeFile, exe) != 0) continue;
+            if (n < cap) out[n] = pe.th32ProcessID;
+            n++;
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return n < cap ? n : cap;
+}
+
+static int ui_event_exists(const wchar_t *kind, DWORD pid) {
+    wchar_t name[64];
+    HANDLE h;
+    if (!nex_ui_event_name(name, 64, kind, (unsigned long)pid)) return 0;
+    h = OpenEventW(SYNCHRONIZE, FALSE, name);
+    if (!h) return 0;
+    CloseHandle(h);
+    return 1;
+}
+
+#define UI_MAX_CHILDREN 32
+typedef struct UiChild { DWORD pid; int injected; int failures; } UiChild;
+typedef struct UiTracker {
+    DWORD main_pid;
+    UiChild child[UI_MAX_CHILDREN];
+    int count;
+    ULONGLONG client_seen_at;
+    ULONGLONG first_injected_at;
+} UiTracker;
+
+/* A different main process is a different client: start over. Children that
+   are gone drop out; new ones join uninjected. */
+static void ui_tracker_sync(UiTracker *t, DWORD main_pid, const DWORD *children, int n,
+                            ULONGLONG now) {
+    int i, j, w = 0;
+    if (t->main_pid != main_pid) {
+        memset(t, 0, sizeof(*t));
+        t->main_pid = main_pid;
+        t->client_seen_at = now;
+    }
+    for (i = 0; i < t->count; i++) {
+        int alive = 0;
+        for (j = 0; j < n; j++) if (children[j] == t->child[i].pid) { alive = 1; break; }
+        if (alive) t->child[w++] = t->child[i];
+    }
+    t->count = w;
+    for (j = 0; j < n && t->count < UI_MAX_CHILDREN; j++) {
+        int known = 0;
+        for (i = 0; i < t->count; i++) if (t->child[i].pid == children[j]) { known = 1; break; }
+        if (known) continue;
+        t->child[t->count].pid = children[j];
+        t->child[t->count].injected = 0;
+        t->child[t->count].failures = 0;
+        t->count++;
+    }
+}
+
+static void ui_tracker_route_input(const UiTracker *t, int dll_present, ULONGLONG now,
+                                   NexUiRouteInput *out) {
+    int i;
+    memset(out, 0, sizeof(*out));
+    out->dll_present = dll_present;
+    for (i = 0; i < t->count; i++) {
+        if (t->child[i].injected) out->renderer_injected = 1;
+        if (ui_event_exists(L"Ready", t->child[i].pid)) out->renderer_ready = 1;
+        if (ui_event_exists(L"Unsupported", t->child[i].pid)) out->renderer_unsupported = 1;
+        if (t->child[i].failures > out->inject_failures) out->inject_failures = t->child[i].failures;
+    }
+    if (t->client_seen_at && now > t->client_seen_at)
+        out->ms_since_client_seen = (unsigned long)(now - t->client_seen_at);
+    if (t->first_injected_at && now > t->first_injected_at)
+        out->ms_since_renderer_injected = (unsigned long)(now - t->first_injected_at);
+}
+
+static const char *ui_route_reason(const NexUiRouteInput *in) {
+    if (!in->dll_present) return "缺少 nexui.dll";
+    if (in->renderer_unsupported) return "渲染进程不支持（见 nexui.log）";
+    if (in->inject_failures >= NEX_UI_INJECT_MAX_FAILURES) return "注入渲染进程失败";
+    return "20 秒内渲染进程未就绪";
+}
+
+static volatile LONG g_ui_route = NEX_UI_ROUTE_WAIT;
+
+static DWORD WINAPI ui_thread(LPVOID unused) {
+    static UiTracker tracker;
+    int last_route = -1;
+    (void)unused;
+    for (;;) {
+        DWORD kids[UI_MAX_CHILDREN];
+        DWORD main_pid = find_main_client();
+        int i, n, route, dll_present;
+        NexUiRouteInput in;
+        if (!main_pid) {
+            memset(&tracker, 0, sizeof(tracker));
+            InterlockedExchange(&g_ui_route, NEX_UI_ROUTE_WAIT);
+            last_route = -1;
+            Sleep(1000);
+            continue;
+        }
+        n = find_child_pids(main_pid, L"cloudmusic.exe", kids, UI_MAX_CHILDREN);
+        ui_tracker_sync(&tracker, main_pid, kids, n, GetTickCount64());
+        dll_present = GetFileAttributesA(kUiDll) != INVALID_FILE_ATTRIBUTES;
+        for (i = 0; dll_present && i < tracker.count; i++) {
+            UiChild *c = &tracker.child[i];
+            if (c->injected || c->failures >= NEX_UI_INJECT_MAX_FAILURES) continue;
+            if (module_loaded(c->pid, L"nexui.dll") || inject_dll(c->pid, kUiDll)) {
+                c->injected = 1;
+                if (!tracker.first_injected_at) tracker.first_injected_at = GetTickCount64();
+            } else {
+                c->failures++;
+            }
+        }
+        ui_tracker_route_input(&tracker, dll_present, GetTickCount64(), &in);
+        route = nex_ui_route_decide(&in);
+        if (route != last_route) {
+            if (route == NEX_UI_ROUTE_RENDERER)
+                host_log("界面链路：渲染进程就绪，面板由 nexui.dll 加载（客户端 pid=%lu）",
+                         (unsigned long)main_pid);
+            else if (route == NEX_UI_ROUTE_CDP)
+                host_log("界面链路：回退到 CDP（%s）", ui_route_reason(&in));
+            else
+                host_log("界面链路：等待渲染进程（客户端 pid=%lu）", (unsigned long)main_pid);
+            last_route = route;
+        }
+        InterlockedExchange(&g_ui_route, route);
+        Sleep(route == NEX_UI_ROUTE_RENDERER ? 1000 : 100);
+    }
+    return 0;
+}
+
 /* ---- 最小 HTTP 客户端（只用来访问 CDP 的 HTTP 端点） ------------------- */
 static int http_get(int port, const char *path, char *out, size_t n) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -3029,6 +3176,13 @@ static void watchdog_tick(void) {
         g_last_probe = now;
     }
 
+    /* The panel's transport is the UI chain's call (ui_thread). CDP runs only
+       when the renderer path is out; the scripts guard against a second copy. */
+    if (g_ui_route != NEX_UI_ROUTE_CDP) {
+        if (g_ui_route == NEX_UI_ROUTE_RENDERER) g_cdp_miss_probes = 0;
+        return;
+    }
+
     /* 页面重载会让 id 变化，界面脚本必须跟着重新注入 */
     char page[128];
     if (cdp_page_id(page, sizeof(page))) {
@@ -3314,6 +3468,8 @@ int main(int argc, char **argv) {
 
     /* 配置服务先起，面板随时可以连上来 */
     CreateThread(NULL, 0, http_thread, NULL, 0, NULL);
+    /* 界面链路单独一个线程：跟踪子进程、注入 nexui.dll、决定是否回退 CDP */
+    CreateThread(NULL, 0, ui_thread, NULL, 0, NULL);
 
     DWORD initial_pid = find_main_client();
     if (want_show || !initial_pid || !client_window_visible(initial_pid)) {

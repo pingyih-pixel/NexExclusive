@@ -108,3 +108,21 @@ console.log('PASS host contract: visible launch and injection hand-off');
   check(watchdog.includes('面板不可用'), 'a missing CDP port must be reported as panel unavailable');
   check(watchdog.includes('音频不受影响'), 'the panel-unavailable report must state that audio is unaffected');
 }
+
+/* Audio and panel are separate chains. nexsink.dll goes only into the main
+   process from the watchdog; nexui.dll goes into its children from ui_thread;
+   CDP runs only when the UI route says the renderer path failed. */
+{
+  const start = source.indexOf('static void watchdog_tick(void)');
+  const end = source.indexOf('static void tray_add(HWND hwnd)');
+  const watchdog = source.slice(start, end);
+  check(/join_into\(kUiDll,\s*sizeof\(kUiDll\),\s*"nexui\.dll"\)/.test(source), 'host must resolve nexui.dll beside itself');
+  check(source.includes('CreateThread(NULL, 0, ui_thread'), 'the UI chain must run on its own thread');
+  check(/g_ui_route\s*[!=]=\s*NEX_UI_ROUTE_CDP/.test(watchdog), 'CDP injection must be gated by the UI route');
+  check(!watchdog.includes('kUiDll'), 'the watchdog must not inject the UI module');
+  check(source.split('inject_dll(pid, kSinkDll)').length === 2, 'nexsink.dll must be injected from one place only');
+  const uiStart = source.indexOf('static DWORD WINAPI ui_thread');
+  const uiBody = source.slice(uiStart, uiStart + source.slice(uiStart).search(/\r?\n}\r?\n/));
+  check(uiStart > 0 && uiBody.includes('kUiDll'), 'ui_thread must inject the UI module');
+  check(!uiBody.includes('kSinkDll'), 'the UI thread must not touch the audio module');
+}
