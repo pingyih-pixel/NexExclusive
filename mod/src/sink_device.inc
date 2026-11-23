@@ -149,6 +149,20 @@ static HRESULT drain_once(SinkGen *g) {
         if (g->device_started && pad==0 && g->submitted) g_starve++;
         if (pad>g->real_frames) return E_UNEXPECTED;
         space=g->real_frames-pad;
+        if (g->real_evt && !g->device_started && pad) {
+            /* Resume after a pause (Stop without Reset): the device still holds
+               a queued period. An event-driven stream only takes a full period
+               into an empty buffer, so waiting for room would wait forever;
+               start on what is queued and continue on the next event. */
+            g->stage=STAGE_START;
+            hr=O_START(g->real);
+            if(g->retired)return E_ABORT;
+            if(FAILED(hr))return hr;
+            g->device_started=1;
+            g->stage=STAGE_IDLE;
+            log_line("sink: hardware resumed with %lu frames queued",(unsigned long)pad);
+            return S_OK;
+        }
     }
     if (!space) return S_FALSE;
     if (!g->remote && g_sink.prime_left) {

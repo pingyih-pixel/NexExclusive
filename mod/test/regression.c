@@ -2519,6 +2519,14 @@ static void test_event_mode_waits_for_device_request(void) {
     CHECK(mock_gb_calls == 1 && mock_gb_frames == 16 && g_sink.r == 56);
     CHECK(gen->evt_fired == 0);
 
+    /* Pause and resume without Reset: the device still holds a period, so the
+       drain starts it on what is queued instead of waiting for room. */
+    gen->device_started = 0;
+    mock_padding = 16; mock_gb_calls = 0; mock_start_calls = 0;
+    CHECK(drain_once(gen) == S_OK);
+    CHECK(mock_start_calls == 1 && gen->device_started && mock_gb_calls == 0);
+    mock_padding = 0;
+
     gen->real = NULL;
     gen->real_render = NULL;
     g_sink.gen = NULL;
