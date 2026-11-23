@@ -218,6 +218,7 @@ static HRESULT STDMETHODCALLTYPE H_Start(void *self) {
     if (!g) { LeaveCriticalSection(&g_control); log_line("Start -> no device generation"); return E_FAIL; }
     InterlockedExchange(&g->running, 1);
     g_sink.started = 1;
+    if (g->remote) remote_set_transport(NEX_AUDIO_TRANSPORT_PLAY);
     g_sink.fade_total = (UINT32)((UINT64)g_sink.out_rate * (UINT64)g_fade_ms / 1000u);
     if (g_fade_ms > 0 && g_sink.fade_total < 32) g_sink.fade_total = 32;
     g_sink.fade_left = g_sink.fade_total;
@@ -279,6 +280,10 @@ static HRESULT STDMETHODCALLTYPE H_Reset(void *self) {
         LeaveCriticalSection(&g_control);
         return hr;
     }
+    /* A seek also has to drop what the Host already holds, or the first
+       ~0.5 s after the seek is pre-seek audio. */
+    if (g_sink.gen && g_sink.gen->remote && !remote_request_flush(500))
+        log_line("sink: audiohost did not acknowledge the flush within 500 ms");
     EnterCriticalSection(&g_lock);
     g_sink.w = g_sink.r = 0;
     if (g_sink.ring)

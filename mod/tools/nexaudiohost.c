@@ -25,6 +25,7 @@ typedef struct HostApi {
     HRESULT (*start)(HostRuntime *);
     HRESULT (*stop)(HostRuntime *);
     HRESULT (*get_position)(HostRuntime *, UINT64 *, UINT64 *);
+    HRESULT (*reset)(HostRuntime *);
 } HostApi;
 
 struct HostRuntime {
@@ -199,13 +200,64 @@ static HRESULT host_publish_clock(HostRuntime *rt, UINT32 padding) {
     return S_OK;
 }
 
+/* Apply the client's transport. Returns S_FALSE when this step is fully
+   handled (a flush, or a pause), S_OK to continue with normal pumping, or a
+   failure. Only the Host can stop or reset the device it owns; without this a
+   client pause left the device running into underruns and a seek replayed the
+   ring's pre-seek audio. */
+static HRESULT host_apply_transport(HostRuntime *rt) {
+    NexAudioControl *c = rt->control;
+    uint64_t request = nex_audio_read64(&c->flush_request_generation);
+    HRESULT hr;
+    if (request != nex_audio_read64(&c->flush_ack_generation)) {
+        if (c->device_started) {
+            rt->api->stop(rt);
+            rt->api->reset(rt);
+        }
+        InterlockedExchange64((volatile LONG64 *)&c->read_frame,
+                              (LONG64)nex_audio_read64((volatile uint64_t *)&c->write_frame));
+        c->device_started = 0;
+        c->first_buffer_submitted = 0;
+        InterlockedExchange((volatile LONG *)&c->device_paused, 0);
+        InterlockedExchange((volatile LONG *)&c->device_padding_frames, 0);
+        rt->eos_checking = 0;
+        long state = host_state(rt);
+        if (state == NEX_AUDIO_RUNNING || state == NEX_AUDIO_PREFILLED || state == NEX_AUDIO_DRAINING)
+            host_set_state(rt, NEX_AUDIO_READY);
+        InterlockedExchange64((volatile LONG64 *)&c->flush_ack_generation, (LONG64)request);
+        if (rt->space_event) SetEvent(rt->space_event);
+        host_log("flush generation=%llu: device reset, ring discarded", (unsigned long long)request);
+        return S_FALSE;
+    }
+    if (c->transport == NEX_AUDIO_TRANSPORT_PAUSE) {
+        if (c->device_started && !c->device_paused) {
+            hr = rt->api->stop(rt);
+            if (FAILED(hr)) return host_fail(rt, hr, NEX_AUDIO_FALLBACK_RUNTIME_DEVICE_LOST);
+            InterlockedExchange((volatile LONG *)&c->device_paused, 1);
+            host_log("paused generation=%llu ring_used=%llu",
+                     (unsigned long long)c->stream_generation,
+                     (unsigned long long)nex_audio_ring_available(c));
+        }
+        return S_FALSE;
+    }
+    if (c->device_paused) {
+        hr = rt->api->start(rt);
+        if (FAILED(hr)) return host_fail(rt, hr, NEX_AUDIO_FALLBACK_ENDPOINT_OPEN_FAILED);
+        InterlockedExchange((volatile LONG *)&c->device_paused, 0);
+        host_log("resumed generation=%llu", (unsigned long long)c->stream_generation);
+    }
+    return S_OK;
+}
+
 /* One bounded polling step. The mock host test drives this same function. */
 static HRESULT host_pump(HostRuntime *rt) {
     NexAudioControl *control = rt->control;
     long state = host_state(rt);
     if (state == NEX_AUDIO_FAILED) return (HRESULT)control->error;
     if (state == NEX_AUDIO_CLOSING) return S_FALSE;
-    if (state == NEX_AUDIO_COMPLETE) return S_OK;
+    HRESULT transport = host_apply_transport(rt);
+    if (transport != S_OK) return transport;
+    if (host_state(rt) == NEX_AUDIO_COMPLETE) return S_OK;
 
     uint64_t available64 = nex_audio_ring_available(control);
     if (!control->device_started) {
@@ -288,13 +340,14 @@ static HRESULT real_release_buffer(HostRuntime *rt, UINT32 frames) {
 }
 static HRESULT real_start(HostRuntime *rt) { return IAudioClient_Start(rt->client); }
 static HRESULT real_stop(HostRuntime *rt) { return IAudioClient_Stop(rt->client); }
+static HRESULT real_reset(HostRuntime *rt) { return IAudioClient_Reset(rt->client); }
 static HRESULT real_get_position(HostRuntime *rt, UINT64 *position, UINT64 *qpc) {
     return IAudioClock_GetPosition(rt->clock, position, qpc);
 }
 
 static const HostApi g_real_api = {
     real_get_padding, real_get_buffer, real_release_buffer,
-    real_start, real_stop, real_get_position
+    real_start, real_stop, real_get_position, real_reset
 };
 
 static uint32_t host_startup_reason(HRESULT hr) {

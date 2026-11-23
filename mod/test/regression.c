@@ -1018,6 +1018,59 @@ static void remote_fixture_end(void) {
     g_remote_reason = NEX_AUDIO_FALLBACK_NONE;
 }
 
+/* ---- v3.1 transport from the client side ----------------------------------- */
+static volatile LONG flush_acker_stop;
+static DWORD WINAPI flush_acker(LPVOID arg) {
+    NexAudioControl *c = (NexAudioControl *)arg;
+    while (!flush_acker_stop) {
+        UINT64 req = nex_audio_read64(&c->flush_request_generation);
+        if (req != nex_audio_read64(&c->flush_ack_generation))
+            InterlockedExchange64((volatile LONG64 *)&c->flush_ack_generation, (LONG64)req);
+        Sleep(1);
+    }
+    return 0;
+}
+
+static void test_remote_transport_signals(void) {
+    NexAudioControl control;
+    BYTE pcm[64 * 6];
+    SinkGen gen;
+    prepare_ring();
+    remote_fixture_begin(&control, pcm, 64, 6);
+    memset(&gen, 0, sizeof(gen));
+    gen.remote = 1;
+    gen.ref = 2;
+    g_sink.gen = &gen;
+    g_sink.started = 1;
+    CHECK(control.transport == NEX_AUDIO_TRANSPORT_PLAY);
+    CHECK(sink_stop() == S_OK);
+    CHECK(control.transport == NEX_AUDIO_TRANSPORT_PAUSE);
+    remote_set_transport(NEX_AUDIO_TRANSPORT_PLAY);
+    CHECK(control.transport == NEX_AUDIO_TRANSPORT_PLAY);
+
+    /* without a Host the flush request is still published, and times out */
+    CHECK(!remote_request_flush(30));
+    CHECK(control.flush_request_generation == 1);
+    /* with a Host acknowledging, the request completes */
+    flush_acker_stop = 0;
+    HANDLE t = CreateThread(NULL, 0, flush_acker, &control, 0, NULL);
+    CHECK(remote_request_flush(500));
+    CHECK(control.flush_request_generation == 2 && control.flush_ack_generation == 2);
+    flush_acker_stop = 1;
+    WaitForSingleObject(t, 1000);
+    CloseHandle(t);
+
+    /* teardown drains the Host only when the stream was still playing */
+    CHECK(sink_teardown_waits_for_eos(1, 1));
+    CHECK(!sink_teardown_waits_for_eos(1, 0));
+    CHECK(!sink_teardown_waits_for_eos(0, 1));
+
+    g_sink.gen = NULL;
+    remote_fixture_end();
+    free_ring();
+    printf("PASS remote transport: Stop pauses, Start plays, Reset flushes the Host, stopped teardown skips EOS\n");
+}
+
 static void test_remote_converted_drain(void) {
     prepare_ring();
     g_sink.in_rate = 44100;
@@ -2478,6 +2531,7 @@ int main(void) {
     test_float_pipeline_keeps_32_bit_precision();
     test_auto_dither_keeps_exact_samples();
     test_drain_window_count();
+    test_remote_transport_signals();
     test_multichannel_conversion_keeps_channels();
     test_multichannel_resample_keeps_channels();
     test_drain_thread_registers_mmcss();

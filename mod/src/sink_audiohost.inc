@@ -373,6 +373,40 @@ static UINT32 remote_write(const BYTE *client, const BYTE *converted, UINT32 fra
     }
 }
 
+/* v3.1 transport. The Host owns the device, so the client's Stop/Start and
+   Reset reach it as requests on the control page. */
+static void remote_set_transport(UINT32 transport) {
+    if (!g_remote_ipc) return;
+    InterlockedExchange((volatile LONG *)&g_remote_ipc->transport, (LONG)transport);
+    if (g_remote_data) SetEvent(g_remote_data);
+}
+
+/* Ask the Host to drop its ring and device buffer (a seek). Called with the
+   drain thread stopped, so nothing writes while the Host discards. Returns 1
+   once the Host has acknowledged within timeout_ms. */
+static int remote_request_flush(DWORD timeout_ms) {
+    if (!g_remote_ipc) return 0;
+    UINT64 generation = nex_audio_read64(&g_remote_ipc->flush_request_generation) + 1;
+    InterlockedExchange64((volatile LONG64 *)&g_remote_ipc->flush_request_generation,
+                          (LONG64)generation);
+    if (g_remote_data) SetEvent(g_remote_data);
+    DWORD start = GetTickCount();
+    for (;;) {
+        if (nex_audio_read64(&g_remote_ipc->flush_ack_generation) == generation) return 1;
+        LONG state = remote_state();
+        if (state == NEX_AUDIO_FAILED || state == NEX_AUDIO_CLOSING) return 0;
+        if (GetTickCount() - start >= timeout_ms) return 0;
+        if (g_remote_space) WaitForSingleObject(g_remote_space, 5); else Sleep(2);
+    }
+}
+
+/* EOS asks the Host to play out what it holds. That only makes sense for a
+   stream that was still playing; a stopped stream's tail belongs to a pause or
+   a skip and must not be played, nor waited for. */
+static int sink_teardown_waits_for_eos(int was_remote, int was_playing) {
+    return was_remote && was_playing;
+}
+
 /* Called only when a real source-end signal becomes available. Stop, Reset and
    a track rebuild are transport controls and must not be misreported as EOS. */
 static void remote_submit_eos(void) {
