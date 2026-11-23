@@ -124,7 +124,7 @@ static void remote_close(void) {
     if (g_remote_data) CloseHandle(g_remote_data);
     if (g_remote_space) CloseHandle(g_remote_space);
     if (g_remote_ready) CloseHandle(g_remote_ready);
-    free(g_remote_out);
+    audio_free(g_remote_out);
     g_remote_out = NULL;
     g_remote_ipc = NULL;
     g_remote_pcm_data = NULL;
@@ -281,6 +281,7 @@ static HRESULT remote_try_exclusive(SinkGen *g, IMMDevice *dev,
         g->real_frames = c->device_frames;
         g->real_latency = (REFERENCE_TIME)c->device_latency_100ns;
         g_remote_out = (BYTE *)malloc((size_t)SCRATCH_FRAMES * c->output_frame_bytes);
+        audio_mem_lock(g_remote_out, (SIZE_T)SCRATCH_FRAMES * c->output_frame_bytes);
         if (!g_remote_out) {
             g_remote_error = E_OUTOFMEMORY;
             g_remote_reason = NEX_AUDIO_FALLBACK_MAPPING_FAILED;
@@ -457,7 +458,10 @@ static void remote_submit_eos(void) {
 
 static int remote_wait_eos_complete(UINT64 generation) {
     if (!g_remote_ipc || !generation) return 0;
-    DWORD deadline = GetTickCount() + 5000u;
+    DWORD bound = nex_audio_policy_eos_wait_ms(
+        nex_audio_ring_available(g_remote_ipc) + g_remote_ipc->device_padding_frames,
+        (long)g_remote_ipc->output_rate);
+    DWORD deadline = GetTickCount() + bound;
     for (;;) {
         remote_sync_stats();
         if (nex_audio_read64(&g_remote_ipc->eos_complete_generation) == generation)
@@ -473,8 +477,9 @@ static int remote_wait_eos_complete(UINT64 generation) {
             g_remote_ipc->fallback_reason = g_remote_reason;
             InterlockedExchange((volatile LONG *)&g_remote_ipc->state, NEX_AUDIO_FAILED);
             if (g_remote_data) SetEvent(g_remote_data);
-            log_line("audiohost: EOS wait timed out generation=%llu state=%s",
-                     (unsigned long long)generation, nex_audio_state_name(state));
+            log_line("audiohost: EOS wait timed out after %lu ms generation=%llu state=%s",
+                     (unsigned long)bound, (unsigned long long)generation,
+                     nex_audio_state_name(state));
             return 0;
         }
         DWORD remaining = deadline - now;

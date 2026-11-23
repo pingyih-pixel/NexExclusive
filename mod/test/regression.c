@@ -2452,6 +2452,25 @@ static void test_remote_clock_converts_device_ticks(void) {
     printf("PASS remote clock: device ticks are converted to 100 ns, primed silence excluded\n");
 }
 
+/* ---- Orion 5: the drain path's buffers are locked in memory --------------- */
+static void test_audio_buffers_locked(void) {
+    LONG64 before = g_audio_locked_bytes;
+    SIZE_T n = 4u << 20;                          /* larger than the default WS minimum */
+    void *p = malloc(n);
+    CHECK(p != NULL);
+    audio_mem_lock(p, n);
+    CHECK(g_audio_locked_bytes == before + (LONG64)n);
+    audio_free(p);
+    CHECK(g_audio_locked_bytes == before);
+    g_memlock = 0;                                /* memlock=0 leaves buffers pageable */
+    p = malloc(4096);
+    audio_mem_lock(p, 4096);
+    CHECK(g_audio_locked_bytes == before);
+    audio_free(p);
+    g_memlock = 1;
+    printf("PASS memlock: buffers locked after allocation, unlocked before free, off switch honoured\n");
+}
+
 static void test_src_response(void) {
     static const struct { int in, out; const char *name; } ratios[] = {
         {44100, 48000, "44.1k->48k"},
@@ -2675,6 +2694,7 @@ int main(void) {
     test_drain_primes_silence();
     test_clock_excludes_primed_silence();
     test_remote_clock_converts_device_ticks();
+    test_audio_buffers_locked();
     test_multichannel_conversion_keeps_channels();
     test_multichannel_resample_keeps_channels();
     test_drain_thread_registers_mmcss();

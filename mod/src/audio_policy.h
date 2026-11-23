@@ -145,6 +145,23 @@ NEX_AUDIO_POLICY_FN long nex_audio_policy_prime_frames(long previous_rate, long 
     return frames;
 }
 
+/* How long a teardown may wait for the separate host to play out what it
+   holds: the audio still buffered (ring + device), plus a scheduling margin.
+   A fixed 5 s held the client's teardown for seconds whenever the Host stalled,
+   although nothing longer than the buffered audio can legitimately be pending. */
+#define NEX_AUDIO_EOS_MARGIN_MS 250
+#define NEX_AUDIO_EOS_MIN_MS    300
+#define NEX_AUDIO_EOS_MAX_MS    5000
+NEX_AUDIO_POLICY_FN unsigned long nex_audio_policy_eos_wait_ms(unsigned long long buffered_frames,
+                                                               long rate) {
+    if (rate <= 0) return NEX_AUDIO_EOS_MAX_MS;
+    unsigned long long ms = buffered_frames * 1000ull / (unsigned long long)rate
+                          + NEX_AUDIO_EOS_MARGIN_MS;
+    if (ms < NEX_AUDIO_EOS_MIN_MS) ms = NEX_AUDIO_EOS_MIN_MS;
+    if (ms > NEX_AUDIO_EOS_MAX_MS) ms = NEX_AUDIO_EOS_MAX_MS;
+    return (unsigned long)ms;
+}
+
 /* ---- what the negotiated path does to the samples ------------------------- */
 enum {
     NEX_AUDIO_PATH_NATIVE = 0,    /* identical bytes                             */

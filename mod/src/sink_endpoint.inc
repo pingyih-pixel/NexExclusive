@@ -510,15 +510,18 @@ static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
        device's clock. g_fout is sized from the new device's buffer. */
     if (g_sink.resample) {
         if (!src_init(g_sink.in_rate, rate, g_sink.in_channels)) { sink_teardown(); return E_OUTOFMEMORY; }
-        free(g_fout);
+        audio_free(g_fout);
         g_fout = (double *)malloc((size_t)gen->real_frames * g_sink.in_channels * sizeof(double));
-        if (!g_fin)
+        audio_mem_lock(g_fout, (SIZE_T)gen->real_frames * g_sink.in_channels * sizeof(double));
+        if (!g_fin) {
             g_fin = (double *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_channels * sizeof(double));
+            audio_mem_lock(g_fin, (SIZE_T)SCRATCH_FRAMES * g_sink.in_channels * sizeof(double));
+        }
         if (!g_fout || !g_fin) { sink_teardown(); return E_OUTOFMEMORY; }
     } else {
         src_free();
-        free(g_fout); g_fout = NULL;
-        free(g_fin);  g_fin  = NULL;
+        audio_free(g_fout); g_fout = NULL;
+        audio_free(g_fin);  g_fin  = NULL;
     }
 
     g_sink.clock_base   = keep_clock;
@@ -729,6 +732,11 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     if(!g_inb || (g_sink.resample && (!g_fin || !g_fout))) {
         sink_teardown_controlled();return E_OUTOFMEMORY;
     }
+    audio_mem_lock(g_inb, (SIZE_T)SCRATCH_FRAMES*g_sink.in_block);
+    if (g_sink.resample) {
+        audio_mem_lock(g_fin, (SIZE_T)SCRATCH_FRAMES*g_sink.in_channels*sizeof(double));
+        audio_mem_lock(g_fout, (SIZE_T)gen->real_frames*g_sink.in_channels*sizeof(double));
+    }
 
     /* buffer the client is told about */
     UINT32 want = (UINT32)g_out_frames;
@@ -746,6 +754,8 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     g_sink.ring = (BYTE *)calloc((size_t)g_sink.cap, (size_t)g_sink.in_block);
     g_sink.conv = (BYTE *)malloc((size_t)g_sink.cap*g_sink.in_block);
     if (!g_sink.ring || !g_sink.conv) { sink_teardown_controlled(); return E_OUTOFMEMORY; }
+    audio_mem_lock(g_sink.ring, (SIZE_T)g_sink.cap * g_sink.in_block);
+    audio_mem_lock(g_sink.conv, (SIZE_T)g_sink.cap * g_sink.in_block);
     g_sink.w = g_sink.r = 0;
 
     g_sink.h_space = CreateEventA(NULL, FALSE, FALSE, NULL);

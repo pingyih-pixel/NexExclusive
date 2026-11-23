@@ -503,6 +503,21 @@ int wmain(int argc, wchar_t **argv) {
         goto done;
     }
     rt.data = data;
+    {
+        /* Keep the shared ring and control page resident: a trimmed page here
+           is a hard fault on the render thread. Best effort. */
+        SIZE_T lock_bytes = (SIZE_T)control->data_bytes + sizeof(NexAudioControl);
+        SIZE_T lo = 0, hi = 0;
+        HANDLE self = GetCurrentProcess();
+        if (GetProcessWorkingSetSize(self, &lo, &hi))
+            SetProcessWorkingSetSize(self, lo + lock_bytes + 256 * 1024,
+                                     hi > lo + 2 * lock_bytes + 256 * 1024
+                                         ? hi : lo + 2 * lock_bytes + 256 * 1024);
+        BOOL locked = VirtualLock(data, (SIZE_T)control->data_bytes) &&
+                      VirtualLock(control, sizeof(NexAudioControl));
+        host_log("memlock: ring %llu bytes %s", (unsigned long long)control->data_bytes,
+                 locked ? "locked" : "left pageable");
+    }
 
     hr = open_device(control, &device);
     if (FAILED(hr) || !device) {

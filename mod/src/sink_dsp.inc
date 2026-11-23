@@ -196,9 +196,9 @@ static double *g_fin;   /* the same frames as double */
 static double *g_fout;  /* resampled output, up to one device buffer */
 
 static void scratch_free(void) {
-    if (g_inb)  { free(g_inb);  g_inb  = NULL; }
-    if (g_fin)  { free(g_fin);  g_fin  = NULL; }
-    if (g_fout) { free(g_fout); g_fout = NULL; }
+    if (g_inb)  { audio_free(g_inb);  g_inb  = NULL; }
+    if (g_fin)  { audio_free(g_fin);  g_fin  = NULL; }
+    if (g_fout) { audio_free(g_fout); g_fout = NULL; }
 }
 
 /* A transport Reset discards input history, not just the client ring. Cached
@@ -212,8 +212,8 @@ static void src_reset(int ch) {
 }
 
 static void src_free(void) {
-    if (g_src.buf)  { free(g_src.buf);  g_src.buf  = NULL; }
-    if (g_src.pool) { free(g_src.pool); g_src.pool = NULL; }
+    if (g_src.buf)  { audio_free(g_src.buf);  g_src.buf  = NULL; }
+    if (g_src.pool) { audio_free(g_src.pool); g_src.pool = NULL; }
     memset(g_src.ph, 0, sizeof(g_src.ph));
     g_src.count = 0;
     g_src.pos   = 0;
@@ -275,6 +275,8 @@ static int src_init(int in_rate, int out_rate, int ch) {
     g_src.buf  = (double *)calloc((size_t)SRC_CAP * (size_t)ch, sizeof(double));
     g_src.pool = (double *)calloc((size_t)phases * stride, sizeof(double));
     if (!g_src.buf || !g_src.pool) { src_free(); return 0; }
+    audio_mem_lock(g_src.buf, (SIZE_T)SRC_CAP * (SIZE_T)ch * sizeof(double));
+    audio_mem_lock(g_src.pool, (SIZE_T)phases * stride * sizeof(double));
 
     g_i0_beta = src_i0(SRC_BETA);
     for (int i = 0; i < phases; i++) {

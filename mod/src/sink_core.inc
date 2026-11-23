@@ -9,6 +9,7 @@ static int g_fade_ms     = 0;   /* explicit processing; 0 (default) leaves sampl
 static int g_shared_fallback = 0; /* strict exclusive by default */
 static int g_hifi        = 0;   /* strict native client-format exclusive path */
 static int g_audiohost   = 0;   /* optional out-of-process exclusive renderer */
+static int g_memlock     = 1;   /* VirtualLock the buffers the drain path touches */
 static int g_prime       = 1;   /* one device buffer of silence before a fresh start */
 static int g_resync_ms   = 200; /* extra silence when the DAC changes clock family */
 /* Which rate to prefer when the device refuses the source rate.
@@ -160,6 +161,70 @@ static void log_line(const char *fmt, ...) {
         LeaveCriticalSection(&g_log_qlock);
     }
     OutputDebugStringA(buf);
+}
+
+/* ---- audio buffers stay resident (Orion: VirtualLock) ---------------------
+   A page of the ring or the resampler that has been trimmed from the working
+   set costs a hard fault on the audio thread - milliseconds on a busy disk,
+   which is an audible gap at a 100 ms device buffer. The buffers the drain
+   path touches are locked after allocation and unlocked before free. The
+   working-set minimum is raised as needed; failure only logs. memlock=0 in
+   hook.cfg turns this off. */
+#define AUDIO_LOCK_SLOTS 16
+typedef struct AudioLock { void *volatile p; SIZE_T n; } AudioLock;
+static AudioLock g_audio_locks[AUDIO_LOCK_SLOTS];
+static volatile LONG64 g_audio_locked_bytes;
+static volatile LONG g_audio_lock_failures;
+
+static int audio_mem_grow_working_set(SIZE_T n) {
+    SIZE_T lo = 0, hi = 0;
+    HANDLE self = GetCurrentProcess();
+    if (!GetProcessWorkingSetSize(self, &lo, &hi)) return 0;
+    SIZE_T want_lo = lo + n + 256 * 1024;
+    SIZE_T want_hi = hi > want_lo + n ? hi : want_lo + n;
+    return SetProcessWorkingSetSize(self, want_lo, want_hi) ? 1 : 0;
+}
+
+static void audio_mem_lock(void *p, SIZE_T n) {
+    if (!g_memlock || !p || !n) return;
+    int slot = -1;
+    for (int i = 0; i < AUDIO_LOCK_SLOTS; i++)
+        if (InterlockedCompareExchangePointer((PVOID volatile *)&g_audio_locks[i].p, p, NULL) == NULL) {
+            slot = i;
+            break;
+        }
+    if (slot < 0) return;
+    BOOL ok = VirtualLock(p, n);
+    if (!ok && GetLastError() == ERROR_WORKING_SET_QUOTA && audio_mem_grow_working_set(n))
+        ok = VirtualLock(p, n);
+    if (!ok) {
+        DWORD e = GetLastError();
+        InterlockedExchangePointer((PVOID volatile *)&g_audio_locks[slot].p, NULL);
+        if (InterlockedIncrement(&g_audio_lock_failures) <= 3)
+            log_line("memlock: VirtualLock(%lu bytes) failed %lu; buffer stays pageable",
+                     (unsigned long)n, (unsigned long)e);
+        return;
+    }
+    g_audio_locks[slot].n = n;
+    InterlockedExchangeAdd64(&g_audio_locked_bytes, (LONG64)n);
+}
+
+static void audio_mem_unlock(void *p) {
+    if (!p) return;
+    for (int i = 0; i < AUDIO_LOCK_SLOTS; i++) {
+        if (g_audio_locks[i].p != p) continue;
+        SIZE_T n = g_audio_locks[i].n;
+        VirtualUnlock(p, n);
+        InterlockedExchangeAdd64(&g_audio_locked_bytes, -(LONG64)n);
+        g_audio_locks[i].n = 0;
+        InterlockedExchangePointer((PVOID volatile *)&g_audio_locks[i].p, NULL);
+        return;
+    }
+}
+
+static void audio_free(void *p) {
+    audio_mem_unlock(p);
+    free(p);
 }
 
 /* ---- device generation -------------------------------------------------- */
@@ -482,6 +547,7 @@ static void load_config(void) {
         else if (_strnicmp(p, "audiohost=", 10) == 0) g_audiohost = atoi(p + 10) != 0;
         else if (_strnicmp(p, "log=", 4) == 0) g_log_enabled = atoi(p + 4) != 0;
         else if (_strnicmp(p, "prime=", 6) == 0) g_prime = atoi(p + 6) != 0;
+        else if (_strnicmp(p, "memlock=", 8) == 0) g_memlock = atoi(p + 8) != 0;
         else if (_strnicmp(p, "resync_ms=", 10) == 0) g_resync_ms = atoi(p + 10);
         else if (_strnicmp(p, "src_prefer=", 11) == 0) {
             char v[32];

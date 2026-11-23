@@ -511,6 +511,16 @@ static void test_rate_family_and_prime() {
     std::printf("PASS prime: one buffer of silence per fresh start, +resync across clock families\n");
 }
 
+/* ---- Orion 4: the EOS wait is bounded by what is actually buffered ---------- */
+static void test_eos_wait_bound() {
+    CHECK(nex_audio_policy_eos_wait_ms(0, 48000) == 300);              /* floor */
+    CHECK(nex_audio_policy_eos_wait_ms(4800, 48000) == 350);           /* 100 ms + margin */
+    CHECK(nex_audio_policy_eos_wait_ms(48000, 48000) == 1250);         /* 1 s + margin */
+    CHECK(nex_audio_policy_eos_wait_ms(192000ull * 60, 192000) == 5000); /* capped */
+    CHECK(nex_audio_policy_eos_wait_ms(4800, 0) == 5000);              /* unknown rate */
+    std::printf("PASS eos wait: buffered audio + 250 ms, between 300 ms and 5 s\n");
+}
+
 int main() {
     test_16_bit_source_ladder_precedes_higher_setting();
     test_24_bit_source_ladder();
@@ -541,6 +551,7 @@ int main() {
     test_bits_zero_follows_source();
     test_path_kind_labels();
     test_rate_family_and_prime();
+    test_eos_wait_bound();
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }
