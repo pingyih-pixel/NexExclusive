@@ -207,6 +207,7 @@ static HRESULT sink_teardown(void) {
     if(g_sink.h_space)CloseHandle(g_sink.h_space);
     if(g_sink.h_data)CloseHandle(g_sink.h_data);
     audio_free(g_sink.ring);audio_free(g_sink.conv);
+    sink_restore_priority();
     if(g_sink.owner) {
         EnterCriticalSection(&g_patch_lock);
         for(int i=0;i<128;i++)if(g_bindings[i].client==g_sink.owner) {

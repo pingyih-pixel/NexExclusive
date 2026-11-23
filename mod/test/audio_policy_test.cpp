@@ -531,6 +531,22 @@ static void test_event_mode_fits() {
     std::printf("PASS event mode: used only when a full period fits the resampler history\n");
 }
 
+/* ---- Orion 7: the optional dedicated core ------------------------------------ */
+static void test_pick_core() {
+    /* hybrid: 2 P-cores (class 1, SMT pairs) then 4 E-cores (class 0) */
+    NexAudioCoreInfo hybrid[6] = {
+        {1, 0x3}, {1, 0xC}, {0, 0x10}, {0, 0x20}, {0, 0x40}, {0, 0x80},
+    };
+    CHECK(nex_audio_policy_pick_core(hybrid, 6) == 1);       /* fast core, not CPU 0 */
+    NexAudioCoreInfo flat[4] = { {0, 0x1}, {0, 0x2}, {0, 0x4}, {0, 0x8} };
+    CHECK(nex_audio_policy_pick_core(flat, 4) == 3);         /* last core */
+    NexAudioCoreInfo one[1] = { {0, 0x1} };
+    CHECK(nex_audio_policy_pick_core(one, 1) == -1);         /* nothing to spare */
+    NexAudioCoreInfo e_first[3] = { {0, 0x1}, {1, 0x2}, {0, 0x4} };
+    CHECK(nex_audio_policy_pick_core(e_first, 3) == 1);
+    std::printf("PASS dedicated core: fastest class, never the core holding CPU 0\n");
+}
+
 int main() {
     test_16_bit_source_ladder_precedes_higher_setting();
     test_24_bit_source_ladder();
@@ -563,6 +579,7 @@ int main() {
     test_rate_family_and_prime();
     test_eos_wait_bound();
     test_event_mode_fits();
+    test_pick_core();
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }

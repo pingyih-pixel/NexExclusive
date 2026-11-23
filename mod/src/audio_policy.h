@@ -176,6 +176,26 @@ NEX_AUDIO_POLICY_FN int nex_audio_policy_event_fits(long in_rate, long out_rate,
     return need <= src_cap;
 }
 
+/* Optional dedicated core for the drain thread (hook.cfg dedicated_core=1).
+   One entry per physical core: its efficiency class (higher = faster core on
+   hybrid CPUs, all 0 elsewhere) and its logical-processor mask in group 0.
+   Picks the last core of the fastest class that does not hold logical CPU 0,
+   where most device interrupts and DPCs land. -1: nothing worth pinning to. */
+typedef struct NexAudioCoreInfo {
+    unsigned char efficiency;
+    unsigned long long mask;
+} NexAudioCoreInfo;
+
+NEX_AUDIO_POLICY_FN int nex_audio_policy_pick_core(const NexAudioCoreInfo *cores, int count) {
+    if (!cores || count < 2) return -1;
+    int best = -1;
+    for (int i = 0; i < count; i++) {
+        if (!cores[i].mask || (cores[i].mask & 1ull)) continue;
+        if (best < 0 || cores[i].efficiency >= cores[best].efficiency) best = i;
+    }
+    return best;
+}
+
 /* ---- what the negotiated path does to the samples ------------------------- */
 enum {
     NEX_AUDIO_PATH_NATIVE = 0,    /* identical bytes                             */

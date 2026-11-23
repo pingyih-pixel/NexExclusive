@@ -380,11 +380,65 @@ static void drain_mmcss_leave(HANDLE h) {
     if (h) AvRevertMmThreadCharacteristics(h);
 }
 
+/* Orion's LocalPlaybackTuning, both opt-in: a core of its own for the drain
+   thread, and a raised process priority class while a stream is engaged. */
+static DWORD g_prio_saved;              /* 0: not raised */
+
+static void drain_pin_core(void) {
+    DWORD bytes = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &bytes);
+    if (!bytes) return;
+    BYTE *buf = (BYTE *)malloc(bytes);
+    if (!buf) return;
+    NexAudioCoreInfo cores[64];
+    int count = 0;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore,
+                                         (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf, &bytes)) {
+        for (DWORD off = 0; off < bytes && count < 64;) {
+            PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX e =
+                (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf + off);
+            if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount &&
+                e->Processor.GroupMask[0].Group == 0) {
+                cores[count].efficiency = e->Processor.EfficiencyClass;
+                cores[count].mask = (unsigned long long)e->Processor.GroupMask[0].Mask;
+                count++;
+            }
+            if (!e->Size) break;
+            off += e->Size;
+        }
+    }
+    free(buf);
+    int pick = nex_audio_policy_pick_core(cores, count);
+    if (pick < 0) { log_line("drain: dedicated_core: no suitable core (%d cores)", count); return; }
+    DWORD_PTR old = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)cores[pick].mask);
+    log_line("drain: pinned to core %d mask=0x%llX class=%u%s", pick,
+             cores[pick].mask, (unsigned)cores[pick].efficiency, old ? "" : " (failed)");
+}
+
+static void sink_raise_priority(void) {
+    if (!g_process_priority || g_prio_saved) return;
+    DWORD current = GetPriorityClass(GetCurrentProcess());
+    if (!current || current == HIGH_PRIORITY_CLASS || current == REALTIME_PRIORITY_CLASS) return;
+    if (SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS)) {
+        g_prio_saved = current;
+        log_line("sink: process priority raised to HIGH (was 0x%lX)", (unsigned long)current);
+    }
+}
+
+static void sink_restore_priority(void) {
+    if (!g_prio_saved) return;
+    SetPriorityClass(GetCurrentProcess(), g_prio_saved);
+    log_line("sink: process priority restored to 0x%lX", (unsigned long)g_prio_saved);
+    g_prio_saved = 0;
+}
+
 static DWORD WINAPI drain_thread(LPVOID param) {
     SinkGen *g=(SinkGen *)param;
     HRESULT co=CoInitializeEx(NULL,COINIT_MULTITHREADED);
     const char *mm_task = NULL;
     HANDLE mmcss = drain_mmcss_enter(&mm_task);
+    if (g_dedicated_core) drain_pin_core();
+    sink_raise_priority();
     g->stage=STAGE_IDLE;
     log_line("drain: thread up (gen %llu), out=%d Hz/%d.%d bit, mmcss=%s",
              (unsigned long long)g->id,g_sink.out_rate,out_container(),out_valid(),

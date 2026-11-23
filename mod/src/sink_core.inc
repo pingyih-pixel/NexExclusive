@@ -9,6 +9,8 @@ static int g_fade_ms     = 0;   /* explicit processing; 0 (default) leaves sampl
 static int g_shared_fallback = 0; /* strict exclusive by default */
 static int g_hifi        = 0;   /* strict native client-format exclusive path */
 static int g_audiohost   = 0;   /* optional out-of-process exclusive renderer */
+static int g_dedicated_core = 0; /* pin the drain thread to one fast core */
+static int g_process_priority = 0; /* HIGH_PRIORITY_CLASS while engaged */
 static int g_event       = 1;   /* try event-driven exclusive first, timer polling if refused */
 static int g_memlock     = 1;   /* VirtualLock the buffers the drain path touches */
 static int g_prime       = 1;   /* one device buffer of silence before a fresh start */
@@ -551,6 +553,8 @@ static void load_config(void) {
         else if (_strnicmp(p, "prime=", 6) == 0) g_prime = atoi(p + 6) != 0;
         else if (_strnicmp(p, "memlock=", 8) == 0) g_memlock = atoi(p + 8) != 0;
         else if (_strnicmp(p, "event=", 6) == 0) g_event = atoi(p + 6) != 0;
+        else if (_strnicmp(p, "dedicated_core=", 15) == 0) g_dedicated_core = atoi(p + 15) != 0;
+        else if (_strnicmp(p, "process_priority=", 17) == 0) g_process_priority = atoi(p + 17) != 0;
         else if (_strnicmp(p, "resync_ms=", 10) == 0) g_resync_ms = atoi(p + 10);
         else if (_strnicmp(p, "src_prefer=", 11) == 0) {
             char v[32];
