@@ -156,6 +156,32 @@ static HRESULT host_check_eos(HostRuntime *rt) {
     return S_FALSE;
 }
 
+/* Set NEX_HOST_DUMP=<file> in the client's environment (the Host inherits it)
+   to capture exactly the PCM the Host hands to the device, for a byte-level
+   comparison with the DLL's NEX_DUMP capture (tools/compare_pcm.py). Start-up
+   silence is not written: it is not client audio. Diagnostic only - the
+   writes are buffered, but they are still on the render thread. */
+static FILE *g_host_dump;
+static int   g_host_dump_state;     /* 0 = not tried, 1 = open, -1 = off */
+
+static void host_dump(const BYTE *p, size_t bytes) {
+    if (!g_host_dump_state) {
+        g_host_dump_state = -1;
+        const wchar_t *path = _wgetenv(L"NEX_HOST_DUMP");
+        if (path && *path) {
+            g_host_dump = _wfopen(path, L"wb");
+            if (g_host_dump) {
+                setvbuf(g_host_dump, NULL, _IOFBF, 1u << 20);
+                g_host_dump_state = 1;
+                host_log("dump: device frames -> %ls", path);
+            } else {
+                host_log("dump: cannot open %ls", path);
+            }
+        }
+    }
+    if (g_host_dump_state == 1 && bytes) fwrite(p, 1, bytes, g_host_dump);
+}
+
 static HRESULT host_submit(HostRuntime *rt, uint32_t frames) {
     BYTE *destination = NULL;
     HRESULT hr = rt->api->get_buffer(rt, frames, &destination);
@@ -171,6 +197,7 @@ static HRESULT host_submit(HostRuntime *rt, uint32_t frames) {
     uint64_t next_hash = hash_bytes(destination, (size_t)frames *
                                     rt->control->output_frame_bytes,
                                     rt->endpoint_hash);
+    host_dump(destination, (size_t)frames * rt->control->output_frame_bytes);
     hr = rt->api->release_buffer(rt, frames, 0);
     if (FAILED(hr)) {
         add_counter(&rt->control->releasebuffer_failures, 1);
@@ -625,6 +652,7 @@ done:
         host_set_state(&rt, NEX_AUDIO_FAILED);
     if (ready_event && !ready_signalled) SetEvent(ready_event);
     if (mmss_active) AvRevertMmThreadCharacteristics(mmss);
+    if (g_host_dump) { fclose(g_host_dump); g_host_dump = NULL; }
     if (clock) IAudioClock_Release(clock);
     if (render) IAudioRenderClient_Release(render);
     if (client) IAudioClient_Release(client);

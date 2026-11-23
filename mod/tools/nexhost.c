@@ -883,6 +883,12 @@ static void status_json(char *out, size_t n) {
     unsigned long long dropped = line_ull(remote_status, "dropped=");
     unsigned long long eos_submitted = line_ull(remote_status, "eos_submitted=");
     unsigned long long eos_complete = line_ull(remote_status, "eos_complete=");
+    unsigned long long ring_used = line_ull(remote_status, "ring_used=");
+    unsigned long long ring_capacity = line_ull(remote_status, "ring_capacity=");
+    unsigned long long device_padding = line_ull(remote_status, "device_padding=");
+    unsigned long long latency_ms = line_ull(remote_status, "latency_ms=");
+    unsigned long long write_waits = line_ull(remote_status, "write_waits=");
+    unsigned long long write_wait_max = line_ull(remote_status, "write_wait_max_ms=");
     char *rs = json_escape(remote_status);
     source_refresh_probe();
     if (!_stricmp(g_source.status, "pending") && !g_source.probe_started_ms &&
@@ -902,6 +908,9 @@ static void status_json(char *out, size_t n) {
              "\"backpressure\":%llu,\"underrunEvents\":%llu,"
              "\"droppedFrames\":%llu,\"currentGeneration\":%llu,"
              "\"eosSubmittedGeneration\":%llu,\"eosCompleteGeneration\":%llu,"
+             "\"ringUsedFrames\":%llu,\"ringCapacityFrames\":%llu,"
+             "\"devicePaddingFrames\":%llu,\"remoteLatencyMs\":%llu,"
+             "\"writeWaits\":%llu,\"writeWaitMaxMs\":%llu,"
              "\"remoteStatus\":\"%s\",%s,%s,"
              "\"source_status\":\"%s\",\"source_play_id\":\"%s\","
              "\"source_format\":\"%s\",\"source_rate\":%d,"
@@ -917,7 +926,9 @@ static void status_json(char *out, size_t n) {
              active_audiohost ? "wasapi" : "wasapi",
              active_audiohost ? "audiohost" : "in_process",
              converted, source_waits, backpressure, underruns, dropped, generation,
-             eos_submitted, eos_complete, rs ? rs : "", ep, verification,
+             eos_submitted, eos_complete,
+             ring_used, ring_capacity, device_padding, latency_ms, write_waits, write_wait_max,
+             rs ? rs : "", ep, verification,
              source_status, source_play_id ? source_play_id : "",
              source_format ? source_format : "", g_source.rate, g_source.channels,
              g_source.sample_bytes, g_source.valid_bits, g_source.container_bits,

@@ -41,13 +41,16 @@ fi
 
 FLAGS=(-target x86_64-windows-gnu -O2 -Wall)
 LIBS=(-lole32 -loleaut32 -luuid -lavrt)
-# The control-page identity is generated from the checked-out wire sources and
-# the current working diff.  Both client and Host receive the same wire id,
-# while the Host compares against its own compiled-in expected value.
-WIRE_HASH=$( {
-    git -C "$MOD_DIR/.." rev-parse HEAD 2>/dev/null || true
-    git -C "$MOD_DIR/.." diff -- mod/tools/nexaudiolink.h mod/tools/nexaudiohost.c mod/src 2>/dev/null || true
-} | sha256sum | cut -c1-16 )
+# The control-page identity is the content of the three files that define the
+# wire contract: the layout (nexaudiolink.h) and both ends that speak it
+# (nexaudiohost.c, sink_audiohost.inc). Both client and Host receive the same
+# id and the Host compares it against its own compiled-in value. It used to
+# include git HEAD and the whole mod/src diff, so any commit - even a panel
+# text change - made a freshly built DLL refuse the deployed Host. Line endings
+# are normalised so a CRLF checkout gets the same id.
+WIRE_HASH=$( cat -- "$MOD_DIR/tools/nexaudiolink.h" "$MOD_DIR/tools/nexaudiohost.c" \
+                    "$MOD_DIR/src/sink_audiohost.inc" 2>/dev/null | tr -d '\r' \
+             | sha256sum | cut -c1-16 )
 if [[ ! "$WIRE_HASH" =~ ^[0-9a-fA-F]{16}$ ]]; then
     WIRE_HASH=4e45584156333031
 fi

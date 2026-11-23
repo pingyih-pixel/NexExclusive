@@ -413,6 +413,10 @@
     volume.className = 'nex-summary-line';
     volume.id = 'nex-volume';
     summary.appendChild(volume);
+    var remote = document.createElement('div');
+    remote.className = 'nex-summary-line';
+    remote.id = 'nex-remote';
+    summary.appendChild(remote);
     panel.appendChild(summary);
 
     var formatBlock = document.createElement('div');
@@ -1134,6 +1138,17 @@
     applyVisualState();
   }
 
+  /* Separate-host water level: what sits between the client and the DAC. */
+  function remoteSummary(snapshot) {
+    if (!snapshot || snapshot.deployment !== 'audiohost' || !snapshot.ringCapacityFrames) return '';
+    var text = '独立宿主　缓冲 ' + snapshot.remoteLatencyMs + ' ms'
+      + '（共享环 ' + snapshot.ringUsedFrames + ' / ' + snapshot.ringCapacityFrames + ' 帧，设备 '
+      + snapshot.devicePaddingFrames + ' 帧）';
+    if (snapshot.writeWaits) text += '　写入等待 ' + snapshot.writeWaits + ' 次，最长 ' + snapshot.writeWaitMaxMs + ' ms';
+    if (snapshot.underrunEvents) text += '　欠载 ' + snapshot.underrunEvents + ' 次';
+    return text;
+  }
+
   function refreshStatus() {
     var status = document.getElementById('nex-status');
     if (!status || !connected) return;
@@ -1158,6 +1173,8 @@
         if (state.dither === 2 && !strictHiFi()) {
           status.textContent += '　自动抖动仅在降位深时启用';
         }
+        var remote = document.getElementById('nex-remote');
+        if (remote) remote.textContent = remoteSummary(snapshot);
         var volume = document.getElementById('nex-volume');
         if (volume) {
           if (!snapshot.endpoint || snapshot.hwVolume === null || snapshot.hwVolume === undefined) {

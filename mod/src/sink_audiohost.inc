@@ -50,6 +50,14 @@ static long remote_state(void) {
         (volatile LONG *)&g_remote_ipc->state, 0, 0) : NEX_AUDIO_CLOSING;
 }
 
+/* Producer-side telemetry, reported once a second next to the Host's own
+   counters: how often a write had to wait for ring space, the longest wait,
+   and the lowest / highest shared water level seen in the window. */
+static UINT32 g_remote_write_waits;
+static UINT32 g_remote_write_wait_max_ms;
+static UINT64 g_remote_level_min = ~(UINT64)0;
+static UINT64 g_remote_level_max;
+
 static void remote_sync_stats(void) {
     if (!g_remote_ipc) return;
     g_sink.hifi_client_frames = nex_audio_read64(&g_remote_ipc->client_frames);
@@ -73,8 +81,15 @@ static void remote_sync_stats(void) {
     DWORD now = GetTickCount();
     if (now - last_remote_log >= 1000) {
         last_remote_log = now;
+        UINT64 ring_used = nex_audio_ring_available(g_remote_ipc);
+        UINT32 padding = g_remote_ipc->device_padding_frames;
+        UINT32 rate = g_remote_ipc->output_rate;
+        unsigned long latency_ms = rate
+            ? (unsigned long)((ring_used + padding) * 1000ull / rate) : 0;
         log_line("audiohost telemetry generation=%llu converted=%llu source_waits=%llu "
-                 "backpressure=%llu underrun=%llu dropped=%llu eos_submitted=%llu eos_complete=%llu",
+                 "backpressure=%llu underrun=%llu dropped=%llu eos_submitted=%llu eos_complete=%llu "
+                 "ring_used=%llu ring_min=%llu ring_max=%llu ring_capacity=%lu device_padding=%lu "
+                 "latency_ms=%lu write_waits=%lu write_wait_max_ms=%lu primed=%llu",
                  (unsigned long long)g_remote_ipc->stream_generation,
                  (unsigned long long)nex_audio_read64(&g_remote_ipc->converted_frames),
                  (unsigned long long)nex_audio_read64(&g_remote_ipc->source_waits),
@@ -82,7 +97,18 @@ static void remote_sync_stats(void) {
                  (unsigned long long)nex_audio_read64(&g_remote_ipc->underrun_events),
                  (unsigned long long)nex_audio_read64(&g_remote_ipc->dropped_frames),
                  (unsigned long long)nex_audio_read64(&g_remote_ipc->eos_submitted_generation),
-                 (unsigned long long)nex_audio_read64(&g_remote_ipc->eos_complete_generation));
+                 (unsigned long long)nex_audio_read64(&g_remote_ipc->eos_complete_generation),
+                 (unsigned long long)ring_used,
+                 (unsigned long long)(g_remote_level_min == ~(UINT64)0 ? 0 : g_remote_level_min),
+                 (unsigned long long)g_remote_level_max,
+                 (unsigned long)g_remote_ipc->capacity_frames,
+                 (unsigned long)padding, latency_ms,
+                 (unsigned long)g_remote_write_waits, (unsigned long)g_remote_write_wait_max_ms,
+                 (unsigned long long)nex_audio_read64(&g_remote_ipc->primed_frames_total));
+        g_remote_write_waits = 0;
+        g_remote_write_wait_max_ms = 0;
+        g_remote_level_min = ~(UINT64)0;
+        g_remote_level_max = 0;
     }
 }
 
@@ -329,6 +355,7 @@ static void remote_note_client(const BYTE *source, UINT32 frames) {
 static UINT32 remote_write(const BYTE *client, const BYTE *converted, UINT32 frames) {
     if (!g_remote_ipc || !converted || !frames) return 0;
     DWORD deadline = 0;
+    DWORD wait_start = 0;
     for (;;) {
         LONG state = remote_state();
         if (state == NEX_AUDIO_FAILED || state == NEX_AUDIO_CLOSING ||
@@ -350,11 +377,22 @@ static UINT32 remote_write(const BYTE *client, const BYTE *converted, UINT32 fra
                     (LONG64)hifi_changed_bytes(client, converted, bytes));
             }
             SetEvent(g_remote_data);
+            if (wait_start) {
+                DWORD waited = GetTickCount() - wait_start;
+                g_remote_write_waits++;
+                if (waited > g_remote_write_wait_max_ms) g_remote_write_wait_max_ms = waited;
+            }
+            {
+                UINT64 level = used + frames;
+                if (level < g_remote_level_min) g_remote_level_min = level;
+                if (level > g_remote_level_max) g_remote_level_max = level;
+            }
             remote_sync_stats();
             return frames;
         }
         DWORD now = GetTickCount();
         if (!deadline) {
+            wait_start = now;
             deadline = now + NEX_AUDIO_BACKPRESSURE_TIMEOUT_MS;
             InterlockedExchangeAdd64((volatile LONG64 *)&g_remote_ipc->backpressure_events, 1);
         }
