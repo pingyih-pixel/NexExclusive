@@ -522,6 +522,7 @@ static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
     }
 
     g_sink.clock_base   = keep_clock;
+    sink_arm_prime(gen, rate);
     g_sink.endpoint_key = key;
     g_sink.device_lost  = 0;
     g_sink.fault        = S_OK;
@@ -781,6 +782,7 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     g_sink.endpoint_key = key;
     g_sink.clock_base   = 0;
     g_sink.device_lost  = 0;
+    sink_arm_prime(gen, used_rate);
 
     char a[160], b[240];
     describe("in", fmt, a, sizeof(a));

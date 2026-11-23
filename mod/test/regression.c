@@ -2340,6 +2340,118 @@ static void test_log_queue_order_and_overflow(void) {
     printf("PASS log queue: FIFO order, bounded, overflow counted instead of blocking\n");
 }
 
+/* ---- Orion 1+2: the device starts on silence, the clock does not count it -- */
+static void test_drain_primes_silence(void) {
+    prepare_ring();
+    reset_patches();
+    SinkGen *gen = mock_gen();
+    gen->real_frames = 64;
+    g_sink.cap = 64;
+    free(g_sink.ring);
+    g_sink.ring = (BYTE *)calloc(64, 8);
+    g_sink.reported_frames = 32;
+    g_sink.in_rate = 48000;
+    g_sink.out_rate = 48000;
+    void *ac_vt[15] = {0}, *ac_orig[24] = {0};
+    ac_vt[AC_GETCURRENTPADDING] = (void *)mock_get_padding;
+    ac_vt[AC_START] = (void *)mock_start_counted;
+    ac_vt[AC_STOP] = (void *)mock_stop;
+    ac_vt[AC_RESET] = (void *)mock_reset;
+    for (int i = 0; i < 15; i++) ac_orig[i] = ac_vt[i];
+    register_originals(ac_vt, ac_orig);
+    void *rc_vt[5] = {0}, *rc_orig[24] = {0};
+    rc_vt[RC_GETBUFFER] = (void *)mock_render_get;
+    rc_vt[RC_RELEASEBUFFER] = (void *)mock_render_release;
+    for (int i = 0; i < 5; i++) rc_orig[i] = rc_vt[i];
+    register_originals(rc_vt, rc_orig);
+    void *ac_obj[1] = {ac_vt}, *rc_obj[1] = {rc_vt};
+    gen->real = (IAudioClient *)ac_obj;
+    gen->real_render = (IAudioRenderClient *)rc_obj;
+    free(g_inb);
+    g_inb = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_block);
+    mock_padding = 0; mock_gb_calls = 0; mock_start_calls = 0;
+    mock_rb_frames = 0xFFFFFFFF; mock_rb_flags = 0xFF;
+
+    g_sink.prime_left = 64;
+    g_sink.w = 8; g_sink.r = 0;
+    /* not enough client audio yet: do not start the device on silence alone */
+    CHECK(drain_once(gen) == S_FALSE);
+    CHECK(mock_gb_calls == 0 && mock_start_calls == 0);
+    g_sink.w = 64;
+    CHECK(drain_once(gen) == S_OK);
+    CHECK(mock_gb_calls == 1 && mock_gb_frames == 64);
+    CHECK(mock_rb_frames == 64 && mock_rb_flags == AUDCLNT_BUFFERFLAGS_SILENT);
+    CHECK(mock_start_calls == 1 && gen->device_started);
+    CHECK(g_sink.prime_left == 0 && g_sink.skip_frames == 64);
+    CHECK(g_sink.r == 0);                          /* no client audio was used */
+    CHECK(drain_once(gen) == S_OK);                /* then the real audio */
+    CHECK(mock_rb_flags == 0 && g_sink.r == 64);
+
+    gen->real = NULL;                 /* stack mocks: nothing to Release */
+    gen->real_render = NULL;
+    g_sink.gen = NULL;
+    gen_release(gen);
+    free_ring();
+    printf("PASS prime: silence fills the first device buffer, client audio follows unchanged\n");
+}
+
+static void test_clock_excludes_primed_silence(void) {
+    UINT64 pos = 0, qpc = 0;
+    prepare_ring();
+    SinkGen *gen = mock_gen();
+    void *clock_obj[1] = {mock_clock_vtbl};
+    gen->real_clock = (IAudioClock *)clock_obj;
+    gen->clock_frequency = 48000;
+    memset(&g_fake_clock, 0, sizeof(g_fake_clock));
+    g_fake_clock.vtbl = g_fake_clock_vtbl;
+    g_fake_clock.ref = 1;
+    g_fake_clock.generation = g_sink.generation;
+    g_sink.proxy_clock = &g_fake_clock;
+    g_sink.out_rate = 48000;
+    g_sink.skip_frames = 4800;                     /* 100 ms of primed silence */
+    mock_clock_pos = 2400;
+    CHECK(fc_GetPosition(&g_fake_clock, &pos, &qpc) == S_OK && pos == 0);
+    mock_clock_pos = 4800 + 48000;
+    CHECK(fc_GetPosition(&g_fake_clock, &pos, &qpc) == S_OK && pos == 10000000ull);
+    gen->real_clock = NULL;
+    g_sink.gen = NULL;
+    gen_release(gen);
+    free_ring();
+    printf("PASS clock: primed silence is not reported as played client audio\n");
+}
+
+/* The Host publishes IAudioClock ticks at the device's own frequency. */
+static void test_remote_clock_converts_device_ticks(void) {
+    NexAudioControl control;
+    BYTE pcm[64 * 6];
+    SinkGen gen;
+    UINT64 pos = 0, qpc = 0;
+    prepare_ring();
+    remote_fixture_begin(&control, pcm, 64, 6);
+    memset(&gen, 0, sizeof(gen));
+    gen.remote = 1;
+    gen.ref = 2;
+    g_sink.gen = &gen;
+    memset(&g_fake_clock, 0, sizeof(g_fake_clock));
+    g_fake_clock.vtbl = g_fake_clock_vtbl;
+    g_fake_clock.ref = 1;
+    g_fake_clock.generation = g_sink.generation;
+    g_sink.proxy_clock = &g_fake_clock;
+    g_sink.out_rate = 48000;
+    control.device_clock_frequency = 48000;
+    control.device_clock_position = 48000;        /* one second at 48 kHz ticks */
+    CHECK(fc_GetPosition(&g_fake_clock, &pos, &qpc) == S_OK);
+    CHECK(pos == 10000000ull);
+    control.primed_frames_total = 4800;           /* Host primed 100 ms */
+    g_sink.clock_last = 0;
+    CHECK(fc_GetPosition(&g_fake_clock, &pos, &qpc) == S_OK);
+    CHECK(pos == 9000000ull);
+    g_sink.gen = NULL;
+    remote_fixture_end();
+    free_ring();
+    printf("PASS remote clock: device ticks are converted to 100 ns, primed silence excluded\n");
+}
+
 static void test_src_response(void) {
     static const struct { int in, out; const char *name; } ratios[] = {
         {44100, 48000, "44.1k->48k"},
@@ -2560,6 +2672,9 @@ int main(void) {
     test_drain_window_count();
     test_remote_transport_signals();
     test_log_queue_order_and_overflow();
+    test_drain_primes_silence();
+    test_clock_excludes_primed_silence();
+    test_remote_clock_converts_device_ticks();
     test_multichannel_conversion_keeps_channels();
     test_multichannel_resample_keeps_channels();
     test_drain_thread_registers_mmcss();

@@ -147,7 +147,14 @@ typedef struct NexAudioControl {
     volatile uint32_t device_paused;
     volatile uint64_t flush_request_generation;
     volatile uint64_t flush_ack_generation;
-    unsigned char reserved[104];
+    /* Start-up silence: the client asks for prime_request_frames of silence
+       before the next first buffer; the Host submits it, clears the request and
+       adds what it submitted to primed_frames_total (reset by a flush), which
+       the client subtracts from the device clock. */
+    volatile uint32_t prime_request_frames;
+    uint32_t reserved_prime;
+    volatile uint64_t primed_frames_total;
+    unsigned char reserved[88];
 } NexAudioControl;
 
 #define NEX_AUDIO_CONTROL_BYTES ((uint32_t)sizeof(NexAudioControl))

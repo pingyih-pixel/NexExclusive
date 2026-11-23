@@ -151,6 +151,53 @@ static HRESULT drain_once(SinkGen *g) {
         space=g->real_frames-pad;
     }
     if (!space) return S_FALSE;
+    if (!g->remote && g_sink.prime_left) {
+        /* Start-up silence (Orion primeWithSilence): the first device buffer
+           of a fresh stream is silence, so a DAC that is waking up or relocking
+           to a new clock family does not swallow the opening notes. The
+           hardware is still started only once a full buffer of client audio is
+           waiting, so the silence is followed by music, never by an underrun. */
+        if (!g->device_started) {
+            UINT64 need = g_sink.out_rate && g_sink.in_rate != g_sink.out_rate
+                ? ((UINT64)g->real_frames * (UINT64)g_sink.in_rate + g_sink.out_rate - 1) / g_sink.out_rate
+                : g->real_frames;
+            if (need > g_sink.cap) need = g_sink.cap;
+            EnterCriticalSection(&g_lock);
+            UINT32 have = g_sink.w - g_sink.r;
+            LeaveCriticalSection(&g_lock);
+            if (have < need) {
+                if (g_sink.h_client) SetEvent(g_sink.h_client);
+                return S_FALSE;
+            }
+        }
+        UINT32 m = g_sink.prime_left < space ? g_sink.prime_left : space;
+        if (g->real_evt) {
+            if (pad != 0) return S_FALSE;
+            m = g->real_frames;
+        }
+        BYTE *silent = NULL;
+        g->stage = STAGE_GETBUF;
+        hr = g->real_render->lpVtbl->GetBuffer(g->real_render, m, &silent);
+        if (g->retired) return E_ABORT;
+        if (FAILED(hr)) return hr;
+        g->stage = STAGE_RELEASE;
+        hr = g->real_render->lpVtbl->ReleaseBuffer(g->real_render, m, AUDCLNT_BUFFERFLAGS_SILENT);
+        if (g->retired) return E_ABORT;
+        if (FAILED(hr)) return hr;
+        g_sink.prime_left = m >= g_sink.prime_left ? 0 : g_sink.prime_left - m;
+        g_sink.skip_frames += m;
+        if (!g->device_started) {
+            g->stage = STAGE_START;
+            hr = O_START(g->real);
+            if (g->retired) return E_ABORT;
+            if (FAILED(hr)) return hr;
+            g->device_started = 1;
+            log_line("sink: hardware started on %lu frames of silence (%lu more to come)",
+                     (unsigned long)m, (unsigned long)g_sink.prime_left);
+        }
+        g->stage = STAGE_IDLE;
+        return S_OK;
+    }
     UINT32 n=0;
     if (g_sink.resample) {
         src_compact(g_sink.in_channels);
@@ -602,14 +649,19 @@ static HRESULT STDMETHODCALLTYPE fc_GetPosition(void *s, UINT64 *pos, UINT64 *qp
             }
         }
         if(SUCCEEDED(hr)) {
-            UINT64 ticks;
-            if (g_sink.gen->remote) {
-                /* Remote p is already in IAudioClock ticks. */
-                ticks = g_sink.clock_base + p;
-            } else {
-                ticks=g_sink.clock_base+(p/f)*10000000ULL
-                     +(UINT64)((long double)(p%f)*10000000.0L/f);
-            }
+            /* Both paths read an IAudioClock position in units of its own
+               frequency (the Host publishes the raw snapshot), converted to
+               100 ns. Start-up silence counted by the device clock is not
+               client audio and is taken back out. */
+            UINT64 played=(p/f)*10000000ULL
+                         +(UINT64)((long double)(p%f)*10000000.0L/f);
+            UINT64 skip=g_sink.gen->remote
+                ? (g_remote_ipc ? nex_audio_read64(&g_remote_ipc->primed_frames_total) : 0)
+                : g_sink.skip_frames;
+            UINT64 skip_ticks=g_sink.out_rate
+                ? skip*10000000ULL/(UINT64)g_sink.out_rate : 0;
+            played=played>skip_ticks ? played-skip_ticks : 0;
+            UINT64 ticks=g_sink.clock_base+played;
             UINT64 prev=g_sink.clock_last;
             if(ticks<prev) {
                 /* A new remote device generation can restart its clock at zero.

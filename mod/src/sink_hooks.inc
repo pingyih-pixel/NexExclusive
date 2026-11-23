@@ -281,7 +281,9 @@ static HRESULT STDMETHODCALLTYPE H_Reset(void *self) {
         return hr;
     }
     /* A seek also has to drop what the Host already holds, or the first
-       ~0.5 s after the seek is pre-seek audio. */
+       ~0.5 s after the seek is pre-seek audio. The prime request is armed
+       first so the Host's next prefill starts on silence. */
+    sink_arm_prime_after_reset(g_sink.gen);
     if (g_sink.gen && g_sink.gen->remote && !remote_request_flush(500))
         log_line("sink: audiohost did not acknowledge the flush within 500 ms");
     EnterCriticalSection(&g_lock);

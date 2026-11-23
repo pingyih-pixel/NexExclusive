@@ -9,6 +9,8 @@ static int g_fade_ms     = 0;   /* explicit processing; 0 (default) leaves sampl
 static int g_shared_fallback = 0; /* strict exclusive by default */
 static int g_hifi        = 0;   /* strict native client-format exclusive path */
 static int g_audiohost   = 0;   /* optional out-of-process exclusive renderer */
+static int g_prime       = 1;   /* one device buffer of silence before a fresh start */
+static int g_resync_ms   = 200; /* extra silence when the DAC changes clock family */
 /* Which rate to prefer when the device refuses the source rate.
      0 = bandwidth: nearest higher first, then lower from high to low.
      1 = simplicity: integer conversion ratios first, then bandwidth order.
@@ -258,6 +260,9 @@ typedef struct {
 
     BYTE              *conv;            /* scratch for one conversion pass */
 
+    UINT32             prime_left;      /* silent frames still to submit before client audio */
+    UINT64             skip_frames;     /* silent frames the device clock has counted */
+
     UINT32             fade_total;      /* frames in the opening ramp */
     UINT32             fade_left;
 } Sink;
@@ -476,6 +481,8 @@ static void load_config(void) {
         else if (_strnicmp(p, "hifi=", 5) == 0) g_hifi = atoi(p + 5) != 0;
         else if (_strnicmp(p, "audiohost=", 10) == 0) g_audiohost = atoi(p + 10) != 0;
         else if (_strnicmp(p, "log=", 4) == 0) g_log_enabled = atoi(p + 4) != 0;
+        else if (_strnicmp(p, "prime=", 6) == 0) g_prime = atoi(p + 6) != 0;
+        else if (_strnicmp(p, "resync_ms=", 10) == 0) g_resync_ms = atoi(p + 10);
         else if (_strnicmp(p, "src_prefer=", 11) == 0) {
             char v[32];
             snprintf(v, sizeof(v), "%s", p + 11);
@@ -488,6 +495,7 @@ static void load_config(void) {
         }
     }
     fclose(f);
+    if (g_resync_ms < 0 || g_resync_ms > 2000) g_resync_ms = 200;
     {
         /* Legal ranges, defaults and the strict-native overrides are policy:
            see nex_audio_policy_normalize_config. */

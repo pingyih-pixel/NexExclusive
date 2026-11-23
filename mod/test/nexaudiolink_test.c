@@ -35,7 +35,7 @@ static void test_layout(void) {
     CHECK(NEX_AUDIO_PROTOCOL_MINOR == 1);      /* 3.1: transport fields */
     CHECK(NEX_AUDIO_LAYOUT_VERSION == 3);
     /* the transport fields came out of the reserved tail: the page size is unchanged */
-    CHECK(sizeof(c.reserved) == 104);
+    CHECK(sizeof(c.reserved) == 88);
     CHECK(sizeof(NexAudioControl) == NEX_AUDIO_CONTROL_BYTES);
     CHECK(sizeof(c.state) == sizeof(uint32_t));
     CHECK(sizeof(c.error) == sizeof(uint32_t));

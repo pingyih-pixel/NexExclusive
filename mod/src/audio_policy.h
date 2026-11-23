@@ -122,6 +122,29 @@ NEX_AUDIO_POLICY_FN int nex_audio_policy_dither_selected(int input_float, int in
     return mode == 2 && output_valid < (input_float ? 24 : input_valid) && fade_ms == 0;
 }
 
+/* ---- start-up silence (after Orion's primeWithSilence / resync_delay_ms) ---- */
+/* DACs run two crystals: one for 44.1 kHz multiples, one for 48 kHz multiples.
+   Changing family makes the DAC relock, which mutes or pops the first notes. */
+NEX_AUDIO_POLICY_FN long nex_audio_policy_rate_family(long rate) {
+    if (rate <= 0) return 0;
+    if (rate % 11025 == 0) return 44100;
+    if (rate % 8000 == 0) return 48000;
+    return rate;
+}
+
+/* Frames of silence to submit before the first client audio of a fresh device
+   stream: one device buffer (prime), plus resync_ms when the DAC changes clock
+   family. Silence is added, never mixed into the music. */
+NEX_AUDIO_POLICY_FN long nex_audio_policy_prime_frames(long previous_rate, long rate,
+                                                       long device_frames, int prime,
+                                                       int resync_ms) {
+    long frames = prime && device_frames > 0 ? device_frames : 0;
+    if (previous_rate > 0 && rate > 0 && resync_ms > 0 &&
+        nex_audio_policy_rate_family(previous_rate) != nex_audio_policy_rate_family(rate))
+        frames += (long)((long long)rate * resync_ms / 1000);
+    return frames;
+}
+
 /* ---- what the negotiated path does to the samples ------------------------- */
 enum {
     NEX_AUDIO_PATH_NATIVE = 0,    /* identical bytes                             */

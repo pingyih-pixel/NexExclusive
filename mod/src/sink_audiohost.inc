@@ -381,6 +381,44 @@ static void remote_set_transport(UINT32 transport) {
     if (g_remote_data) SetEvent(g_remote_data);
 }
 
+/* The device rate of the previous fresh stream, for the clock-family check. */
+static long g_last_device_rate;
+
+/* Arm the start-up silence for a fresh device stream (engage, retarget). The
+   in-process drain submits it itself; the Host does it for a remote stream. */
+static void sink_arm_prime(SinkGen *gen, long rate) {
+    long frames = nex_audio_policy_prime_frames(g_last_device_rate, rate,
+                                                gen ? (long)gen->real_frames : 0,
+                                                g_prime, g_resync_ms);
+    g_last_device_rate = rate;
+    g_sink.skip_frames = 0;
+    g_sink.prime_left = 0;
+    if (gen && gen->remote) {
+        if (g_remote_ipc)
+            InterlockedExchange((volatile LONG *)&g_remote_ipc->prime_request_frames, frames);
+    } else {
+        g_sink.prime_left = (UINT32)frames;
+    }
+    if (frames)
+        log_line("sink: %ld frames of start-up silence armed (rate %ld, %s)", frames, rate,
+                 gen && gen->remote ? "audiohost" : "in-process");
+}
+
+/* After a seek the device starts again from an empty buffer: one buffer of
+   silence, no resync (the clock family has not changed). */
+static void sink_arm_prime_after_reset(SinkGen *gen) {
+    g_sink.skip_frames = 0;
+    g_sink.prime_left = 0;
+    if (!gen || !g_prime) return;
+    if (gen->remote) {
+        if (g_remote_ipc)
+            InterlockedExchange((volatile LONG *)&g_remote_ipc->prime_request_frames,
+                                (LONG)gen->real_frames);
+    } else {
+        g_sink.prime_left = gen->real_frames;
+    }
+}
+
 /* Ask the Host to drop its ring and device buffer (a seek). Called with the
    drain thread stopped, so nothing writes while the Host discards. Returns 1
    once the Host has acknowledged within timeout_ms. */

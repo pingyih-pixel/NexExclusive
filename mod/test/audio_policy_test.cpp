@@ -487,6 +487,30 @@ static void test_path_kind_labels() {
     std::printf("PASS path labels: native, repacked, depth only, converted; fade is never hidden\n");
 }
 
+/* ---- Orion 1+2: start with silence, longer across clock families ----------- */
+static void test_rate_family_and_prime() {
+    CHECK(nex_audio_policy_rate_family(44100) == 44100);
+    CHECK(nex_audio_policy_rate_family(88200) == 44100);
+    CHECK(nex_audio_policy_rate_family(176400) == 44100);
+    CHECK(nex_audio_policy_rate_family(352800) == 44100);
+    CHECK(nex_audio_policy_rate_family(48000) == 48000);
+    CHECK(nex_audio_policy_rate_family(96000) == 48000);
+    CHECK(nex_audio_policy_rate_family(192000) == 48000);
+    CHECK(nex_audio_policy_rate_family(32000) == 48000);
+    CHECK(nex_audio_policy_rate_family(0) == 0);
+    /* one device buffer of silence on every fresh start */
+    CHECK(nex_audio_policy_prime_frames(44100, 44100, 4410, 1, 200) == 4410);
+    CHECK(nex_audio_policy_prime_frames(0, 44100, 4410, 1, 200) == 4410);       /* first ever */
+    CHECK(nex_audio_policy_prime_frames(48000, 96000, 9600, 1, 200) == 9600);   /* same family */
+    /* plus the resync time when the DAC has to change crystal */
+    CHECK(nex_audio_policy_prime_frames(48000, 44100, 4410, 1, 200) == 4410 + 8820);
+    CHECK(nex_audio_policy_prime_frames(44100, 192000, 19200, 1, 200) == 19200 + 38400);
+    CHECK(nex_audio_policy_prime_frames(44100, 48000, 4800, 0, 200) == 9600);   /* prime off, resync on */
+    CHECK(nex_audio_policy_prime_frames(44100, 48000, 4800, 1, 0) == 4800);     /* resync off */
+    CHECK(nex_audio_policy_prime_frames(44100, 48000, 4800, 0, 0) == 0);
+    std::printf("PASS prime: one buffer of silence per fresh start, +resync across clock families\n");
+}
+
 int main() {
     test_16_bit_source_ladder_precedes_higher_setting();
     test_24_bit_source_ladder();
@@ -516,6 +540,7 @@ int main() {
     test_20_bit_compat_source_first();
     test_bits_zero_follows_source();
     test_path_kind_labels();
+    test_rate_family_and_prime();
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }

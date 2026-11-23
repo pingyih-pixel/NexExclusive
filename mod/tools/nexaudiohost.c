@@ -21,7 +21,7 @@ typedef struct HostRuntime HostRuntime;
 typedef struct HostApi {
     HRESULT (*get_padding)(HostRuntime *, UINT32 *);
     HRESULT (*get_buffer)(HostRuntime *, UINT32, BYTE **);
-    HRESULT (*release_buffer)(HostRuntime *, UINT32);
+    HRESULT (*release_buffer)(HostRuntime *, UINT32, DWORD);
     HRESULT (*start)(HostRuntime *);
     HRESULT (*stop)(HostRuntime *);
     HRESULT (*get_position)(HostRuntime *, UINT64 *, UINT64 *);
@@ -165,13 +165,13 @@ static HRESULT host_submit(HostRuntime *rt, uint32_t frames) {
                          NEX_AUDIO_FALLBACK_RUNTIME_DEVICE_LOST);
     }
     if (nex_audio_ring_peek(rt->control, rt->data, destination, frames) != frames) {
-        rt->api->release_buffer(rt, 0);
+        rt->api->release_buffer(rt, 0, 0);
         return host_fail(rt, E_UNEXPECTED, NEX_AUDIO_FALLBACK_RUNTIME_DEVICE_LOST);
     }
     uint64_t next_hash = hash_bytes(destination, (size_t)frames *
                                     rt->control->output_frame_bytes,
                                     rt->endpoint_hash);
-    hr = rt->api->release_buffer(rt, frames);
+    hr = rt->api->release_buffer(rt, frames, 0);
     if (FAILED(hr)) {
         add_counter(&rt->control->releasebuffer_failures, 1);
         return host_fail(rt, hr, NEX_AUDIO_FALLBACK_RUNTIME_DEVICE_LOST);
@@ -183,6 +183,26 @@ static HRESULT host_submit(HostRuntime *rt, uint32_t frames) {
     InterlockedExchange64((volatile LONG64 *)&rt->control->endpoint_hash,
                           (LONG64)next_hash);
     if (rt->space_event) SetEvent(rt->space_event);
+    return S_OK;
+}
+
+/* Submit silence that is not taken from the ring (start-up prime). */
+static HRESULT host_submit_silence(HostRuntime *rt, uint32_t frames) {
+    BYTE *destination = NULL;
+    HRESULT hr = rt->api->get_buffer(rt, frames, &destination);
+    if (FAILED(hr) || !destination) {
+        add_counter(&rt->control->getbuffer_failures, 1);
+        return host_fail(rt, FAILED(hr) ? hr : E_POINTER, NEX_AUDIO_FALLBACK_RUNTIME_DEVICE_LOST);
+    }
+    hr = rt->api->release_buffer(rt, frames, AUDCLNT_BUFFERFLAGS_SILENT);
+    if (FAILED(hr)) {
+        add_counter(&rt->control->releasebuffer_failures, 1);
+        return host_fail(rt, hr, NEX_AUDIO_FALLBACK_RUNTIME_DEVICE_LOST);
+    }
+    uint32_t left = rt->control->prime_request_frames;
+    InterlockedExchange((volatile LONG *)&rt->control->prime_request_frames,
+                        (LONG)(frames >= left ? 0 : left - frames));
+    add_counter(&rt->control->primed_frames_total, frames);
     return S_OK;
 }
 
@@ -220,6 +240,7 @@ static HRESULT host_apply_transport(HostRuntime *rt) {
         c->first_buffer_submitted = 0;
         InterlockedExchange((volatile LONG *)&c->device_paused, 0);
         InterlockedExchange((volatile LONG *)&c->device_padding_frames, 0);
+        InterlockedExchange64((volatile LONG64 *)&c->primed_frames_total, 0);
         rt->eos_checking = 0;
         long state = host_state(rt);
         if (state == NEX_AUDIO_RUNNING || state == NEX_AUDIO_PREFILLED || state == NEX_AUDIO_DRAINING)
@@ -260,6 +281,26 @@ static HRESULT host_pump(HostRuntime *rt) {
     if (host_state(rt) == NEX_AUDIO_COMPLETE) return S_OK;
 
     uint64_t available64 = nex_audio_ring_available(control);
+    if (!control->device_started && control->prime_request_frames &&
+        available64 >= control->device_frames) {
+        /* Fresh start with client audio ready: the first device buffer is
+           silence, so a DAC waking up or relocking does not eat the opening. */
+        HRESULT hr = host_submit_silence(rt, control->device_frames);
+        if (FAILED(hr)) return hr;
+        control->first_buffer_submitted = 1;
+        host_set_state(rt, NEX_AUDIO_PREFILLED);
+        hr = rt->api->start(rt);
+        if (FAILED(hr)) return host_fail(rt, hr, NEX_AUDIO_FALLBACK_ENDPOINT_OPEN_FAILED);
+        control->device_started = 1;
+        host_set_state(rt, NEX_AUDIO_RUNNING);
+        hr = host_publish_clock(rt, control->device_frames);
+        if (FAILED(hr)) return host_fail(rt, hr, NEX_AUDIO_FALLBACK_RUNTIME_DEVICE_LOST);
+        host_log("hardware started on silence generation=%llu prime=%lu more=%lu",
+                 (unsigned long long)control->stream_generation,
+                 (unsigned long)control->device_frames,
+                 (unsigned long)control->prime_request_frames);
+        return S_OK;
+    }
     if (!control->device_started) {
         if (available64 < control->device_frames) {
             if (host_eos_requested(rt) && available64) {
@@ -316,6 +357,11 @@ static HRESULT host_pump(HostRuntime *rt) {
     if (FAILED(hr)) return host_fail(rt, hr, NEX_AUDIO_FALLBACK_RUNTIME_DEVICE_LOST);
     UINT32 space = control->device_frames - padding;
     if (!space) return host_check_eos(rt);
+    if (control->prime_request_frames) {
+        /* The rest of a cross-family resync interval. */
+        uint32_t left = control->prime_request_frames;
+        return host_submit_silence(rt, left < space ? left : space);
+    }
     if (!available64) {
         if (host_eos_requested(rt)) return host_check_eos(rt);
         /* Padding still contains audio, so this event is a source wait.  Only
@@ -335,8 +381,8 @@ static HRESULT real_get_padding(HostRuntime *rt, UINT32 *padding) {
 static HRESULT real_get_buffer(HostRuntime *rt, UINT32 frames, BYTE **destination) {
     return IAudioRenderClient_GetBuffer(rt->render, frames, destination);
 }
-static HRESULT real_release_buffer(HostRuntime *rt, UINT32 frames) {
-    return IAudioRenderClient_ReleaseBuffer(rt->render, frames, 0);
+static HRESULT real_release_buffer(HostRuntime *rt, UINT32 frames, DWORD flags) {
+    return IAudioRenderClient_ReleaseBuffer(rt->render, frames, flags);
 }
 static HRESULT real_start(HostRuntime *rt) { return IAudioClient_Start(rt->client); }
 static HRESULT real_stop(HostRuntime *rt) { return IAudioClient_Stop(rt->client); }
