@@ -11,6 +11,8 @@
   var API = 'http://127.0.0.1:9334/api/cfg';
   var SOURCE_API = 'http://127.0.0.1:9334/api/source';
   var RESTART_API = 'http://127.0.0.1:9334/api/restart';
+  var ENDPOINTS_API = 'http://127.0.0.1:9334/api/endpoints';
+  var ENDPOINT_API = 'http://127.0.0.1:9334/api/endpoint';
   var PANEL_ID = 'nexsink-panel';
   var SETTINGS_PANEL_ID = 'nex-settings-panel';
   var SETTINGS_LAUNCHER_ID = 'nex-settings-launcher';
@@ -39,6 +41,10 @@
           key: 'hifi', label: '输出策略', type: 'select',
           options: [[0, '原率优先（推荐）'], [1, '严格原样']],
           description: '先尝试源格式；设备不支持时，原率优先会继续使用独占转换。严格原样只接受源格式。'
+        },
+        {
+          key: 'endpoint', label: '独占输出设备', type: 'endpoint',
+          description: '默认跟随网易云自己的输出设备。选定的设备拔出或不可用时，自动回到网易云的设备。下一首生效。'
         },
         {
           key: 'audiohost', label: '独立音频宿主', type: 'switch',
@@ -212,6 +218,7 @@
   function fieldDisabled(field) {
     if (!connected) return true;
     if (field.key === 'enable' || field.key === 'hifi' || field.key === 'audiohost') return false;
+    if (field.key === 'endpoint') return false;
     if (!strictHiFi()) return false;
     return ['rate', 'compat', 'src_prefer', 'dither', 'fade_ms']
       .indexOf(field.key) >= 0;
@@ -260,6 +267,68 @@
     return { root: select, input: select, kind: 'select' };
   }
 
+  /* The output device is a string id with a live option list, so it is
+     saved on its own (POST /api/endpoint) rather than through the numeric
+     hook.cfg form and its save buttons. */
+  var endpointState = { current: '', endpoints: [], currentAvailable: true };
+
+  function fillEndpointSelect(select) {
+    while (select.firstChild) select.removeChild(select.firstChild);
+    var follow = document.createElement('option');
+    follow.value = '';
+    follow.textContent = '跟随网易云';
+    select.appendChild(follow);
+    endpointState.endpoints.forEach(function (ep) {
+      var item = document.createElement('option');
+      item.value = ep.id;
+      item.textContent = ep.name + (ep.default ? '（系统默认）' : '');
+      select.appendChild(item);
+    });
+    if (endpointState.current && !endpointState.currentAvailable) {
+      var gone = document.createElement('option');
+      gone.value = endpointState.current;
+      gone.textContent = '已选设备（当前不可用）';
+      select.appendChild(gone);
+    }
+    select.value = endpointState.current;
+    var option = select.options[select.selectedIndex];
+    select.title = option ? option.textContent : '独占输出设备';
+  }
+
+  function renderEndpoints() {
+    var entry = controls.endpoint;
+    if (entry && entry.widget) fillEndpointSelect(entry.widget.input);
+  }
+
+  function refreshEndpoints() {
+    fetch(ENDPOINTS_API, { method: 'GET' })
+      .then(function (response) { return response.ok ? response.json() : Promise.reject(response.status); })
+      .then(function (list) {
+        endpointState = list;
+        renderEndpoints();
+      })
+      .catch(function () {});
+  }
+
+  function makeEndpointSelect(field) {
+    var select = document.createElement('select');
+    select.className = 'nex-select';
+    select.setAttribute('aria-label', field.label);
+    fillEndpointSelect(select);
+    select.addEventListener('change', function () {
+      var id = select.value;
+      fetch(ENDPOINT_API, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: id })
+      })
+        .then(function (response) { return response.ok ? response.json() : Promise.reject(response.status); })
+        .then(function (list) { endpointState = list; renderEndpoints(); })
+        .catch(function () { refreshEndpoints(); });
+    });
+    return { root: select, input: select, kind: 'endpoint' };
+  }
+
   function makeRow(field) {
     var row = document.createElement('div');
     row.className = 'nex-item';
@@ -281,7 +350,8 @@
 
     var control = document.createElement('div');
     control.className = 'nex-control';
-    var widget = field.type === 'switch' ? makeSwitch(field) : makeSelect(field);
+    var widget = field.type === 'switch' ? makeSwitch(field)
+      : field.type === 'endpoint' ? makeEndpointSelect(field) : makeSelect(field);
     control.appendChild(widget.root);
     row.appendChild(control);
     controls[field.key] = { row: row, widget: widget };
@@ -398,7 +468,9 @@
       var input = entry.widget.input;
       input.disabled = disabled;
       entry.row.setAttribute('aria-disabled', disabled ? 'true' : 'false');
-      if (entry.widget.kind === 'switch') {
+      if (entry.widget.kind === 'endpoint') {
+        /* filled by renderEndpoints(); only the enabled state is shared */
+      } else if (entry.widget.kind === 'switch') {
         input.setAttribute('aria-checked', readValue(field) ? 'true' : 'false');
       } else {
         input.value = String(readValue(field));
@@ -466,6 +538,7 @@
     }
     if (open) syncSourcePlayId();
     if (open) reloadConfigIfClean();
+    if (open) refreshEndpoints();
   }
 
   /* hook.cfg can change outside this page (a hand edit, another client
@@ -1115,6 +1188,7 @@
         setBadge(true);
         mount();
         refreshStatus();
+        refreshEndpoints();
       })
       .catch(function () {
         setBadge(false);

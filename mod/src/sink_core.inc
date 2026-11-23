@@ -9,6 +9,7 @@ static int g_fade_ms     = 0;   /* explicit processing; 0 (default) leaves sampl
 static int g_shared_fallback = 0; /* strict exclusive by default */
 static int g_hifi        = 0;   /* strict native client-format exclusive path */
 static int g_audiohost   = 0;   /* optional out-of-process exclusive renderer */
+static char g_endpoint_id[200];  /* hook.cfg endpoint=: output device chosen in the panel */
 static int g_dedicated_core = 0; /* pin the drain thread to one fast core */
 static int g_process_priority = 0; /* HIGH_PRIORITY_CLASS while engaged */
 static int g_event       = 1;   /* try event-driven exclusive first, timer polling if refused */
@@ -536,6 +537,9 @@ static void load_config(void) {
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[256];
+    char endpoint_before[sizeof(g_endpoint_id)];
+    memcpy(endpoint_before, g_endpoint_id, sizeof(endpoint_before));
+    g_endpoint_id[0] = 0;
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
@@ -553,6 +557,11 @@ static void load_config(void) {
         else if (_strnicmp(p, "prime=", 6) == 0) g_prime = atoi(p + 6) != 0;
         else if (_strnicmp(p, "memlock=", 8) == 0) g_memlock = atoi(p + 8) != 0;
         else if (_strnicmp(p, "event=", 6) == 0) g_event = atoi(p + 6) != 0;
+        else if (_strnicmp(p, "endpoint=", 9) == 0) {
+            snprintf(g_endpoint_id, sizeof(g_endpoint_id), "%s", p + 9);
+            for (char *q = g_endpoint_id; *q; q++)
+                if (*q == '\r' || *q == '\n' || *q == ' ') { *q = 0; break; }
+        }
         else if (_strnicmp(p, "dedicated_core=", 15) == 0) g_dedicated_core = atoi(p + 15) != 0;
         else if (_strnicmp(p, "process_priority=", 17) == 0) g_process_priority = atoi(p + 17) != 0;
         else if (_strnicmp(p, "resync_ms=", 10) == 0) g_resync_ms = atoi(p + 10);
@@ -605,7 +614,8 @@ static void load_config(void) {
                    || g_cfg_policy.dither != g_dither
                    || g_cfg_policy.fade_ms != g_fade_ms
                    || g_cfg_policy.src_prefer != g_src_prefer
-                   || g_cfg_policy.hifi != g_hifi;
+                   || g_cfg_policy.hifi != g_hifi
+                   || strcmp(endpoint_before, g_endpoint_id) != 0;
         g_cfg_policy.out_bits = g_out_bits;
         g_cfg_policy.force_rate = g_force_rate;
         g_cfg_policy.compat = g_compat;
@@ -619,5 +629,8 @@ static void load_config(void) {
     log_line("config: enable=%d bits=%d rate=%d buffer=%d compat=%d dither=%d fade_ms=%d shared_fallback=%d src_prefer=%s hifi=%d audiohost=%d",
              g_enable, g_out_bits, g_force_rate, g_out_frames, g_compat, g_dither, g_fade_ms,
              g_shared_fallback, g_src_prefer ? "simplicity" : "bandwidth", g_hifi, g_audiohost);
+    log_line("config: prime=%d resync_ms=%d event=%d memlock=%d dedicated_core=%d process_priority=%d log=%d endpoint=%s",
+             g_prime, g_resync_ms, g_event, g_memlock, g_dedicated_core, g_process_priority,
+             g_log_enabled, g_endpoint_id[0] ? g_endpoint_id : "(follow client)");
 }
 

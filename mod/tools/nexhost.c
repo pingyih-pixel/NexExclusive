@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdarg.h>
 #include <wchar.h>
 
@@ -408,22 +409,92 @@ static void cfg_read(int *v) {
     v[7] = 0;
 }
 
-static int cfg_write(const int *v) {
+/* True when a hook.cfg line sets one of the keys the panel owns. */
+static int cfg_line_is_panel_key(const char *line) {
+    while (*line == ' ' || *line == '\t') line++;
+    for (int i = 0; i < CFG_N; i++) {
+        size_t len = strlen(kCfgKeys[i]);
+        if (strncmp(line, kCfgKeys[i], len) == 0 && line[len] == '=') return 1;
+    }
+    return 0;
+}
+
+static int cfg_line_has_key(const char *line, const char *key) {
+    while (*line == ' ' || *line == '\t') line++;
+    size_t len = strlen(key);
+    return strncmp(line, key, len) == 0 && line[len] == '=';
+}
+
+/* Rewrites hook.cfg: the panel's keys from v, then every other line kept as
+   it was (advanced keys set by hand - prime, event, memlock, log ... - used to
+   be dropped by the first panel save), with string_key replaced by
+   string_value (removed when the value is empty). */
+static int cfg_rewrite(const int *v, const char *string_key, const char *string_value) {
     char temp[MAX_PATH];
     int n = snprintf(temp, sizeof(temp), "%s.tmp", kHookCfg);
     if (n < 0 || (size_t)n >= sizeof(temp)) return 0;
+    char *old = read_file(kHookCfg);
     FILE *f = fopen(temp, "wb");
-    if (!f) { host_log("cfg: temporary file open failed %s", temp); return 0; }
+    if (!f) { free(old); host_log("cfg: temporary file open failed %s", temp); return 0; }
     for (int i = 0; i < CFG_N; i++) {
         if (i == 8) fprintf(f, "%s=%s\n", kCfgKeys[i], v[i] ? "simplicity" : "bandwidth");
         else fprintf(f, "%s=%d\n", kCfgKeys[i], v[i]);
     }
+    for (char *line = old; line && *line;) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\r' || line[len - 1] == ' ')) line[--len] = 0;
+        if (len && !cfg_line_is_panel_key(line) &&
+            !(string_key && cfg_line_has_key(line, string_key)))
+            fprintf(f, "%s\n", line);
+        if (!nl) break;
+        line = nl + 1;
+    }
+    free(old);
+    if (string_key && string_value && string_value[0])
+        fprintf(f, "%s=%s\n", string_key, string_value);
     int ok = fflush(f) == 0 && !ferror(f);
     if (fclose(f) != 0) ok = 0;
     if (!ok || !MoveFileExA(temp, kHookCfg, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         host_log("cfg: atomic update failed %s (%lu)", kHookCfg, GetLastError());
         DeleteFileA(temp);
         return 0;
+    }
+    return 1;
+}
+
+static int cfg_write(const int *v) { return cfg_rewrite(v, NULL, NULL); }
+
+/* A string key of hook.cfg, "" when absent. */
+static void cfg_read_string(const char *key, char *out, size_t n) {
+    out[0] = 0;
+    char *txt = read_file(kHookCfg);
+    if (!txt) return;
+    for (char *line = txt; line && *line;) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        if (cfg_line_has_key(line, key)) {
+            const char *v = strchr(line, '=') + 1;
+            snprintf(out, n, "%s", v);
+            size_t len = strlen(out);
+            while (len && (out[len - 1] == '\r' || out[len - 1] == ' ')) out[--len] = 0;
+        }
+        if (!nl) break;
+        line = nl + 1;
+    }
+    free(txt);
+}
+
+/* Endpoint ids are "{0.0.0.00000000}.{guid}"; anything else is refused so a
+   posted value can never inject a second hook.cfg line. */
+static int endpoint_id_valid(const char *id) {
+    size_t len = strlen(id);
+    if (len > 190) return 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)id[i];
+        if (!(isalnum(c) || c == '{' || c == '}' || c == '.' || c == '-' || c == '#' || c == '_'))
+            return 0;
     }
     return 1;
 }
@@ -567,6 +638,74 @@ static void ep_query(EndpointInfo *ei) {
         dev->lpVtbl->Release(dev);
     }
     en->lpVtbl->Release(en);
+}
+
+/* Every active render endpoint, for the panel's output-device picker. The
+   chosen id is stored as hook.cfg endpoint=; the audio module opens that
+   device and falls back to the client's own device when it is unavailable. */
+static void endpoints_json(char *out, size_t n) {
+    char current[200];
+    cfg_read_string("endpoint", current, sizeof(current));
+    size_t used = 0;
+    char *cur = json_escape(current);
+    used += (size_t)snprintf(out + used, n - used, "{\"current\":\"%s\",\"endpoints\":[",
+                             cur ? cur : "");
+    free(cur);
+    int count = 0, current_listed = 0;
+    IMMDeviceEnumerator *en = NULL;
+    IMMDeviceCollection *list = NULL;
+    char default_id[200] = "";
+    if (g_com_ready &&
+        SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator_l, NULL, CLSCTX_ALL,
+                                   &IID_IMMDeviceEnumerator_l, (void **)&en)) && en) {
+        IMMDevice *def = NULL;
+        if (SUCCEEDED(en->lpVtbl->GetDefaultAudioEndpoint(en, eRender, eMultimedia, &def)) && def) {
+            LPWSTR wid = NULL;
+            if (SUCCEEDED(def->lpVtbl->GetId(def, &wid)) && wid) {
+                WideCharToMultiByte(CP_UTF8, 0, wid, -1, default_id, (int)sizeof(default_id), NULL, NULL);
+                CoTaskMemFree(wid);
+            }
+            def->lpVtbl->Release(def);
+        }
+        if (SUCCEEDED(en->lpVtbl->EnumAudioEndpoints(en, eRender, DEVICE_STATE_ACTIVE, &list)) && list) {
+            UINT total = 0;
+            list->lpVtbl->GetCount(list, &total);
+            for (UINT i = 0; i < total && used + 600 < n; i++) {
+                IMMDevice *dev = NULL;
+                if (FAILED(list->lpVtbl->Item(list, i, &dev)) || !dev) continue;
+                char id[200] = "", name[256] = "";
+                LPWSTR wid = NULL;
+                if (SUCCEEDED(dev->lpVtbl->GetId(dev, &wid)) && wid) {
+                    WideCharToMultiByte(CP_UTF8, 0, wid, -1, id, (int)sizeof(id), NULL, NULL);
+                    CoTaskMemFree(wid);
+                }
+                IPropertyStore *ps = NULL;
+                if (SUCCEEDED(dev->lpVtbl->OpenPropertyStore(dev, STGM_READ, &ps)) && ps) {
+                    PROPVARIANT pv;
+                    PropVariantInit(&pv);
+                    if (SUCCEEDED(ps->lpVtbl->GetValue(ps, &PKEY_FriendlyName_l, &pv)) &&
+                        pv.vt == VT_LPWSTR && pv.pwszVal)
+                        WideCharToMultiByte(CP_UTF8, 0, pv.pwszVal, -1, name, (int)sizeof(name), NULL, NULL);
+                    PropVariantClear(&pv);
+                    ps->lpVtbl->Release(ps);
+                }
+                dev->lpVtbl->Release(dev);
+                if (!id[0] || !endpoint_id_valid(id)) continue;
+                if (strcmp(id, current) == 0) current_listed = 1;
+                char *ename = json_escape(name[0] ? name : id);
+                used += (size_t)snprintf(out + used, n - used,
+                                         "%s{\"id\":\"%s\",\"name\":\"%s\",\"default\":%s}",
+                                         count ? "," : "", id, ename ? ename : "",
+                                         strcmp(id, default_id) == 0 ? "true" : "false");
+                free(ename);
+                count++;
+            }
+            list->lpVtbl->Release(list);
+        }
+        en->lpVtbl->Release(en);
+    }
+    snprintf(out + used, n - used, "],\"currentAvailable\":%s}",
+             current[0] && !current_listed ? "false" : "true");
 }
 
 static const EndpointInfo *ep_cached(void) {
@@ -2549,6 +2688,26 @@ static DWORD WINAPI http_thread(LPVOID unused) {
             else {
                 cfg_to_json(v, out, sizeof(out));
                 http_reply(c, 200, out);
+            }
+        } else if (strcmp(path, "/api/endpoints") == 0 && strcmp(method, "GET") == 0) {
+            endpoints_json(out, sizeof(out));
+            http_reply(c, 200, out);
+        } else if (strcmp(path, "/api/endpoint") == 0 && strcmp(method, "POST") == 0) {
+            char id[200] = "";
+            int v[CFG_N];
+            /* an empty id means "follow the client's device" */
+            int has_id = json_get_string(body_buf, "id", id, sizeof(id)) ||
+                         strstr(body_buf, "\"id\":\"\"") != NULL;
+            if (!has_id || !endpoint_id_valid(id)) {
+                http_reply(c, 400, "{\"error\":\"invalid endpoint id\"}");
+            } else {
+                cfg_read(v);
+                if (!cfg_rewrite(v, "endpoint", id)) http_reply(c, 500, "{\"error\":\"config write failed\"}");
+                else {
+                    host_log("cfg: output endpoint %s", id[0] ? id : "(follow client)");
+                    endpoints_json(out, sizeof(out));
+                    http_reply(c, 200, out);
+                }
             }
         } else if (strcmp(path, "/api/ui") == 0 && strcmp(method, "GET") == 0) {
             int v[UI_N];

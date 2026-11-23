@@ -474,6 +474,33 @@ static HRESULT sink_retarget(const char *reason) {
     return sink_retarget_endpoint(reason, 0);
 }
 
+/* The output device chosen in the panel (hook.cfg endpoint=), AddRef'd, or
+   NULL when none is set or it is not currently active - then the caller uses
+   the client's own device, so an unplugged pick never silences playback. */
+static IMMDevice *sink_pinned_device(void) {
+    if (!g_endpoint_id[0]) return NULL;
+    WCHAR wid[200];
+    if (!MultiByteToWideChar(CP_UTF8, 0, g_endpoint_id, -1, wid, 200)) return NULL;
+    IMMDevice *dev = NULL;
+    IMMDeviceEnumerator *e = NULL;
+    InterlockedIncrement(&g_internal);
+    if (SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                                   &IID_IMMDeviceEnumerator, (void **)&e)) && e) {
+        if (FAILED(e->lpVtbl->GetDevice(e, wid, &dev))) dev = NULL;
+        e->lpVtbl->Release(e);
+    }
+    InterlockedDecrement(&g_internal);
+    if (dev) {
+        DWORD state = 0;
+        if (FAILED(dev->lpVtbl->GetState(dev, &state)) || state != DEVICE_STATE_ACTIVE) {
+            dev->lpVtbl->Release(dev);
+            dev = NULL;
+        }
+    }
+    if (!dev) log_line("sink: chosen endpoint %s unavailable, using the client's device", g_endpoint_id);
+    return dev;
+}
+
 /* keep_bound: rebuild on the endpoint the client bound through
    IMMDevice::Activate, falling back to the default when there is none. */
 static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
@@ -488,8 +515,8 @@ static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
     if (g_sink.gen) { gen_release(g_sink.gen); g_sink.gen = NULL; }
     if (was_remote) remote_close();
 
-    IMMDevice *dev = NULL;
-    if (keep_bound) {
+    IMMDevice *dev = sink_pinned_device();
+    if (!dev && keep_bound) {
         EnterCriticalSection(&g_patch_lock);
         for (int i = 0; i < 128; i++) if (g_bindings[i].client == g_sink.owner && g_bindings[i].dev) {
             dev = g_bindings[i].dev; dev->lpVtbl->AddRef(dev); break;
@@ -679,9 +706,9 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     if(g_sink.gen) {
         HRESULT clear=sink_teardown_controlled();if(FAILED(clear))return clear;
     }
-    IMMDevice *dev = NULL;
+    IMMDevice *dev = sink_pinned_device();
     EnterCriticalSection(&g_patch_lock);
-    for(int i=0;i<128;i++)if(g_bindings[i].client==self && g_bindings[i].dev) {
+    for(int i=0;!dev && i<128;i++)if(g_bindings[i].client==self && g_bindings[i].dev) {
         dev=g_bindings[i].dev;dev->lpVtbl->AddRef(dev);break;
     }
     LeaveCriticalSection(&g_patch_lock);
