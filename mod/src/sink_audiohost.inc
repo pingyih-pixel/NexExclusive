@@ -171,7 +171,7 @@ static HRESULT remote_try_exclusive(SinkGen *g, IMMDevice *dev,
                L"Local\\NexAudioV3Ready_%lu_%llu", (unsigned long)pid,
                (unsigned long long)generation);
 
-    UINT32 capacity = fmt->nSamplesPerSec / 2u; /* current short ring: 0.5 s */
+    UINT32 capacity = (UINT32)((UINT64)fmt->nSamplesPerSec * (UINT64)g_host_ring_ms / 1000u);
     if (capacity < NEX_AUDIO_MIN_RING_FRAMES) capacity = NEX_AUDIO_MIN_RING_FRAMES;
     UINT64 data_bytes = (UINT64)capacity * fmt->nBlockAlign;
     if (!data_bytes || data_bytes > NEX_AUDIO_MAX_DATA_BYTES) {

@@ -547,6 +547,15 @@ static void test_pick_core() {
     std::printf("PASS dedicated core: fastest class, never the core holding CPU 0\n");
 }
 
+/* ---- Orion 9: the separate host's ring depth --------------------------------- */
+static void test_host_ring_depth() {
+    CHECK(nex_audio_policy_host_ring_ms(0) == 500);
+    CHECK(nex_audio_policy_host_ring_ms(50) == 200);
+    CHECK(nex_audio_policy_host_ring_ms(2000) == 2000);
+    CHECK(nex_audio_policy_host_ring_ms(60000) == 4000);
+    std::printf("PASS host ring: 500 ms default, 200 ms to 4 s\n");
+}
+
 int main() {
     test_16_bit_source_ladder_precedes_higher_setting();
     test_24_bit_source_ladder();
@@ -580,6 +589,7 @@ int main() {
     test_eos_wait_bound();
     test_event_mode_fits();
     test_pick_core();
+    test_host_ring_depth();
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }

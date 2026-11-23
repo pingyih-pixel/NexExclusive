@@ -196,6 +196,20 @@ NEX_AUDIO_POLICY_FN int nex_audio_policy_pick_core(const NexAudioCoreInfo *cores
     return best;
 }
 
+/* Depth of the separate host's shared ring (hook.cfg host_ring_ms). A deeper
+   ring rides out longer stalls of the client process; the client's own volume
+   and effects reach the device that much later, since they are applied before
+   the ring. Seek and pause are not delayed: both act on the Host directly. */
+#define NEX_AUDIO_HOST_RING_DEFAULT_MS 500
+#define NEX_AUDIO_HOST_RING_MIN_MS     200
+#define NEX_AUDIO_HOST_RING_MAX_MS     4000
+NEX_AUDIO_POLICY_FN int nex_audio_policy_host_ring_ms(int ms) {
+    if (ms <= 0) return NEX_AUDIO_HOST_RING_DEFAULT_MS;
+    if (ms < NEX_AUDIO_HOST_RING_MIN_MS) return NEX_AUDIO_HOST_RING_MIN_MS;
+    if (ms > NEX_AUDIO_HOST_RING_MAX_MS) return NEX_AUDIO_HOST_RING_MAX_MS;
+    return ms;
+}
+
 /* ---- what the negotiated path does to the samples ------------------------- */
 enum {
     NEX_AUDIO_PATH_NATIVE = 0,    /* identical bytes                             */

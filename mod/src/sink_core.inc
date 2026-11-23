@@ -10,6 +10,7 @@ static int g_shared_fallback = 0; /* strict exclusive by default */
 static int g_hifi        = 0;   /* strict native client-format exclusive path */
 static int g_audiohost   = 0;   /* optional out-of-process exclusive renderer */
 static char g_endpoint_id[200];  /* hook.cfg endpoint=: output device chosen in the panel */
+static int g_host_ring_ms = 500; /* separate host's shared ring depth */
 static int g_dedicated_core = 0; /* pin the drain thread to one fast core */
 static int g_process_priority = 0; /* HIGH_PRIORITY_CLASS while engaged */
 static int g_event       = 1;   /* try event-driven exclusive first, timer polling if refused */
@@ -557,6 +558,7 @@ static void load_config(void) {
         else if (_strnicmp(p, "prime=", 6) == 0) g_prime = atoi(p + 6) != 0;
         else if (_strnicmp(p, "memlock=", 8) == 0) g_memlock = atoi(p + 8) != 0;
         else if (_strnicmp(p, "event=", 6) == 0) g_event = atoi(p + 6) != 0;
+        else if (_strnicmp(p, "host_ring_ms=", 13) == 0) g_host_ring_ms = atoi(p + 13);
         else if (_strnicmp(p, "endpoint=", 9) == 0) {
             snprintf(g_endpoint_id, sizeof(g_endpoint_id), "%s", p + 9);
             for (char *q = g_endpoint_id; *q; q++)
@@ -578,6 +580,7 @@ static void load_config(void) {
     }
     fclose(f);
     if (g_resync_ms < 0 || g_resync_ms > 2000) g_resync_ms = 200;
+    g_host_ring_ms = nex_audio_policy_host_ring_ms(g_host_ring_ms);
     {
         /* Legal ranges, defaults and the strict-native overrides are policy:
            see nex_audio_policy_normalize_config. */
@@ -629,8 +632,9 @@ static void load_config(void) {
     log_line("config: enable=%d bits=%d rate=%d buffer=%d compat=%d dither=%d fade_ms=%d shared_fallback=%d src_prefer=%s hifi=%d audiohost=%d",
              g_enable, g_out_bits, g_force_rate, g_out_frames, g_compat, g_dither, g_fade_ms,
              g_shared_fallback, g_src_prefer ? "simplicity" : "bandwidth", g_hifi, g_audiohost);
-    log_line("config: prime=%d resync_ms=%d event=%d memlock=%d dedicated_core=%d process_priority=%d log=%d endpoint=%s",
+    log_line("config: prime=%d resync_ms=%d event=%d memlock=%d dedicated_core=%d process_priority=%d host_ring_ms=%d log=%d endpoint=%s",
              g_prime, g_resync_ms, g_event, g_memlock, g_dedicated_core, g_process_priority,
+             g_host_ring_ms,
              g_log_enabled, g_endpoint_id[0] ? g_endpoint_id : "(follow client)");
 }
 
