@@ -2314,6 +2314,32 @@ static void test_multichannel_resample_keeps_channels(void) {
     printf("PASS multichannel resample: 8 channels at different levels stay separate (96k->48k)\n");
 }
 
+/* ---- Orion 3: the log is written off the audio path ------------------------ */
+static void test_log_queue_order_and_overflow(void) {
+    static LogQueue q;
+    char out[LOG_LINE_BYTES];
+    memset(&q, 0, sizeof(q));
+    CHECK(log_queue_push(&q, "first"));
+    CHECK(log_queue_push(&q, "second"));
+    CHECK(log_queue_take(&q, out, sizeof(out)) && strcmp(out, "first") == 0);
+    CHECK(log_queue_take(&q, out, sizeof(out)) && strcmp(out, "second") == 0);
+    CHECK(!log_queue_take(&q, out, sizeof(out)));
+    for (int i = 0; i < LOG_QUEUE_LINES + 5; i++) log_queue_push(&q, "x");
+    CHECK(q.dropped == 5);                       /* a full queue drops, never blocks */
+    int taken = 0;
+    while (log_queue_take(&q, out, sizeof(out))) taken++;
+    CHECK(taken == LOG_QUEUE_LINES);
+    /* a long line is truncated, not overrun */
+    {
+        char longline[LOG_LINE_BYTES * 2];
+        memset(longline, 'a', sizeof(longline) - 1);
+        longline[sizeof(longline) - 1] = 0;
+        CHECK(log_queue_push(&q, longline));
+        CHECK(log_queue_take(&q, out, sizeof(out)) && strlen(out) == LOG_LINE_BYTES - 1);
+    }
+    printf("PASS log queue: FIFO order, bounded, overflow counted instead of blocking\n");
+}
+
 static void test_src_response(void) {
     static const struct { int in, out; const char *name; } ratios[] = {
         {44100, 48000, "44.1k->48k"},
@@ -2510,6 +2536,7 @@ int main(void) {
     InitializeCriticalSection(&g_lock);
     InitializeCriticalSection(&g_control);
     InitializeCriticalSection(&g_patch_lock);
+    InitializeCriticalSection(&g_log_qlock);
     g_log[0] = 0; /* No on-disk playback log is modified by this test. */
     /* No test may rebuild a generation on a real endpoint (ROADMAP 6c path). */
     mock_rebuild_setup();
@@ -2532,6 +2559,7 @@ int main(void) {
     test_auto_dither_keeps_exact_samples();
     test_drain_window_count();
     test_remote_transport_signals();
+    test_log_queue_order_and_overflow();
     test_multichannel_conversion_keeps_channels();
     test_multichannel_resample_keeps_channels();
     test_drain_thread_registers_mmcss();

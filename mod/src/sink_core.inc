@@ -69,22 +69,94 @@ static char g_log[MAX_PATH];
 static UINT64 g_generation;
 typedef struct FakeObj FakeObj;
 
+/* The log is written by a background thread. log_line() only formats the
+   line and appends it to a bounded in-memory queue under its own small lock.
+   It used to open, write and close sink.log while holding g_lock - the lock
+   that also guards the client ring - so any log line from any thread could
+   hold up audio for the length of a disk write (or an antivirus scan of
+   sink.log). A full queue drops lines and counts them; it never blocks. */
+#define LOG_QUEUE_LINES 256
+#define LOG_LINE_BYTES  640
+typedef struct LogQueue {
+    char   line[LOG_QUEUE_LINES][LOG_LINE_BYTES];
+    UINT32 head, tail;
+    UINT32 dropped;
+} LogQueue;
+
+static int log_queue_push(LogQueue *q, const char *text) {
+    if (q->head - q->tail >= LOG_QUEUE_LINES) { q->dropped++; return 0; }
+    snprintf(q->line[q->head % LOG_QUEUE_LINES], LOG_LINE_BYTES, "%s", text);
+    q->head++;
+    return 1;
+}
+static int log_queue_take(LogQueue *q, char *out, size_t n) {
+    if (q->head == q->tail) return 0;
+    snprintf(out, n, "%s", q->line[q->tail % LOG_QUEUE_LINES]);
+    q->tail++;
+    return 1;
+}
+
+static LogQueue g_logq;
+static CRITICAL_SECTION g_log_qlock;
+static HANDLE g_log_event;
+static volatile LONG g_log_async;
+static int g_log_enabled = 1;          /* hook.cfg log=0 turns file logging off */
+
+static DWORD WINAPI log_writer(LPVOID unused) {
+    static char batch[LOG_QUEUE_LINES][LOG_LINE_BYTES];
+    (void)unused;
+    for (;;) {
+        WaitForSingleObject(g_log_event, 1000);
+        int n = 0;
+        UINT32 dropped;
+        EnterCriticalSection(&g_log_qlock);
+        while (n < LOG_QUEUE_LINES && log_queue_take(&g_logq, batch[n], LOG_LINE_BYTES)) n++;
+        dropped = g_logq.dropped;
+        g_logq.dropped = 0;
+        LeaveCriticalSection(&g_log_qlock);
+        if (!n && !dropped) continue;
+        FILE *f = fopen(g_log, "a");
+        if (!f) continue;
+        for (int i = 0; i < n; i++) fputs(batch[i], f);
+        if (dropped) fprintf(f, "log: %lu line(s) dropped (queue full)\n", (unsigned long)dropped);
+        fclose(f);
+    }
+    return 0;
+}
+
+/* Started once the log path is known (DllMain). Before that, and in the
+   regression binary, lines are written synchronously under the queue lock. */
+static void log_start_writer(void) {
+    g_log_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!g_log_event) return;
+    HANDLE t = CreateThread(NULL, 0, log_writer, NULL, 0, NULL);
+    if (!t) return;
+    CloseHandle(t);
+    InterlockedExchange(&g_log_async, 1);
+}
+
 static void log_line(const char *fmt, ...) {
-    char buf[1024];
+    if (!g_log[0] || !g_log_enabled) return;
+    char buf[LOG_LINE_BYTES - 48];
+    char line[LOG_LINE_BYTES];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    EnterCriticalSection(&g_lock);
-    FILE *f = fopen(g_log, "a");
-    if (f) {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        fprintf(f, "%02d:%02d:%02d.%03d [%lu] %s\n", st.wHour, st.wMinute,
-                st.wSecond, st.wMilliseconds, GetCurrentThreadId(), buf);
-        fclose(f);
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(line, sizeof(line), "%02d:%02d:%02d.%03d [%lu] %s\n", st.wHour, st.wMinute,
+             st.wSecond, st.wMilliseconds, GetCurrentThreadId(), buf);
+    EnterCriticalSection(&g_log_qlock);
+    if (g_log_async) {
+        log_queue_push(&g_logq, line);
+        LeaveCriticalSection(&g_log_qlock);
+        SetEvent(g_log_event);
+    } else {
+        FILE *f = fopen(g_log, "a");
+        if (f) { fputs(line, f); fclose(f); }
+        LeaveCriticalSection(&g_log_qlock);
     }
-    LeaveCriticalSection(&g_lock);
     OutputDebugStringA(buf);
 }
 
@@ -403,6 +475,7 @@ static void load_config(void) {
         else if (_strnicmp(p, "shared_fallback=", 16) == 0) g_shared_fallback = atoi(p + 16) != 0;
         else if (_strnicmp(p, "hifi=", 5) == 0) g_hifi = atoi(p + 5) != 0;
         else if (_strnicmp(p, "audiohost=", 10) == 0) g_audiohost = atoi(p + 10) != 0;
+        else if (_strnicmp(p, "log=", 4) == 0) g_log_enabled = atoi(p + 4) != 0;
         else if (_strnicmp(p, "src_prefer=", 11) == 0) {
             char v[32];
             snprintf(v, sizeof(v), "%s", p + 11);

@@ -682,6 +682,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         InitializeCriticalSection(&g_lock);
         InitializeCriticalSection(&g_control);
         InitializeCriticalSection(&g_patch_lock);
+        InitializeCriticalSection(&g_log_qlock);
         DisableThreadLibraryCalls(inst);
 
         const char *env = getenv("NEX_LOG");
@@ -695,6 +696,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
                 else g_log[0] = 0;
             }
         }
+
+        if (g_log[0]) log_start_writer();
 
         g_fake_render.vtbl = g_fake_render_vtbl;
         g_fake_render.ref  = 1;
