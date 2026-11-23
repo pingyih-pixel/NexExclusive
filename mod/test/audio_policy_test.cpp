@@ -487,6 +487,75 @@ static void test_path_kind_labels() {
     std::printf("PASS path labels: native, repacked, depth only, converted; fade is never hidden\n");
 }
 
+/* ---- Orion 1+2: start with silence, longer across clock families ----------- */
+static void test_rate_family_and_prime() {
+    CHECK(nex_audio_policy_rate_family(44100) == 44100);
+    CHECK(nex_audio_policy_rate_family(88200) == 44100);
+    CHECK(nex_audio_policy_rate_family(176400) == 44100);
+    CHECK(nex_audio_policy_rate_family(352800) == 44100);
+    CHECK(nex_audio_policy_rate_family(48000) == 48000);
+    CHECK(nex_audio_policy_rate_family(96000) == 48000);
+    CHECK(nex_audio_policy_rate_family(192000) == 48000);
+    CHECK(nex_audio_policy_rate_family(32000) == 48000);
+    CHECK(nex_audio_policy_rate_family(0) == 0);
+    /* one device buffer of silence on every fresh start */
+    CHECK(nex_audio_policy_prime_frames(44100, 44100, 4410, 1, 200) == 4410);
+    CHECK(nex_audio_policy_prime_frames(0, 44100, 4410, 1, 200) == 4410);       /* first ever */
+    CHECK(nex_audio_policy_prime_frames(48000, 96000, 9600, 1, 200) == 9600);   /* same family */
+    /* plus the resync time when the DAC has to change crystal */
+    CHECK(nex_audio_policy_prime_frames(48000, 44100, 4410, 1, 200) == 4410 + 8820);
+    CHECK(nex_audio_policy_prime_frames(44100, 192000, 19200, 1, 200) == 19200 + 38400);
+    CHECK(nex_audio_policy_prime_frames(44100, 48000, 4800, 0, 200) == 9600);   /* prime off, resync on */
+    CHECK(nex_audio_policy_prime_frames(44100, 48000, 4800, 1, 0) == 4800);     /* resync off */
+    CHECK(nex_audio_policy_prime_frames(44100, 48000, 4800, 0, 0) == 0);
+    std::printf("PASS prime: one buffer of silence per fresh start, +resync across clock families\n");
+}
+
+/* ---- Orion 4: the EOS wait is bounded by what is actually buffered ---------- */
+static void test_eos_wait_bound() {
+    CHECK(nex_audio_policy_eos_wait_ms(0, 48000) == 300);              /* floor */
+    CHECK(nex_audio_policy_eos_wait_ms(4800, 48000) == 350);           /* 100 ms + margin */
+    CHECK(nex_audio_policy_eos_wait_ms(48000, 48000) == 1250);         /* 1 s + margin */
+    CHECK(nex_audio_policy_eos_wait_ms(192000ull * 60, 192000) == 5000); /* capped */
+    CHECK(nex_audio_policy_eos_wait_ms(4800, 0) == 5000);              /* unknown rate */
+    std::printf("PASS eos wait: buffered audio + 250 ms, between 300 ms and 5 s\n");
+}
+
+/* ---- Orion 6: event mode only where one period can be completed ----------- */
+static void test_event_mode_fits() {
+    CHECK(nex_audio_policy_event_fits(44100, 44100, 4410, 32768, 544));    /* native */
+    CHECK(nex_audio_policy_event_fits(44100, 96000, 9600, 32768, 544));    /* upsampling */
+    CHECK(nex_audio_policy_event_fits(192000, 96000, 9600, 32768, 544));   /* 2:1 down */
+    CHECK(!nex_audio_policy_event_fits(384000, 96000, 9600, 32768, 544));  /* 38400 in > cap */
+    CHECK(!nex_audio_policy_event_fits(0, 48000, 4800, 32768, 544));
+    std::printf("PASS event mode: used only when a full period fits the resampler history\n");
+}
+
+/* ---- Orion 7: the optional dedicated core ------------------------------------ */
+static void test_pick_core() {
+    /* hybrid: 2 P-cores (class 1, SMT pairs) then 4 E-cores (class 0) */
+    NexAudioCoreInfo hybrid[6] = {
+        {1, 0x3}, {1, 0xC}, {0, 0x10}, {0, 0x20}, {0, 0x40}, {0, 0x80},
+    };
+    CHECK(nex_audio_policy_pick_core(hybrid, 6) == 1);       /* fast core, not CPU 0 */
+    NexAudioCoreInfo flat[4] = { {0, 0x1}, {0, 0x2}, {0, 0x4}, {0, 0x8} };
+    CHECK(nex_audio_policy_pick_core(flat, 4) == 3);         /* last core */
+    NexAudioCoreInfo one[1] = { {0, 0x1} };
+    CHECK(nex_audio_policy_pick_core(one, 1) == -1);         /* nothing to spare */
+    NexAudioCoreInfo e_first[3] = { {0, 0x1}, {1, 0x2}, {0, 0x4} };
+    CHECK(nex_audio_policy_pick_core(e_first, 3) == 1);
+    std::printf("PASS dedicated core: fastest class, never the core holding CPU 0\n");
+}
+
+/* ---- Orion 9: the separate host's ring depth --------------------------------- */
+static void test_host_ring_depth() {
+    CHECK(nex_audio_policy_host_ring_ms(0) == 500);
+    CHECK(nex_audio_policy_host_ring_ms(50) == 200);
+    CHECK(nex_audio_policy_host_ring_ms(2000) == 2000);
+    CHECK(nex_audio_policy_host_ring_ms(60000) == 4000);
+    std::printf("PASS host ring: 500 ms default, 200 ms to 4 s\n");
+}
+
 int main() {
     test_16_bit_source_ladder_precedes_higher_setting();
     test_24_bit_source_ladder();
@@ -516,6 +585,11 @@ int main() {
     test_20_bit_compat_source_first();
     test_bits_zero_follows_source();
     test_path_kind_labels();
+    test_rate_family_and_prime();
+    test_eos_wait_bound();
+    test_event_mode_fits();
+    test_pick_core();
+    test_host_ring_depth();
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }

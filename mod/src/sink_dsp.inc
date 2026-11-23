@@ -196,9 +196,9 @@ static double *g_fin;   /* the same frames as double */
 static double *g_fout;  /* resampled output, up to one device buffer */
 
 static void scratch_free(void) {
-    if (g_inb)  { free(g_inb);  g_inb  = NULL; }
-    if (g_fin)  { free(g_fin);  g_fin  = NULL; }
-    if (g_fout) { free(g_fout); g_fout = NULL; }
+    if (g_inb)  { audio_free(g_inb);  g_inb  = NULL; }
+    if (g_fin)  { audio_free(g_fin);  g_fin  = NULL; }
+    if (g_fout) { audio_free(g_fout); g_fout = NULL; }
 }
 
 /* A transport Reset discards input history, not just the client ring. Cached
@@ -212,8 +212,8 @@ static void src_reset(int ch) {
 }
 
 static void src_free(void) {
-    if (g_src.buf)  { free(g_src.buf);  g_src.buf  = NULL; }
-    if (g_src.pool) { free(g_src.pool); g_src.pool = NULL; }
+    if (g_src.buf)  { audio_free(g_src.buf);  g_src.buf  = NULL; }
+    if (g_src.pool) { audio_free(g_src.pool); g_src.pool = NULL; }
     memset(g_src.ph, 0, sizeof(g_src.ph));
     g_src.count = 0;
     g_src.pos   = 0;
@@ -275,6 +275,8 @@ static int src_init(int in_rate, int out_rate, int ch) {
     g_src.buf  = (double *)calloc((size_t)SRC_CAP * (size_t)ch, sizeof(double));
     g_src.pool = (double *)calloc((size_t)phases * stride, sizeof(double));
     if (!g_src.buf || !g_src.pool) { src_free(); return 0; }
+    audio_mem_lock(g_src.buf, (SIZE_T)SRC_CAP * (SIZE_T)ch * sizeof(double));
+    audio_mem_lock(g_src.pool, (SIZE_T)phases * stride * sizeof(double));
 
     g_i0_beta = src_i0(SRC_BETA);
     for (int i = 0; i < phases; i++) {
@@ -481,15 +483,22 @@ static void apply_fade(BYTE *dst, UINT32 frames) {
 
 /* Copy without moving the read cursor.  Remote submission uses this two-step
    form so a timed-out IPC write leaves the client ring untouched. */
+/* Copies across the wrap point: an event-driven device needs one complete
+   period per call, and a contiguous-only copy could leave a tail shorter than
+   a period at the end of the ring forever. */
 static UINT32 ring_peek(BYTE *dst, UINT32 maxframes) {
     EnterCriticalSection(&g_lock);
     UINT32 avail = g_sink.w - g_sink.r;
     UINT32 start = g_sink.r % g_sink.cap;
-    if (start + avail > g_sink.cap) avail = g_sink.cap - start;
     UINT32 n = avail < maxframes ? avail : maxframes;
-    if (n)
+    UINT32 first = n;
+    if (start + first > g_sink.cap) first = g_sink.cap - start;
+    if (first)
         memcpy(dst, g_sink.ring + (size_t)start * g_sink.in_block,
-               (size_t)n * g_sink.in_block);
+               (size_t)first * g_sink.in_block);
+    if (n > first)
+        memcpy(dst + (size_t)first * g_sink.in_block, g_sink.ring,
+               (size_t)(n - first) * g_sink.in_block);
     LeaveCriticalSection(&g_lock);
     return n;
 }

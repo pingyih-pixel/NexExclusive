@@ -9,6 +9,14 @@ static int g_fade_ms     = 0;   /* explicit processing; 0 (default) leaves sampl
 static int g_shared_fallback = 0; /* strict exclusive by default */
 static int g_hifi        = 0;   /* strict native client-format exclusive path */
 static int g_audiohost   = 0;   /* optional out-of-process exclusive renderer */
+static char g_endpoint_id[200];  /* hook.cfg endpoint=: output device chosen in the panel */
+static int g_host_ring_ms = 500; /* separate host's shared ring depth */
+static int g_dedicated_core = 0; /* pin the drain thread to one fast core */
+static int g_process_priority = 0; /* HIGH_PRIORITY_CLASS while engaged */
+static int g_event       = 1;   /* try event-driven exclusive first, timer polling if refused */
+static int g_memlock     = 1;   /* VirtualLock the buffers the drain path touches */
+static int g_prime       = 1;   /* one device buffer of silence before a fresh start */
+static int g_resync_ms   = 200; /* extra silence when the DAC changes clock family */
 /* Which rate to prefer when the device refuses the source rate.
      0 = bandwidth: nearest higher first, then lower from high to low.
      1 = simplicity: integer conversion ratios first, then bandwidth order.
@@ -69,23 +77,159 @@ static char g_log[MAX_PATH];
 static UINT64 g_generation;
 typedef struct FakeObj FakeObj;
 
+/* The log is written by a background thread. log_line() only formats the
+   line and appends it to a bounded in-memory queue under its own small lock.
+   It used to open, write and close sink.log while holding g_lock - the lock
+   that also guards the client ring - so any log line from any thread could
+   hold up audio for the length of a disk write (or an antivirus scan of
+   sink.log). A full queue drops lines and counts them; it never blocks. */
+#define LOG_QUEUE_LINES 256
+#define LOG_LINE_BYTES  640
+typedef struct LogQueue {
+    char   line[LOG_QUEUE_LINES][LOG_LINE_BYTES];
+    UINT32 head, tail;
+    UINT32 dropped;
+} LogQueue;
+
+static int log_queue_push(LogQueue *q, const char *text) {
+    if (q->head - q->tail >= LOG_QUEUE_LINES) { q->dropped++; return 0; }
+    snprintf(q->line[q->head % LOG_QUEUE_LINES], LOG_LINE_BYTES, "%s", text);
+    q->head++;
+    return 1;
+}
+static int log_queue_take(LogQueue *q, char *out, size_t n) {
+    if (q->head == q->tail) return 0;
+    snprintf(out, n, "%s", q->line[q->tail % LOG_QUEUE_LINES]);
+    q->tail++;
+    return 1;
+}
+
+static LogQueue g_logq;
+static CRITICAL_SECTION g_log_qlock;
+static HANDLE g_log_event;
+static volatile LONG g_log_async;
+static int g_log_enabled = 1;          /* hook.cfg log=0 turns file logging off */
+
+static DWORD WINAPI log_writer(LPVOID unused) {
+    static char batch[LOG_QUEUE_LINES][LOG_LINE_BYTES];
+    (void)unused;
+    for (;;) {
+        WaitForSingleObject(g_log_event, 1000);
+        int n = 0;
+        UINT32 dropped;
+        EnterCriticalSection(&g_log_qlock);
+        while (n < LOG_QUEUE_LINES && log_queue_take(&g_logq, batch[n], LOG_LINE_BYTES)) n++;
+        dropped = g_logq.dropped;
+        g_logq.dropped = 0;
+        LeaveCriticalSection(&g_log_qlock);
+        if (!n && !dropped) continue;
+        FILE *f = fopen(g_log, "a");
+        if (!f) continue;
+        for (int i = 0; i < n; i++) fputs(batch[i], f);
+        if (dropped) fprintf(f, "log: %lu line(s) dropped (queue full)\n", (unsigned long)dropped);
+        fclose(f);
+    }
+    return 0;
+}
+
+/* Started once the log path is known (DllMain). Before that, and in the
+   regression binary, lines are written synchronously under the queue lock. */
+static void log_start_writer(void) {
+    g_log_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!g_log_event) return;
+    HANDLE t = CreateThread(NULL, 0, log_writer, NULL, 0, NULL);
+    if (!t) return;
+    CloseHandle(t);
+    InterlockedExchange(&g_log_async, 1);
+}
+
 static void log_line(const char *fmt, ...) {
-    char buf[1024];
+    if (!g_log[0] || !g_log_enabled) return;
+    char buf[LOG_LINE_BYTES - 48];
+    char line[LOG_LINE_BYTES];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    EnterCriticalSection(&g_lock);
-    FILE *f = fopen(g_log, "a");
-    if (f) {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        fprintf(f, "%02d:%02d:%02d.%03d [%lu] %s\n", st.wHour, st.wMinute,
-                st.wSecond, st.wMilliseconds, GetCurrentThreadId(), buf);
-        fclose(f);
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(line, sizeof(line), "%02d:%02d:%02d.%03d [%lu] %s\n", st.wHour, st.wMinute,
+             st.wSecond, st.wMilliseconds, GetCurrentThreadId(), buf);
+    EnterCriticalSection(&g_log_qlock);
+    if (g_log_async) {
+        log_queue_push(&g_logq, line);
+        LeaveCriticalSection(&g_log_qlock);
+        SetEvent(g_log_event);
+    } else {
+        FILE *f = fopen(g_log, "a");
+        if (f) { fputs(line, f); fclose(f); }
+        LeaveCriticalSection(&g_log_qlock);
     }
-    LeaveCriticalSection(&g_lock);
     OutputDebugStringA(buf);
+}
+
+/* ---- audio buffers stay resident (Orion: VirtualLock) ---------------------
+   A page of the ring or the resampler that has been trimmed from the working
+   set costs a hard fault on the audio thread - milliseconds on a busy disk,
+   which is an audible gap at a 100 ms device buffer. The buffers the drain
+   path touches are locked after allocation and unlocked before free. The
+   working-set minimum is raised as needed; failure only logs. memlock=0 in
+   hook.cfg turns this off. */
+#define AUDIO_LOCK_SLOTS 16
+typedef struct AudioLock { void *volatile p; SIZE_T n; } AudioLock;
+static AudioLock g_audio_locks[AUDIO_LOCK_SLOTS];
+static volatile LONG64 g_audio_locked_bytes;
+static volatile LONG g_audio_lock_failures;
+
+static int audio_mem_grow_working_set(SIZE_T n) {
+    SIZE_T lo = 0, hi = 0;
+    HANDLE self = GetCurrentProcess();
+    if (!GetProcessWorkingSetSize(self, &lo, &hi)) return 0;
+    SIZE_T want_lo = lo + n + 256 * 1024;
+    SIZE_T want_hi = hi > want_lo + n ? hi : want_lo + n;
+    return SetProcessWorkingSetSize(self, want_lo, want_hi) ? 1 : 0;
+}
+
+static void audio_mem_lock(void *p, SIZE_T n) {
+    if (!g_memlock || !p || !n) return;
+    int slot = -1;
+    for (int i = 0; i < AUDIO_LOCK_SLOTS; i++)
+        if (InterlockedCompareExchangePointer((PVOID volatile *)&g_audio_locks[i].p, p, NULL) == NULL) {
+            slot = i;
+            break;
+        }
+    if (slot < 0) return;
+    BOOL ok = VirtualLock(p, n);
+    if (!ok && GetLastError() == ERROR_WORKING_SET_QUOTA && audio_mem_grow_working_set(n))
+        ok = VirtualLock(p, n);
+    if (!ok) {
+        DWORD e = GetLastError();
+        InterlockedExchangePointer((PVOID volatile *)&g_audio_locks[slot].p, NULL);
+        if (InterlockedIncrement(&g_audio_lock_failures) <= 3)
+            log_line("memlock: VirtualLock(%lu bytes) failed %lu; buffer stays pageable",
+                     (unsigned long)n, (unsigned long)e);
+        return;
+    }
+    g_audio_locks[slot].n = n;
+    InterlockedExchangeAdd64(&g_audio_locked_bytes, (LONG64)n);
+}
+
+static void audio_mem_unlock(void *p) {
+    if (!p) return;
+    for (int i = 0; i < AUDIO_LOCK_SLOTS; i++) {
+        if (g_audio_locks[i].p != p) continue;
+        SIZE_T n = g_audio_locks[i].n;
+        VirtualUnlock(p, n);
+        InterlockedExchangeAdd64(&g_audio_locked_bytes, -(LONG64)n);
+        g_audio_locks[i].n = 0;
+        InterlockedExchangePointer((PVOID volatile *)&g_audio_locks[i].p, NULL);
+        return;
+    }
+}
+
+static void audio_free(void *p) {
+    audio_mem_unlock(p);
+    free(p);
 }
 
 /* ---- device generation -------------------------------------------------- */
@@ -109,6 +253,7 @@ typedef struct SinkGen {
     UINT64              clock_frequency;
     UINT32              real_frames;
     HANDLE              real_evt;
+    volatile LONG       evt_fired;      /* the device asked for its next period */
     REFERENCE_TIME      real_latency;
     HANDLE              endpoint_gate;  /* per-endpoint cross-process lock file */
     volatile LONG       device_started;
@@ -185,6 +330,9 @@ typedef struct {
     int                 config_audiohost;
 
     BYTE              *conv;            /* scratch for one conversion pass */
+
+    UINT32             prime_left;      /* silent frames still to submit before client audio */
+    UINT64             skip_frames;     /* silent frames the device clock has counted */
 
     UINT32             fade_total;      /* frames in the opening ramp */
     UINT32             fade_left;
@@ -390,6 +538,9 @@ static void load_config(void) {
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[256];
+    char endpoint_before[sizeof(g_endpoint_id)];
+    memcpy(endpoint_before, g_endpoint_id, sizeof(endpoint_before));
+    g_endpoint_id[0] = 0;
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
@@ -403,6 +554,19 @@ static void load_config(void) {
         else if (_strnicmp(p, "shared_fallback=", 16) == 0) g_shared_fallback = atoi(p + 16) != 0;
         else if (_strnicmp(p, "hifi=", 5) == 0) g_hifi = atoi(p + 5) != 0;
         else if (_strnicmp(p, "audiohost=", 10) == 0) g_audiohost = atoi(p + 10) != 0;
+        else if (_strnicmp(p, "log=", 4) == 0) g_log_enabled = atoi(p + 4) != 0;
+        else if (_strnicmp(p, "prime=", 6) == 0) g_prime = atoi(p + 6) != 0;
+        else if (_strnicmp(p, "memlock=", 8) == 0) g_memlock = atoi(p + 8) != 0;
+        else if (_strnicmp(p, "event=", 6) == 0) g_event = atoi(p + 6) != 0;
+        else if (_strnicmp(p, "host_ring_ms=", 13) == 0) g_host_ring_ms = atoi(p + 13);
+        else if (_strnicmp(p, "endpoint=", 9) == 0) {
+            snprintf(g_endpoint_id, sizeof(g_endpoint_id), "%s", p + 9);
+            for (char *q = g_endpoint_id; *q; q++)
+                if (*q == '\r' || *q == '\n' || *q == ' ') { *q = 0; break; }
+        }
+        else if (_strnicmp(p, "dedicated_core=", 15) == 0) g_dedicated_core = atoi(p + 15) != 0;
+        else if (_strnicmp(p, "process_priority=", 17) == 0) g_process_priority = atoi(p + 17) != 0;
+        else if (_strnicmp(p, "resync_ms=", 10) == 0) g_resync_ms = atoi(p + 10);
         else if (_strnicmp(p, "src_prefer=", 11) == 0) {
             char v[32];
             snprintf(v, sizeof(v), "%s", p + 11);
@@ -415,6 +579,8 @@ static void load_config(void) {
         }
     }
     fclose(f);
+    if (g_resync_ms < 0 || g_resync_ms > 2000) g_resync_ms = 200;
+    g_host_ring_ms = nex_audio_policy_host_ring_ms(g_host_ring_ms);
     {
         /* Legal ranges, defaults and the strict-native overrides are policy:
            see nex_audio_policy_normalize_config. */
@@ -451,7 +617,8 @@ static void load_config(void) {
                    || g_cfg_policy.dither != g_dither
                    || g_cfg_policy.fade_ms != g_fade_ms
                    || g_cfg_policy.src_prefer != g_src_prefer
-                   || g_cfg_policy.hifi != g_hifi;
+                   || g_cfg_policy.hifi != g_hifi
+                   || strcmp(endpoint_before, g_endpoint_id) != 0;
         g_cfg_policy.out_bits = g_out_bits;
         g_cfg_policy.force_rate = g_force_rate;
         g_cfg_policy.compat = g_compat;
@@ -465,5 +632,9 @@ static void load_config(void) {
     log_line("config: enable=%d bits=%d rate=%d buffer=%d compat=%d dither=%d fade_ms=%d shared_fallback=%d src_prefer=%s hifi=%d audiohost=%d",
              g_enable, g_out_bits, g_force_rate, g_out_frames, g_compat, g_dither, g_fade_ms,
              g_shared_fallback, g_src_prefer ? "simplicity" : "bandwidth", g_hifi, g_audiohost);
+    log_line("config: prime=%d resync_ms=%d event=%d memlock=%d dedicated_core=%d process_priority=%d host_ring_ms=%d log=%d endpoint=%s",
+             g_prime, g_resync_ms, g_event, g_memlock, g_dedicated_core, g_process_priority,
+             g_host_ring_ms,
+             g_log_enabled, g_endpoint_id[0] ? g_endpoint_id : "(follow client)");
 }
 

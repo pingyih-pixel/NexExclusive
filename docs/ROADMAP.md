@@ -78,6 +78,32 @@ AudioQuest DragonFly MM3A（额外支持 88.2）。
 - [ ] CI 里跑（需要 Windows runner，已经有）
 - [ ] 用 Pingyi 会话完成进程内与 audiohost 的同曲目对照，并保存状态 JSON 和日志
 
+### 5a. 回放模拟与长时验收（借鉴 Orion 的工程做法）
+
+单元回归用的是 mock 端点，测不到真实驱动；实机验收靠人听，不可重复。中间缺一层：
+用脚本按网易云的调用方式驱动真实 DLL 与真实设备，并且能反复跑。
+
+- [x] 回放模拟工具 `mod/tools/nexsim.c`（`bash mod/build.sh sim`）：在自己的进程里加载 `nexsink.dll`，
+      以共享 + 事件驱动的客户端方式驱动默认设备，脚本覆盖同格式交接、44.1k↔48k↔96k 换族、暂停 1.5 s、
+      跳转（Stop/Reset/Start）；检查调用返回值、客户端时钟单调 / 暂停不走 / 跳转归零 / 与实际播放时长的偏差，
+      客户端事件不得静默 500 ms 以上，最后扫描 sink.log 的 fault 与 empty-buffer
+- [ ] 在本机实跑一轮 `nexsim playlist` 并记录结果（进程内与 `audiohost=1` 各一轮）
+- [ ] 加一个读真实 sink.log 回放的离线模式（把一次出问题的会话变成可重复的回归输入）
+- [ ] 通宵浸泡验收：连续 7 小时播放（列表循环，含切歌、拖进度、换格式），
+      验收线为 **0 断音、0 欠载（empty-buffer 全程为 0）、0 削波（非音源自身）**；进程内与 audiohost 各一次
+
+### 5b. 从 Orion 借鉴的 WASAPI 改进（2026-11-23）
+
+- [x] 新流开播前垫一个设备缓冲的静音；44.1k 族与 48k 族之间切换时多垫 `resync_ms`（默认 200 ms）；客户端时钟扣除这段静音
+- [x] 日志改为后台线程写盘，不再占用环形缓冲的锁；`log=0` 关闭文件日志
+- [x] 独立宿主的 EOS 等待按实际缓冲量限时（300 ms～5 s），不再固定 5 s
+- [x] 音频缓冲 `VirtualLock`（DLL 与 NexAudioHost 的共享环），`memlock=0` 关闭
+- [x] 独占优先事件驱动，驱动拒绝时回退定时轮询（`event=0` 强制轮询）
+- [x] 可选：drain 线程独占一个快核心（`dedicated_core=1`）、接管期间提高进程优先级（`process_priority=1`），默认关闭
+- [x] 面板选择独占输出设备（默认跟随网易云，选定设备不可用时回退）
+- [x] 独立宿主环形缓冲深度可配（`host_ring_ms`，默认 500 ms，200 ms～4 s）
+- [ ] 以上各项的实机验收：事件驱动在 MOONDROP / DragonFly 上是否被接受、换族时 DAC 是否还吞音头
+
 ### 6b. 远程时钟、EOS 与背压
 
 - [x] Host 回传真实 `IAudioClock`、QPC 和 padding，客户端不再用 `endpoint_frames` 推算公开时间轴
@@ -146,6 +172,8 @@ WASAPI 独占 ✅ ／ ASIO ❌ ／ OpenHome ❌ ／ DLNA ❌
 
 面板原计划分「本机播放 / 网播播放」两个页签，本机页签里在 WASAPI 端点和
 ASIO 驱动之间二选一。目前只有第一条。
+
+2026-11-23 决定：ASIO、DLNA/UPnP、RAAT 这些新输出通路**先不做**，先把 WASAPI 这一条做扎实（见 5a、5b）。
 
 ### 9. 设置面板回归
 

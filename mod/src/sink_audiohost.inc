@@ -50,6 +50,14 @@ static long remote_state(void) {
         (volatile LONG *)&g_remote_ipc->state, 0, 0) : NEX_AUDIO_CLOSING;
 }
 
+/* Producer-side telemetry, reported once a second next to the Host's own
+   counters: how often a write had to wait for ring space, the longest wait,
+   and the lowest / highest shared water level seen in the window. */
+static UINT32 g_remote_write_waits;
+static UINT32 g_remote_write_wait_max_ms;
+static UINT64 g_remote_level_min = ~(UINT64)0;
+static UINT64 g_remote_level_max;
+
 static void remote_sync_stats(void) {
     if (!g_remote_ipc) return;
     g_sink.hifi_client_frames = nex_audio_read64(&g_remote_ipc->client_frames);
@@ -73,8 +81,15 @@ static void remote_sync_stats(void) {
     DWORD now = GetTickCount();
     if (now - last_remote_log >= 1000) {
         last_remote_log = now;
+        UINT64 ring_used = nex_audio_ring_available(g_remote_ipc);
+        UINT32 padding = g_remote_ipc->device_padding_frames;
+        UINT32 rate = g_remote_ipc->output_rate;
+        unsigned long latency_ms = rate
+            ? (unsigned long)((ring_used + padding) * 1000ull / rate) : 0;
         log_line("audiohost telemetry generation=%llu converted=%llu source_waits=%llu "
-                 "backpressure=%llu underrun=%llu dropped=%llu eos_submitted=%llu eos_complete=%llu",
+                 "backpressure=%llu underrun=%llu dropped=%llu eos_submitted=%llu eos_complete=%llu "
+                 "ring_used=%llu ring_min=%llu ring_max=%llu ring_capacity=%lu device_padding=%lu "
+                 "latency_ms=%lu write_waits=%lu write_wait_max_ms=%lu primed=%llu",
                  (unsigned long long)g_remote_ipc->stream_generation,
                  (unsigned long long)nex_audio_read64(&g_remote_ipc->converted_frames),
                  (unsigned long long)nex_audio_read64(&g_remote_ipc->source_waits),
@@ -82,7 +97,18 @@ static void remote_sync_stats(void) {
                  (unsigned long long)nex_audio_read64(&g_remote_ipc->underrun_events),
                  (unsigned long long)nex_audio_read64(&g_remote_ipc->dropped_frames),
                  (unsigned long long)nex_audio_read64(&g_remote_ipc->eos_submitted_generation),
-                 (unsigned long long)nex_audio_read64(&g_remote_ipc->eos_complete_generation));
+                 (unsigned long long)nex_audio_read64(&g_remote_ipc->eos_complete_generation),
+                 (unsigned long long)ring_used,
+                 (unsigned long long)(g_remote_level_min == ~(UINT64)0 ? 0 : g_remote_level_min),
+                 (unsigned long long)g_remote_level_max,
+                 (unsigned long)g_remote_ipc->capacity_frames,
+                 (unsigned long)padding, latency_ms,
+                 (unsigned long)g_remote_write_waits, (unsigned long)g_remote_write_wait_max_ms,
+                 (unsigned long long)nex_audio_read64(&g_remote_ipc->primed_frames_total));
+        g_remote_write_waits = 0;
+        g_remote_write_wait_max_ms = 0;
+        g_remote_level_min = ~(UINT64)0;
+        g_remote_level_max = 0;
     }
 }
 
@@ -124,7 +150,7 @@ static void remote_close(void) {
     if (g_remote_data) CloseHandle(g_remote_data);
     if (g_remote_space) CloseHandle(g_remote_space);
     if (g_remote_ready) CloseHandle(g_remote_ready);
-    free(g_remote_out);
+    audio_free(g_remote_out);
     g_remote_out = NULL;
     g_remote_ipc = NULL;
     g_remote_pcm_data = NULL;
@@ -171,7 +197,7 @@ static HRESULT remote_try_exclusive(SinkGen *g, IMMDevice *dev,
                L"Local\\NexAudioV3Ready_%lu_%llu", (unsigned long)pid,
                (unsigned long long)generation);
 
-    UINT32 capacity = fmt->nSamplesPerSec / 2u; /* current short ring: 0.5 s */
+    UINT32 capacity = (UINT32)((UINT64)fmt->nSamplesPerSec * (UINT64)g_host_ring_ms / 1000u);
     if (capacity < NEX_AUDIO_MIN_RING_FRAMES) capacity = NEX_AUDIO_MIN_RING_FRAMES;
     UINT64 data_bytes = (UINT64)capacity * fmt->nBlockAlign;
     if (!data_bytes || data_bytes > NEX_AUDIO_MAX_DATA_BYTES) {
@@ -281,6 +307,7 @@ static HRESULT remote_try_exclusive(SinkGen *g, IMMDevice *dev,
         g->real_frames = c->device_frames;
         g->real_latency = (REFERENCE_TIME)c->device_latency_100ns;
         g_remote_out = (BYTE *)malloc((size_t)SCRATCH_FRAMES * c->output_frame_bytes);
+        audio_mem_lock(g_remote_out, (SIZE_T)SCRATCH_FRAMES * c->output_frame_bytes);
         if (!g_remote_out) {
             g_remote_error = E_OUTOFMEMORY;
             g_remote_reason = NEX_AUDIO_FALLBACK_MAPPING_FAILED;
@@ -328,6 +355,7 @@ static void remote_note_client(const BYTE *source, UINT32 frames) {
 static UINT32 remote_write(const BYTE *client, const BYTE *converted, UINT32 frames) {
     if (!g_remote_ipc || !converted || !frames) return 0;
     DWORD deadline = 0;
+    DWORD wait_start = 0;
     for (;;) {
         LONG state = remote_state();
         if (state == NEX_AUDIO_FAILED || state == NEX_AUDIO_CLOSING ||
@@ -349,11 +377,22 @@ static UINT32 remote_write(const BYTE *client, const BYTE *converted, UINT32 fra
                     (LONG64)hifi_changed_bytes(client, converted, bytes));
             }
             SetEvent(g_remote_data);
+            if (wait_start) {
+                DWORD waited = GetTickCount() - wait_start;
+                g_remote_write_waits++;
+                if (waited > g_remote_write_wait_max_ms) g_remote_write_wait_max_ms = waited;
+            }
+            {
+                UINT64 level = used + frames;
+                if (level < g_remote_level_min) g_remote_level_min = level;
+                if (level > g_remote_level_max) g_remote_level_max = level;
+            }
             remote_sync_stats();
             return frames;
         }
         DWORD now = GetTickCount();
         if (!deadline) {
+            wait_start = now;
             deadline = now + NEX_AUDIO_BACKPRESSURE_TIMEOUT_MS;
             InterlockedExchangeAdd64((volatile LONG64 *)&g_remote_ipc->backpressure_events, 1);
         }
@@ -373,6 +412,78 @@ static UINT32 remote_write(const BYTE *client, const BYTE *converted, UINT32 fra
     }
 }
 
+/* v3.1 transport. The Host owns the device, so the client's Stop/Start and
+   Reset reach it as requests on the control page. */
+static void remote_set_transport(UINT32 transport) {
+    if (!g_remote_ipc) return;
+    InterlockedExchange((volatile LONG *)&g_remote_ipc->transport, (LONG)transport);
+    if (g_remote_data) SetEvent(g_remote_data);
+}
+
+/* The device rate of the previous fresh stream, for the clock-family check. */
+static long g_last_device_rate;
+
+/* Arm the start-up silence for a fresh device stream (engage, retarget). The
+   in-process drain submits it itself; the Host does it for a remote stream. */
+static void sink_arm_prime(SinkGen *gen, long rate) {
+    long frames = nex_audio_policy_prime_frames(g_last_device_rate, rate,
+                                                gen ? (long)gen->real_frames : 0,
+                                                g_prime, g_resync_ms);
+    g_last_device_rate = rate;
+    g_sink.skip_frames = 0;
+    g_sink.prime_left = 0;
+    if (gen && gen->remote) {
+        if (g_remote_ipc)
+            InterlockedExchange((volatile LONG *)&g_remote_ipc->prime_request_frames, frames);
+    } else {
+        g_sink.prime_left = (UINT32)frames;
+    }
+    if (frames)
+        log_line("sink: %ld frames of start-up silence armed (rate %ld, %s)", frames, rate,
+                 gen && gen->remote ? "audiohost" : "in-process");
+}
+
+/* After a seek the device starts again from an empty buffer: one buffer of
+   silence, no resync (the clock family has not changed). */
+static void sink_arm_prime_after_reset(SinkGen *gen) {
+    g_sink.skip_frames = 0;
+    g_sink.prime_left = 0;
+    if (!gen || !g_prime) return;
+    if (gen->remote) {
+        if (g_remote_ipc)
+            InterlockedExchange((volatile LONG *)&g_remote_ipc->prime_request_frames,
+                                (LONG)gen->real_frames);
+    } else {
+        g_sink.prime_left = gen->real_frames;
+    }
+}
+
+/* Ask the Host to drop its ring and device buffer (a seek). Called with the
+   drain thread stopped, so nothing writes while the Host discards. Returns 1
+   once the Host has acknowledged within timeout_ms. */
+static int remote_request_flush(DWORD timeout_ms) {
+    if (!g_remote_ipc) return 0;
+    UINT64 generation = nex_audio_read64(&g_remote_ipc->flush_request_generation) + 1;
+    InterlockedExchange64((volatile LONG64 *)&g_remote_ipc->flush_request_generation,
+                          (LONG64)generation);
+    if (g_remote_data) SetEvent(g_remote_data);
+    DWORD start = GetTickCount();
+    for (;;) {
+        if (nex_audio_read64(&g_remote_ipc->flush_ack_generation) == generation) return 1;
+        LONG state = remote_state();
+        if (state == NEX_AUDIO_FAILED || state == NEX_AUDIO_CLOSING) return 0;
+        if (GetTickCount() - start >= timeout_ms) return 0;
+        if (g_remote_space) WaitForSingleObject(g_remote_space, 5); else Sleep(2);
+    }
+}
+
+/* EOS asks the Host to play out what it holds. That only makes sense for a
+   stream that was still playing; a stopped stream's tail belongs to a pause or
+   a skip and must not be played, nor waited for. */
+static int sink_teardown_waits_for_eos(int was_remote, int was_playing) {
+    return was_remote && was_playing;
+}
+
 /* Called only when a real source-end signal becomes available. Stop, Reset and
    a track rebuild are transport controls and must not be misreported as EOS. */
 static void remote_submit_eos(void) {
@@ -385,7 +496,10 @@ static void remote_submit_eos(void) {
 
 static int remote_wait_eos_complete(UINT64 generation) {
     if (!g_remote_ipc || !generation) return 0;
-    DWORD deadline = GetTickCount() + 5000u;
+    DWORD bound = nex_audio_policy_eos_wait_ms(
+        nex_audio_ring_available(g_remote_ipc) + g_remote_ipc->device_padding_frames,
+        (long)g_remote_ipc->output_rate);
+    DWORD deadline = GetTickCount() + bound;
     for (;;) {
         remote_sync_stats();
         if (nex_audio_read64(&g_remote_ipc->eos_complete_generation) == generation)
@@ -401,8 +515,9 @@ static int remote_wait_eos_complete(UINT64 generation) {
             g_remote_ipc->fallback_reason = g_remote_reason;
             InterlockedExchange((volatile LONG *)&g_remote_ipc->state, NEX_AUDIO_FAILED);
             if (g_remote_data) SetEvent(g_remote_data);
-            log_line("audiohost: EOS wait timed out generation=%llu state=%s",
-                     (unsigned long long)generation, nex_audio_state_name(state));
+            log_line("audiohost: EOS wait timed out after %lu ms generation=%llu state=%s",
+                     (unsigned long)bound, (unsigned long long)generation,
+                     nex_audio_state_name(state));
             return 0;
         }
         DWORD remaining = deadline - now;

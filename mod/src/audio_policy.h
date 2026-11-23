@@ -122,6 +122,94 @@ NEX_AUDIO_POLICY_FN int nex_audio_policy_dither_selected(int input_float, int in
     return mode == 2 && output_valid < (input_float ? 24 : input_valid) && fade_ms == 0;
 }
 
+/* ---- start-up silence (after Orion's primeWithSilence / resync_delay_ms) ---- */
+/* DACs run two crystals: one for 44.1 kHz multiples, one for 48 kHz multiples.
+   Changing family makes the DAC relock, which mutes or pops the first notes. */
+NEX_AUDIO_POLICY_FN long nex_audio_policy_rate_family(long rate) {
+    if (rate <= 0) return 0;
+    if (rate % 11025 == 0) return 44100;
+    if (rate % 8000 == 0) return 48000;
+    return rate;
+}
+
+/* Frames of silence to submit before the first client audio of a fresh device
+   stream: one device buffer (prime), plus resync_ms when the DAC changes clock
+   family. Silence is added, never mixed into the music. */
+NEX_AUDIO_POLICY_FN long nex_audio_policy_prime_frames(long previous_rate, long rate,
+                                                       long device_frames, int prime,
+                                                       int resync_ms) {
+    long frames = prime && device_frames > 0 ? device_frames : 0;
+    if (previous_rate > 0 && rate > 0 && resync_ms > 0 &&
+        nex_audio_policy_rate_family(previous_rate) != nex_audio_policy_rate_family(rate))
+        frames += (long)((long long)rate * resync_ms / 1000);
+    return frames;
+}
+
+/* How long a teardown may wait for the separate host to play out what it
+   holds: the audio still buffered (ring + device), plus a scheduling margin.
+   A fixed 5 s held the client's teardown for seconds whenever the Host stalled,
+   although nothing longer than the buffered audio can legitimately be pending. */
+#define NEX_AUDIO_EOS_MARGIN_MS 250
+#define NEX_AUDIO_EOS_MIN_MS    300
+#define NEX_AUDIO_EOS_MAX_MS    5000
+NEX_AUDIO_POLICY_FN unsigned long nex_audio_policy_eos_wait_ms(unsigned long long buffered_frames,
+                                                               long rate) {
+    if (rate <= 0) return NEX_AUDIO_EOS_MAX_MS;
+    unsigned long long ms = buffered_frames * 1000ull / (unsigned long long)rate
+                          + NEX_AUDIO_EOS_MARGIN_MS;
+    if (ms < NEX_AUDIO_EOS_MIN_MS) ms = NEX_AUDIO_EOS_MIN_MS;
+    if (ms > NEX_AUDIO_EOS_MAX_MS) ms = NEX_AUDIO_EOS_MAX_MS;
+    return (unsigned long)ms;
+}
+
+/* Event-driven exclusive mode hands the device one complete period per event.
+   With a resampler in front, one period must fit in the resampler's input
+   history (period * in/out + both kernel halves + slack), or the period can
+   never be completed. Otherwise the timer-driven contract is used. */
+NEX_AUDIO_POLICY_FN int nex_audio_policy_event_fits(long in_rate, long out_rate,
+                                                    long period_frames, long src_cap,
+                                                    long src_half) {
+    if (in_rate <= 0 || out_rate <= 0 || period_frames <= 0) return 0;
+    if (in_rate == out_rate) return 1;
+    long long need = ((long long)period_frames * in_rate + out_rate - 1) / out_rate
+                   + 2LL * src_half + 64;
+    return need <= src_cap;
+}
+
+/* Optional dedicated core for the drain thread (hook.cfg dedicated_core=1).
+   One entry per physical core: its efficiency class (higher = faster core on
+   hybrid CPUs, all 0 elsewhere) and its logical-processor mask in group 0.
+   Picks the last core of the fastest class that does not hold logical CPU 0,
+   where most device interrupts and DPCs land. -1: nothing worth pinning to. */
+typedef struct NexAudioCoreInfo {
+    unsigned char efficiency;
+    unsigned long long mask;
+} NexAudioCoreInfo;
+
+NEX_AUDIO_POLICY_FN int nex_audio_policy_pick_core(const NexAudioCoreInfo *cores, int count) {
+    if (!cores || count < 2) return -1;
+    int best = -1;
+    for (int i = 0; i < count; i++) {
+        if (!cores[i].mask || (cores[i].mask & 1ull)) continue;
+        if (best < 0 || cores[i].efficiency >= cores[best].efficiency) best = i;
+    }
+    return best;
+}
+
+/* Depth of the separate host's shared ring (hook.cfg host_ring_ms). A deeper
+   ring rides out longer stalls of the client process; the client's own volume
+   and effects reach the device that much later, since they are applied before
+   the ring. Seek and pause are not delayed: both act on the Host directly. */
+#define NEX_AUDIO_HOST_RING_DEFAULT_MS 500
+#define NEX_AUDIO_HOST_RING_MIN_MS     200
+#define NEX_AUDIO_HOST_RING_MAX_MS     4000
+NEX_AUDIO_POLICY_FN int nex_audio_policy_host_ring_ms(int ms) {
+    if (ms <= 0) return NEX_AUDIO_HOST_RING_DEFAULT_MS;
+    if (ms < NEX_AUDIO_HOST_RING_MIN_MS) return NEX_AUDIO_HOST_RING_MIN_MS;
+    if (ms > NEX_AUDIO_HOST_RING_MAX_MS) return NEX_AUDIO_HOST_RING_MAX_MS;
+    return ms;
+}
+
 /* ---- what the negotiated path does to the samples ------------------------- */
 enum {
     NEX_AUDIO_PATH_NATIVE = 0,    /* identical bytes                             */

@@ -45,6 +45,7 @@ static void gen_release(SinkGen *g) {
         away; it releases the device objects if it ever comes back. */
 static HRESULT sink_stop(void) {
     SinkGen *g = g_sink.gen;
+    int was_remote = g && g->remote;
     HRESULT hr = S_OK;
     if (g) {
         InterlockedExchange(&g->running, 0);
@@ -98,6 +99,9 @@ static HRESULT sink_stop(void) {
         }
     }
     g_sink.started = 0;
+    /* The Host owns the device: a pause has to stop it there too, or it plays
+       out its ring and then runs empty. */
+    if (was_remote) remote_set_transport(NEX_AUDIO_TRANSPORT_PAUSE);
     /* A seek interrupts the client mid-buffer: it stops without ever releasing
        the frames it reserved. Keeping that reservation makes every later
        GetBuffer return AUDCLNT_E_OUT_OF_ORDER, and the client gives up instead
@@ -178,13 +182,17 @@ static HRESULT sink_handoff_same_format(IAudioClient *self) {
 
 static HRESULT sink_teardown(void) {
     int was_remote = g_sink.gen && g_sink.gen->remote;
+    int was_playing = g_sink.started;
     UINT64 remote_generation = was_remote && g_remote_ipc
         ? g_remote_ipc->stream_generation : 0;
     HRESULT stop=sink_stop();
     /* Final destruction is the only client-side lifecycle point that means
        the source will not publish another packet.  Pause and Reset retain the
        generation and therefore do not submit EOS. */
-    if (was_remote) {
+    if (sink_teardown_waits_for_eos(was_remote, was_playing)) {
+        /* sink_stop just asked the Host to pause; playing out the tail needs
+           the device running again. */
+        remote_set_transport(NEX_AUDIO_TRANSPORT_PLAY);
         remote_submit_eos();
         /* Keep the Host alive until it has observed the ring empty and the
            device clock has passed the remaining padding. Closing the mapping
@@ -198,7 +206,8 @@ static HRESULT sink_teardown(void) {
     proxy_release_owned();
     if(g_sink.h_space)CloseHandle(g_sink.h_space);
     if(g_sink.h_data)CloseHandle(g_sink.h_data);
-    free(g_sink.ring);free(g_sink.conv);
+    audio_free(g_sink.ring);audio_free(g_sink.conv);
+    sink_restore_priority();
     if(g_sink.owner) {
         EnterCriticalSection(&g_patch_lock);
         for(int i=0;i<128;i++)if(g_bindings[i].client==g_sink.owner) {

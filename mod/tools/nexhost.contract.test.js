@@ -48,7 +48,12 @@ check(audioHost.includes('period_for_frames'), 'audio host must derive the retry
 check(audioHost.includes('hash_bytes(destination'), 'audio host must verify device bytes before releasing the render buffer');
 check(audioHost.includes('nex_audio_ring_peek') && audioHost.includes('nex_audio_ring_commit_read'), 'audio host must consume only after device release succeeds');
 check(audioHost.includes('AvSetMmThreadCharacteristicsW') && audioHost.includes('AVRT_PRIORITY_CRITICAL'), 'audio host must elevate the render thread');
-check(audioHost.indexOf('first_buffer_submitted = 1') >= 0 && audioHost.indexOf('first_buffer_submitted = 1') < audioHost.indexOf('api->start(rt)'), 'audio host must submit and mark the first packet before Start');
+{
+  /* inside host_pump: the prefill path marks the first packet before Start
+     (host_apply_transport's resume Start comes earlier in the file) */
+  const pump = audioHost.slice(audioHost.indexOf('static HRESULT host_pump('));
+  check(pump.indexOf('first_buffer_submitted = 1') >= 0 && pump.indexOf('first_buffer_submitted = 1') < pump.indexOf('api->start(rt)'), 'audio host must submit and mark the first packet before Start');
+}
 check(audioHost.includes('host_startup_reason(hr)'), 'host startup taxonomy must be centralized and testable');
 check(audioHost.includes('hr == AUDCLNT_E_UNSUPPORTED_FORMAT'), 'only an actual format rejection may select unsupported_format');
 check(audioHost.includes('padding_ticks') && audioHost.includes('eos_target = position + padding_ticks'), 'audio host EOS must convert device padding into clock ticks');

@@ -41,13 +41,16 @@ fi
 
 FLAGS=(-target x86_64-windows-gnu -O2 -Wall)
 LIBS=(-lole32 -loleaut32 -luuid -lavrt)
-# The control-page identity is generated from the checked-out wire sources and
-# the current working diff.  Both client and Host receive the same wire id,
-# while the Host compares against its own compiled-in expected value.
-WIRE_HASH=$( {
-    git -C "$MOD_DIR/.." rev-parse HEAD 2>/dev/null || true
-    git -C "$MOD_DIR/.." diff -- mod/tools/nexaudiolink.h mod/tools/nexaudiohost.c mod/src 2>/dev/null || true
-} | sha256sum | cut -c1-16 )
+# The control-page identity is the content of the three files that define the
+# wire contract: the layout (nexaudiolink.h) and both ends that speak it
+# (nexaudiohost.c, sink_audiohost.inc). Both client and Host receive the same
+# id and the Host compares it against its own compiled-in value. It used to
+# include git HEAD and the whole mod/src diff, so any commit - even a panel
+# text change - made a freshly built DLL refuse the deployed Host. Line endings
+# are normalised so a CRLF checkout gets the same id.
+WIRE_HASH=$( cat -- "$MOD_DIR/tools/nexaudiolink.h" "$MOD_DIR/tools/nexaudiohost.c" \
+                    "$MOD_DIR/src/sink_audiohost.inc" 2>/dev/null | tr -d '\r' \
+             | sha256sum | cut -c1-16 )
 if [[ ! "$WIRE_HASH" =~ ^[0-9a-fA-F]{16}$ ]]; then
     WIRE_HASH=4e45584156333031
 fi
@@ -58,8 +61,8 @@ if (( $# > 1 )); then
     exit 2
 fi
 case "$TARGET" in
-    sink|ui|host|audiohost|all|test) ;;
-    *) printf '用法：%s [sink|ui|host|audiohost|all|test]\n' "$0" >&2; exit 2 ;;
+    sink|ui|host|audiohost|sim|all|test) ;;
+    *) printf '用法：%s [sink|ui|host|audiohost|sim|all|test]\n' "$0" >&2; exit 2 ;;
 esac
 
 OUT_DIR=${OUT_DIR-$MOD_DIR}
@@ -151,6 +154,15 @@ build_audiohost() {
     printf '已构建到 %s：NexAudioHost.exe\n' "$OUT_DIR"
 }
 
+build_sim() {
+    # 回放模拟工具：在自己的进程里加载 nexsink.dll，按网易云的调用方式驱动真实
+    # 默认设备，跑同格式交接、跨采样率、暂停、跳转等脚本并检查时钟与日志。
+    # 需要真实设备，所以不在 test 里跑。
+    "$CC" cc "${FLAGS[@]}" -Wl,--subsystem,console \
+        -o "$OUT_DIR/nexsim.exe" "$MOD_DIR/tools/nexsim.c" "${LIBS[@]}"
+    printf '已构建到 %s：nexsim.exe\n' "$OUT_DIR"
+}
+
 build_test() {
     "$CC" c++ "${FLAGS[@]}" -o "$OUT_DIR/audio_policy_test.exe" "$MOD_DIR/test/audio_policy_test.cpp"
     "$OUT_DIR/audio_policy_test.exe"
@@ -176,6 +188,7 @@ case "$TARGET" in
     ui)   build_ui ;;
     host) build_host ;;
     audiohost) build_audiohost ;;
+    sim)  build_sim ;;
     all)  build_sink; build_ui; build_host; build_audiohost ;;
     test) build_test ;;
 esac

@@ -54,11 +54,61 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
         return FAILED(hr) ? hr : E_FAIL;
     }
 
-    /* Keep the original 100 ms client-visible buffer and poll the real
-       endpoint. This device accepts the timer-driven exclusive contract while
-       rejecting the event callback initialization after alignment negotiation. */
+    /* 100 ms device buffer. Event-driven first (Orion's EVENTCALLBACK path):
+       the device wakes the drain thread when it wants the next period, instead
+       of being polled every 3 ms. Some drivers accept the format but refuse the
+       event contract (seen: refused again after alignment negotiation); they
+       fall back to the timer-driven contract on a fresh IAudioClient. A busy
+       device stays busy either way and is not retried in timer mode. */
     REFERENCE_TIME buffer_duration = 1000000;
-    for (int attempt = 0; attempt < 8; attempt++) {
+    int use_event = g_event &&
+        nex_audio_policy_event_fits(g_sink.in_rate, rate,
+                                    (long)((UINT64)rate * (UINT64)buffer_duration / 10000000ull),
+                                    SRC_CAP, SRC_MAX_HALF);
+    HANDLE evt = NULL;
+    if (use_event) {
+        REFERENCE_TIME d = buffer_duration;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            hr = O_INITIALIZE(ac, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                              d, d, (WAVEFORMATEX *)&we, NULL);
+            if (SUCCEEDED(hr)) break;
+            if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+                UINT32 aligned = 0;
+                if (FAILED(O_GETBUFFERSIZE(ac, &aligned)) || !aligned) break;
+                d = (REFERENCE_TIME)(((UINT64)aligned * 10000000ull + (UINT32)rate / 2) / (UINT32)rate);
+                ac->lpVtbl->Release(ac);
+                ac = NULL;
+                hr = dev_activate(dev, &IID_IAudioClient, (void **)&ac);
+                if (FAILED(hr) || !ac) { if (SUCCEEDED(hr)) hr = E_FAIL; break; }
+                continue;
+            }
+            if ((unsigned long)hr != 0x8889000Aul) break;
+            Sleep(50);
+        }
+        if (SUCCEEDED(hr)) {
+            evt = CreateEventA(NULL, FALSE, FALSE, NULL);
+            hr = evt ? O_SETEVENT(ac, evt) : E_OUTOFMEMORY;
+            if (FAILED(hr)) { if (evt) CloseHandle(evt); evt = NULL; }
+        }
+        if (SUCCEEDED(hr)) {
+            log_line("probe %d/%d.%d%s: event-driven exclusive", rate, container, valid,
+                     is_float ? "f" : "");
+        } else if (!ac || (unsigned long)hr == 0x8889000Aul) {
+            log_line("probe %d/%d.%d%s: Initialize(event) 0x%08lX", rate, container, valid,
+                     is_float ? "f" : "", (unsigned long)hr);
+            if (ac) ac->lpVtbl->Release(ac);
+            return hr;
+        } else {
+            log_line("probe %d/%d.%d%s: event mode refused 0x%08lX, using timer polling",
+                     rate, container, valid, is_float ? "f" : "", (unsigned long)hr);
+            ac->lpVtbl->Release(ac);
+            ac = NULL;
+            hr = dev_activate(dev, &IID_IAudioClient, (void **)&ac);
+            if (FAILED(hr) || !ac) return FAILED(hr) ? hr : E_FAIL;
+            use_event = 0;
+        }
+    }
+    for (int attempt = 0; !use_event && attempt < 8; attempt++) {
         hr = O_INITIALIZE(ac, AUDCLNT_SHAREMODE_EXCLUSIVE, 0,
                           buffer_duration, 0, (WAVEFORMATEX *)&we, NULL);
         if (SUCCEEDED(hr)) break;
@@ -87,6 +137,7 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
     if (FAILED(O_GETBUFFERSIZE(ac, &frames)) || !frames) {
         log_line("sink: %d Hz/%d.%d bit%s passed the format check but has no buffer",
                  rate, container, valid, is_float ? " float" : "");
+        if (evt) CloseHandle(evt);
         ac->lpVtbl->Release(ac);
         return E_FAIL;
     }
@@ -97,6 +148,7 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
         log_line("probe %d/%d.%d%s: GetService(RenderClient) 0x%08lX rc=%p frames=%u",
                  rate, container, valid, is_float ? "f" : "", (unsigned long)hr,
                  (void *)rc, frames);
+        if (evt) CloseHandle(evt);
         ac->lpVtbl->Release(ac);
         return FAILED(hr) ? hr : E_POINTER;
     }
@@ -109,6 +161,7 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
                  rate, container, valid, is_float ? "f" : "", (unsigned long)hr,
                  (void *)clock, (unsigned long long)frequency);
         if(clock)clock->lpVtbl->Release(clock);
+        if(evt)CloseHandle(evt);
         rc->lpVtbl->Release(rc); ac->lpVtbl->Release(ac);
         return FAILED(hr)?hr:E_FAIL;
     }
@@ -116,7 +169,8 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
     O_GETLATENCY(ac, &lat);
     g->real_clock      = clock;
     g->clock_frequency = frequency;
-    g->real_evt        = NULL;
+    g->real_evt        = evt;
+    g->evt_fired       = 0;
     g->real            = ac;
     g->real_render     = rc;
     g->real_frames     = frames;
@@ -420,6 +474,33 @@ static HRESULT sink_retarget(const char *reason) {
     return sink_retarget_endpoint(reason, 0);
 }
 
+/* The output device chosen in the panel (hook.cfg endpoint=), AddRef'd, or
+   NULL when none is set or it is not currently active - then the caller uses
+   the client's own device, so an unplugged pick never silences playback. */
+static IMMDevice *sink_pinned_device(void) {
+    if (!g_endpoint_id[0]) return NULL;
+    WCHAR wid[200];
+    if (!MultiByteToWideChar(CP_UTF8, 0, g_endpoint_id, -1, wid, 200)) return NULL;
+    IMMDevice *dev = NULL;
+    IMMDeviceEnumerator *e = NULL;
+    InterlockedIncrement(&g_internal);
+    if (SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                                   &IID_IMMDeviceEnumerator, (void **)&e)) && e) {
+        if (FAILED(e->lpVtbl->GetDevice(e, wid, &dev))) dev = NULL;
+        e->lpVtbl->Release(e);
+    }
+    InterlockedDecrement(&g_internal);
+    if (dev) {
+        DWORD state = 0;
+        if (FAILED(dev->lpVtbl->GetState(dev, &state)) || state != DEVICE_STATE_ACTIVE) {
+            dev->lpVtbl->Release(dev);
+            dev = NULL;
+        }
+    }
+    if (!dev) log_line("sink: chosen endpoint %s unavailable, using the client's device", g_endpoint_id);
+    return dev;
+}
+
 /* keep_bound: rebuild on the endpoint the client bound through
    IMMDevice::Activate, falling back to the default when there is none. */
 static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
@@ -434,8 +515,8 @@ static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
     if (g_sink.gen) { gen_release(g_sink.gen); g_sink.gen = NULL; }
     if (was_remote) remote_close();
 
-    IMMDevice *dev = NULL;
-    if (keep_bound) {
+    IMMDevice *dev = sink_pinned_device();
+    if (!dev && keep_bound) {
         EnterCriticalSection(&g_patch_lock);
         for (int i = 0; i < 128; i++) if (g_bindings[i].client == g_sink.owner && g_bindings[i].dev) {
             dev = g_bindings[i].dev; dev->lpVtbl->AddRef(dev); break;
@@ -510,18 +591,22 @@ static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
        device's clock. g_fout is sized from the new device's buffer. */
     if (g_sink.resample) {
         if (!src_init(g_sink.in_rate, rate, g_sink.in_channels)) { sink_teardown(); return E_OUTOFMEMORY; }
-        free(g_fout);
+        audio_free(g_fout);
         g_fout = (double *)malloc((size_t)gen->real_frames * g_sink.in_channels * sizeof(double));
-        if (!g_fin)
+        audio_mem_lock(g_fout, (SIZE_T)gen->real_frames * g_sink.in_channels * sizeof(double));
+        if (!g_fin) {
             g_fin = (double *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_channels * sizeof(double));
+            audio_mem_lock(g_fin, (SIZE_T)SCRATCH_FRAMES * g_sink.in_channels * sizeof(double));
+        }
         if (!g_fout || !g_fin) { sink_teardown(); return E_OUTOFMEMORY; }
     } else {
         src_free();
-        free(g_fout); g_fout = NULL;
-        free(g_fin);  g_fin  = NULL;
+        audio_free(g_fout); g_fout = NULL;
+        audio_free(g_fin);  g_fin  = NULL;
     }
 
     g_sink.clock_base   = keep_clock;
+    sink_arm_prime(gen, rate);
     g_sink.endpoint_key = key;
     g_sink.device_lost  = 0;
     g_sink.fault        = S_OK;
@@ -621,9 +706,9 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     if(g_sink.gen) {
         HRESULT clear=sink_teardown_controlled();if(FAILED(clear))return clear;
     }
-    IMMDevice *dev = NULL;
+    IMMDevice *dev = sink_pinned_device();
     EnterCriticalSection(&g_patch_lock);
-    for(int i=0;i<128;i++)if(g_bindings[i].client==self && g_bindings[i].dev) {
+    for(int i=0;!dev && i<128;i++)if(g_bindings[i].client==self && g_bindings[i].dev) {
         dev=g_bindings[i].dev;dev->lpVtbl->AddRef(dev);break;
     }
     LeaveCriticalSection(&g_patch_lock);
@@ -728,6 +813,11 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     if(!g_inb || (g_sink.resample && (!g_fin || !g_fout))) {
         sink_teardown_controlled();return E_OUTOFMEMORY;
     }
+    audio_mem_lock(g_inb, (SIZE_T)SCRATCH_FRAMES*g_sink.in_block);
+    if (g_sink.resample) {
+        audio_mem_lock(g_fin, (SIZE_T)SCRATCH_FRAMES*g_sink.in_channels*sizeof(double));
+        audio_mem_lock(g_fout, (SIZE_T)gen->real_frames*g_sink.in_channels*sizeof(double));
+    }
 
     /* buffer the client is told about */
     UINT32 want = (UINT32)g_out_frames;
@@ -745,6 +835,8 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     g_sink.ring = (BYTE *)calloc((size_t)g_sink.cap, (size_t)g_sink.in_block);
     g_sink.conv = (BYTE *)malloc((size_t)g_sink.cap*g_sink.in_block);
     if (!g_sink.ring || !g_sink.conv) { sink_teardown_controlled(); return E_OUTOFMEMORY; }
+    audio_mem_lock(g_sink.ring, (SIZE_T)g_sink.cap * g_sink.in_block);
+    audio_mem_lock(g_sink.conv, (SIZE_T)g_sink.cap * g_sink.in_block);
     g_sink.w = g_sink.r = 0;
 
     g_sink.h_space = CreateEventA(NULL, FALSE, FALSE, NULL);
@@ -781,6 +873,7 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     g_sink.endpoint_key = key;
     g_sink.clock_base   = 0;
     g_sink.device_lost  = 0;
+    sink_arm_prime(gen, used_rate);
 
     char a[160], b[240];
     describe("in", fmt, a, sizeof(a));

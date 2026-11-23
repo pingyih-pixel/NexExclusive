@@ -1018,6 +1018,59 @@ static void remote_fixture_end(void) {
     g_remote_reason = NEX_AUDIO_FALLBACK_NONE;
 }
 
+/* ---- v3.1 transport from the client side ----------------------------------- */
+static volatile LONG flush_acker_stop;
+static DWORD WINAPI flush_acker(LPVOID arg) {
+    NexAudioControl *c = (NexAudioControl *)arg;
+    while (!flush_acker_stop) {
+        UINT64 req = nex_audio_read64(&c->flush_request_generation);
+        if (req != nex_audio_read64(&c->flush_ack_generation))
+            InterlockedExchange64((volatile LONG64 *)&c->flush_ack_generation, (LONG64)req);
+        Sleep(1);
+    }
+    return 0;
+}
+
+static void test_remote_transport_signals(void) {
+    NexAudioControl control;
+    BYTE pcm[64 * 6];
+    SinkGen gen;
+    prepare_ring();
+    remote_fixture_begin(&control, pcm, 64, 6);
+    memset(&gen, 0, sizeof(gen));
+    gen.remote = 1;
+    gen.ref = 2;
+    g_sink.gen = &gen;
+    g_sink.started = 1;
+    CHECK(control.transport == NEX_AUDIO_TRANSPORT_PLAY);
+    CHECK(sink_stop() == S_OK);
+    CHECK(control.transport == NEX_AUDIO_TRANSPORT_PAUSE);
+    remote_set_transport(NEX_AUDIO_TRANSPORT_PLAY);
+    CHECK(control.transport == NEX_AUDIO_TRANSPORT_PLAY);
+
+    /* without a Host the flush request is still published, and times out */
+    CHECK(!remote_request_flush(30));
+    CHECK(control.flush_request_generation == 1);
+    /* with a Host acknowledging, the request completes */
+    flush_acker_stop = 0;
+    HANDLE t = CreateThread(NULL, 0, flush_acker, &control, 0, NULL);
+    CHECK(remote_request_flush(500));
+    CHECK(control.flush_request_generation == 2 && control.flush_ack_generation == 2);
+    flush_acker_stop = 1;
+    WaitForSingleObject(t, 1000);
+    CloseHandle(t);
+
+    /* teardown drains the Host only when the stream was still playing */
+    CHECK(sink_teardown_waits_for_eos(1, 1));
+    CHECK(!sink_teardown_waits_for_eos(1, 0));
+    CHECK(!sink_teardown_waits_for_eos(0, 1));
+
+    g_sink.gen = NULL;
+    remote_fixture_end();
+    free_ring();
+    printf("PASS remote transport: Stop pauses, Start plays, Reset flushes the Host, stopped teardown skips EOS\n");
+}
+
 static void test_remote_converted_drain(void) {
     prepare_ring();
     g_sink.in_rate = 44100;
@@ -2261,6 +2314,227 @@ static void test_multichannel_resample_keeps_channels(void) {
     printf("PASS multichannel resample: 8 channels at different levels stay separate (96k->48k)\n");
 }
 
+/* ---- Orion 3: the log is written off the audio path ------------------------ */
+static void test_log_queue_order_and_overflow(void) {
+    static LogQueue q;
+    char out[LOG_LINE_BYTES];
+    memset(&q, 0, sizeof(q));
+    CHECK(log_queue_push(&q, "first"));
+    CHECK(log_queue_push(&q, "second"));
+    CHECK(log_queue_take(&q, out, sizeof(out)) && strcmp(out, "first") == 0);
+    CHECK(log_queue_take(&q, out, sizeof(out)) && strcmp(out, "second") == 0);
+    CHECK(!log_queue_take(&q, out, sizeof(out)));
+    for (int i = 0; i < LOG_QUEUE_LINES + 5; i++) log_queue_push(&q, "x");
+    CHECK(q.dropped == 5);                       /* a full queue drops, never blocks */
+    int taken = 0;
+    while (log_queue_take(&q, out, sizeof(out))) taken++;
+    CHECK(taken == LOG_QUEUE_LINES);
+    /* a long line is truncated, not overrun */
+    {
+        char longline[LOG_LINE_BYTES * 2];
+        memset(longline, 'a', sizeof(longline) - 1);
+        longline[sizeof(longline) - 1] = 0;
+        CHECK(log_queue_push(&q, longline));
+        CHECK(log_queue_take(&q, out, sizeof(out)) && strlen(out) == LOG_LINE_BYTES - 1);
+    }
+    printf("PASS log queue: FIFO order, bounded, overflow counted instead of blocking\n");
+}
+
+/* ---- Orion 1+2: the device starts on silence, the clock does not count it -- */
+static void test_drain_primes_silence(void) {
+    prepare_ring();
+    reset_patches();
+    SinkGen *gen = mock_gen();
+    gen->real_frames = 64;
+    g_sink.cap = 64;
+    free(g_sink.ring);
+    g_sink.ring = (BYTE *)calloc(64, 8);
+    g_sink.reported_frames = 32;
+    g_sink.in_rate = 48000;
+    g_sink.out_rate = 48000;
+    void *ac_vt[15] = {0}, *ac_orig[24] = {0};
+    ac_vt[AC_GETCURRENTPADDING] = (void *)mock_get_padding;
+    ac_vt[AC_START] = (void *)mock_start_counted;
+    ac_vt[AC_STOP] = (void *)mock_stop;
+    ac_vt[AC_RESET] = (void *)mock_reset;
+    for (int i = 0; i < 15; i++) ac_orig[i] = ac_vt[i];
+    register_originals(ac_vt, ac_orig);
+    void *rc_vt[5] = {0}, *rc_orig[24] = {0};
+    rc_vt[RC_GETBUFFER] = (void *)mock_render_get;
+    rc_vt[RC_RELEASEBUFFER] = (void *)mock_render_release;
+    for (int i = 0; i < 5; i++) rc_orig[i] = rc_vt[i];
+    register_originals(rc_vt, rc_orig);
+    void *ac_obj[1] = {ac_vt}, *rc_obj[1] = {rc_vt};
+    gen->real = (IAudioClient *)ac_obj;
+    gen->real_render = (IAudioRenderClient *)rc_obj;
+    free(g_inb);
+    g_inb = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_block);
+    mock_padding = 0; mock_gb_calls = 0; mock_start_calls = 0;
+    mock_rb_frames = 0xFFFFFFFF; mock_rb_flags = 0xFF;
+
+    g_sink.prime_left = 64;
+    g_sink.w = 8; g_sink.r = 0;
+    /* not enough client audio yet: do not start the device on silence alone */
+    CHECK(drain_once(gen) == S_FALSE);
+    CHECK(mock_gb_calls == 0 && mock_start_calls == 0);
+    g_sink.w = 64;
+    CHECK(drain_once(gen) == S_OK);
+    CHECK(mock_gb_calls == 1 && mock_gb_frames == 64);
+    CHECK(mock_rb_frames == 64 && mock_rb_flags == AUDCLNT_BUFFERFLAGS_SILENT);
+    CHECK(mock_start_calls == 1 && gen->device_started);
+    CHECK(g_sink.prime_left == 0 && g_sink.skip_frames == 64);
+    CHECK(g_sink.r == 0);                          /* no client audio was used */
+    CHECK(drain_once(gen) == S_OK);                /* then the real audio */
+    CHECK(mock_rb_flags == 0 && g_sink.r == 64);
+
+    gen->real = NULL;                 /* stack mocks: nothing to Release */
+    gen->real_render = NULL;
+    g_sink.gen = NULL;
+    gen_release(gen);
+    free_ring();
+    printf("PASS prime: silence fills the first device buffer, client audio follows unchanged\n");
+}
+
+static void test_clock_excludes_primed_silence(void) {
+    UINT64 pos = 0, qpc = 0;
+    prepare_ring();
+    SinkGen *gen = mock_gen();
+    void *clock_obj[1] = {mock_clock_vtbl};
+    gen->real_clock = (IAudioClock *)clock_obj;
+    gen->clock_frequency = 48000;
+    memset(&g_fake_clock, 0, sizeof(g_fake_clock));
+    g_fake_clock.vtbl = g_fake_clock_vtbl;
+    g_fake_clock.ref = 1;
+    g_fake_clock.generation = g_sink.generation;
+    g_sink.proxy_clock = &g_fake_clock;
+    g_sink.out_rate = 48000;
+    g_sink.skip_frames = 4800;                     /* 100 ms of primed silence */
+    mock_clock_pos = 2400;
+    CHECK(fc_GetPosition(&g_fake_clock, &pos, &qpc) == S_OK && pos == 0);
+    mock_clock_pos = 4800 + 48000;
+    CHECK(fc_GetPosition(&g_fake_clock, &pos, &qpc) == S_OK && pos == 10000000ull);
+    gen->real_clock = NULL;
+    g_sink.gen = NULL;
+    gen_release(gen);
+    free_ring();
+    printf("PASS clock: primed silence is not reported as played client audio\n");
+}
+
+/* The Host publishes IAudioClock ticks at the device's own frequency. */
+static void test_remote_clock_converts_device_ticks(void) {
+    NexAudioControl control;
+    BYTE pcm[64 * 6];
+    SinkGen gen;
+    UINT64 pos = 0, qpc = 0;
+    prepare_ring();
+    remote_fixture_begin(&control, pcm, 64, 6);
+    memset(&gen, 0, sizeof(gen));
+    gen.remote = 1;
+    gen.ref = 2;
+    g_sink.gen = &gen;
+    memset(&g_fake_clock, 0, sizeof(g_fake_clock));
+    g_fake_clock.vtbl = g_fake_clock_vtbl;
+    g_fake_clock.ref = 1;
+    g_fake_clock.generation = g_sink.generation;
+    g_sink.proxy_clock = &g_fake_clock;
+    g_sink.out_rate = 48000;
+    control.device_clock_frequency = 48000;
+    control.device_clock_position = 48000;        /* one second at 48 kHz ticks */
+    CHECK(fc_GetPosition(&g_fake_clock, &pos, &qpc) == S_OK);
+    CHECK(pos == 10000000ull);
+    control.primed_frames_total = 4800;           /* Host primed 100 ms */
+    g_sink.clock_last = 0;
+    CHECK(fc_GetPosition(&g_fake_clock, &pos, &qpc) == S_OK);
+    CHECK(pos == 9000000ull);
+    g_sink.gen = NULL;
+    remote_fixture_end();
+    free_ring();
+    printf("PASS remote clock: device ticks are converted to 100 ns, primed silence excluded\n");
+}
+
+/* ---- Orion 5: the drain path's buffers are locked in memory --------------- */
+static void test_audio_buffers_locked(void) {
+    LONG64 before = g_audio_locked_bytes;
+    SIZE_T n = 4u << 20;                          /* larger than the default WS minimum */
+    void *p = malloc(n);
+    CHECK(p != NULL);
+    audio_mem_lock(p, n);
+    CHECK(g_audio_locked_bytes == before + (LONG64)n);
+    audio_free(p);
+    CHECK(g_audio_locked_bytes == before);
+    g_memlock = 0;                                /* memlock=0 leaves buffers pageable */
+    p = malloc(4096);
+    audio_mem_lock(p, 4096);
+    CHECK(g_audio_locked_bytes == before);
+    audio_free(p);
+    g_memlock = 1;
+    printf("PASS memlock: buffers locked after allocation, unlocked before free, off switch honoured\n");
+}
+
+/* ---- Orion 6: event-driven submissions --------------------------------------- */
+static void test_ring_peek_crosses_wrap(void) {
+    BYTE out[16 * 8];
+    prepare_ring();                                /* cap 32, block 8 */
+    for (int f = 0; f < 32; f++) memset(g_sink.ring + f * 8, f, 8);
+    g_sink.r = 28; g_sink.w = 36;                  /* 4 frames at the end, 4 at the start */
+    CHECK(ring_peek(out, 16) == 8);
+    CHECK(out[0] == 28 && out[3 * 8] == 31 && out[4 * 8] == 0 && out[7 * 8] == 3);
+    free_ring();
+    printf("PASS ring peek: one call returns the frames on both sides of the wrap\n");
+}
+
+static void test_event_mode_waits_for_device_request(void) {
+    prepare_ring();
+    reset_patches();
+    SinkGen *gen = mock_gen();
+    gen->real_frames = 16;
+    g_sink.cap = 32;
+    void *ac_vt[15] = {0}, *ac_orig[24] = {0};
+    ac_vt[AC_GETCURRENTPADDING] = (void *)mock_get_padding;
+    ac_vt[AC_START] = (void *)mock_start_counted;
+    ac_vt[AC_STOP] = (void *)mock_stop;
+    for (int i = 0; i < 15; i++) ac_orig[i] = ac_vt[i];
+    register_originals(ac_vt, ac_orig);
+    void *rc_vt[5] = {0}, *rc_orig[24] = {0};
+    rc_vt[RC_GETBUFFER] = (void *)mock_render_get;
+    rc_vt[RC_RELEASEBUFFER] = (void *)mock_render_release;
+    for (int i = 0; i < 5; i++) rc_orig[i] = rc_vt[i];
+    register_originals(rc_vt, rc_orig);
+    void *ac_obj[1] = {ac_vt}, *rc_obj[1] = {rc_vt};
+    gen->real = (IAudioClient *)ac_obj;
+    gen->real_render = (IAudioRenderClient *)rc_obj;
+    gen->real_evt = CreateEventA(NULL, FALSE, FALSE, NULL);
+    free(g_inb);
+    g_inb = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_block);
+    mock_padding = 0; mock_gb_calls = 0; mock_start_calls = 0;
+
+    g_sink.r = 24; g_sink.w = 56;                  /* 32 frames, wrapping */
+    CHECK(drain_once(gen) == S_OK);                /* first period before Start */
+    CHECK(mock_gb_frames == 16 && mock_start_calls == 1 && g_sink.r == 40);
+    mock_gb_calls = 0;
+    CHECK(drain_once(gen) == S_FALSE);             /* padding 0, but no event yet */
+    CHECK(mock_gb_calls == 0);
+    gen->evt_fired = 1;                            /* the device asked */
+    CHECK(drain_once(gen) == S_OK);
+    CHECK(mock_gb_calls == 1 && mock_gb_frames == 16 && g_sink.r == 56);
+    CHECK(gen->evt_fired == 0);
+
+    /* Pause and resume without Reset: the device still holds a period, so the
+       drain starts it on what is queued instead of waiting for room. */
+    gen->device_started = 0;
+    mock_padding = 16; mock_gb_calls = 0; mock_start_calls = 0;
+    CHECK(drain_once(gen) == S_OK);
+    CHECK(mock_start_calls == 1 && gen->device_started && mock_gb_calls == 0);
+    mock_padding = 0;
+
+    gen->real = NULL;
+    gen->real_render = NULL;
+    g_sink.gen = NULL;
+    gen_release(gen);                              /* closes real_evt */
+    free_ring();
+    printf("PASS event mode: one full period per device request, padding alone does not submit\n");
+}
+
 static void test_src_response(void) {
     static const struct { int in, out; const char *name; } ratios[] = {
         {44100, 48000, "44.1k->48k"},
@@ -2457,6 +2731,7 @@ int main(void) {
     InitializeCriticalSection(&g_lock);
     InitializeCriticalSection(&g_control);
     InitializeCriticalSection(&g_patch_lock);
+    InitializeCriticalSection(&g_log_qlock);
     g_log[0] = 0; /* No on-disk playback log is modified by this test. */
     /* No test may rebuild a generation on a real endpoint (ROADMAP 6c path). */
     mock_rebuild_setup();
@@ -2478,6 +2753,14 @@ int main(void) {
     test_float_pipeline_keeps_32_bit_precision();
     test_auto_dither_keeps_exact_samples();
     test_drain_window_count();
+    test_remote_transport_signals();
+    test_log_queue_order_and_overflow();
+    test_drain_primes_silence();
+    test_clock_excludes_primed_silence();
+    test_remote_clock_converts_device_ticks();
+    test_audio_buffers_locked();
+    test_ring_peek_crosses_wrap();
+    test_event_mode_waits_for_device_request();
     test_multichannel_conversion_keeps_channels();
     test_multichannel_resample_keeps_channels();
     test_drain_thread_registers_mmcss();

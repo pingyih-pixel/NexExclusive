@@ -11,8 +11,8 @@
    must come from the same wire build; a version-only match is not enough. */
 #define NEX_AUDIO_MAGIC                 0x4E455841u /* NEXA */
 #define NEX_AUDIO_PROTOCOL_MAJOR        3u
-#define NEX_AUDIO_PROTOCOL_MINOR        0u
-#define NEX_AUDIO_LAYOUT_VERSION        2u
+#define NEX_AUDIO_PROTOCOL_MINOR        1u /* 3.1: transport */
+#define NEX_AUDIO_LAYOUT_VERSION        3u
 /* The build system supplies this from the wire sources.  A Host binary carries
    its own expected value through NEX_AUDIO_EXPECTED_BUILD_ID instead of
    borrowing a header literal at runtime. */
@@ -36,6 +36,11 @@
 
 #define NEX_AUDIO_DEPLOYMENT_IN_PROCESS 0u
 #define NEX_AUDIO_DEPLOYMENT_AUDIOHOST  1u
+
+/* v3.1 transport, written by the client and applied by the Host, which is
+   the only side that owns the device. */
+#define NEX_AUDIO_TRANSPORT_PLAY        0u
+#define NEX_AUDIO_TRANSPORT_PAUSE       1u
 
 #define NEX_AUDIO_ENCODING_PCM          0u
 #define NEX_AUDIO_ENCODING_FLOAT        1u
@@ -133,7 +138,23 @@ typedef struct NexAudioControl {
 
     wchar_t target_id[NEX_AUDIO_ENDPOINT_CHARS];
     wchar_t network_location[NEX_AUDIO_NETWORK_CHARS];
-    unsigned char reserved[128];
+    /* v3.1 transport (carved from the reserved tail; the page size is unchanged).
+       transport: the client's Start/Stop. A pause stops the device and keeps
+       the buffered audio. flush_request_generation: the client's Reset (seek);
+       the Host stops and resets the device, discards the ring, prefills again
+       and copies the value into flush_ack_generation. */
+    volatile uint32_t transport;
+    volatile uint32_t device_paused;
+    volatile uint64_t flush_request_generation;
+    volatile uint64_t flush_ack_generation;
+    /* Start-up silence: the client asks for prime_request_frames of silence
+       before the next first buffer; the Host submits it, clears the request and
+       adds what it submitted to primed_frames_total (reset by a flush), which
+       the client subtracts from the device clock. */
+    volatile uint32_t prime_request_frames;
+    uint32_t reserved_prime;
+    volatile uint64_t primed_frames_total;
+    unsigned char reserved[88];
 } NexAudioControl;
 
 #define NEX_AUDIO_CONTROL_BYTES ((uint32_t)sizeof(NexAudioControl))

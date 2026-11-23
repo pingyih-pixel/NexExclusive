@@ -27,11 +27,11 @@
 
 当前工作树已经包含 v3 的固定宽度字段、build-id、输入/输出格式、format generation、首包状态、背压计数、Host 退出标记和状态接口字段。以下语义仍未完成真实播放验收：
 
-- `fc_GetPosition()` 读取 Host 回传的 `IAudioClock` 位置快照；`endpoint_frames` 只保留为提交统计；
-- `remote_submit_eos()` 位于最终销毁流程，写入后很快进入 `CLOSING`，没有保证 `DRAINING → COMPLETE` 的等待窗口；
-- Hook 生产端以设备周期作为完整批次，Host 端另行读取 padding，二者之间的共同时间轴尚未完成实机对照；
-- `underrun_events` 已避开尚有 padding 的空事件，但连续空事件的统计粒度仍待确定；
-- build-id 由一次构建生成并同时注入 DLL 与 Host，尚未形成独立发行身份。
+- `fc_GetPosition()` 读取 Host 回传的 `IAudioClock` 位置快照，按 `device_clock_frequency` 换算成 100 ns（2026-11-23 之前误把原始 tick 当作 100 ns 相加），并扣除 Host 垫入的启动静音；`endpoint_frames` 只保留为提交统计；
+- EOS 只在流仍在播放时提交并等待（暂停或切走后的拆除不再播放尾巴），等待上限按「共享环 + 设备缓冲时长 + 250 ms」计算，介于 300 ms 与 5 s 之间；
+- 共同水位已进入遥测：每秒一行 `audiohost telemetry`，含 `ring_used / ring_min / ring_max / ring_capacity / device_padding / latency_ms / write_waits / write_wait_max_ms / primed`，`/api/status` 与面板同步显示；实机对照仍待做；
+- `underrun_events` 已避开尚有 padding 的空事件；进程内路径的 `empty-buffer` 按 10 秒窗口报告；
+- build-id 改为只由三份协议文件的内容生成（`nexaudiolink.h`、`nexaudiohost.c`、`sink_audiohost.inc`，换行归一），与 git HEAD 和其他源码无关：改面板或策略不会再让新 DLL 拒绝已部署的 Host。
 
 已在代码中修正、仍需真机确认的项目：Host 进程退出检测、unsupported format 的进程内回退、`/api/status` 的 v3 字段和 format generation 递增原语。
 
@@ -114,7 +114,13 @@ NexAudioData     (capacity_frames * output_frame_bytes)
 | `releasebuffer_failures` | `uint64` | host → hook | required | 端点 `ReleaseBuffer` 失败次数 |
 | `active_engine` | `uint32` enum | host → hook | required | 实际使用的引擎；回退后不能仍显示请求值 |
 | `fallback_reason` | `uint32` enum | host → hook | required | 未回退时为 `none`，否则记录握手、格式、端点或运行时原因 |
-| `target_id` | 字符串 | hook → host | later | WASAPI 设备 ID；未来可承载 DLNA UDN 或 RAAT device ID |
+| `transport` | `uint32` enum | hook → host | 3.1 | `PLAY` / `PAUSE`：客户端的 Start/Stop。暂停时 Host 停设备、保留环内音频 |
+| `device_paused` | `uint32` | host → hook | 3.1 | Host 已因暂停停止设备 |
+| `flush_request_generation` | `uint64` | hook → host | 3.1 | 客户端 Reset（拖进度）：Host 停止并 Reset 设备、丢弃环、重新预填 |
+| `flush_ack_generation` | `uint64` | host → hook | 3.1 | Host 完成 flush 后写入请求值；hook 最多等 500 ms |
+| `prime_request_frames` | `uint32` | hook → host | 3.1 | 下一次首包前要垫的静音帧数（一个设备缓冲；跨 44.1k/48k 族再加 `resync_ms`） |
+| `primed_frames_total` | `uint64` | host → hook | 3.1 | Host 已提交的启动静音帧数，flush 时清零；hook 从设备时钟中扣除 |
+| `target_id` | 字符串 | hook → host | required | WASAPI 设备 ID（面板选定的设备或客户端自己的设备）；未来可承载 DLNA UDN 或 RAAT device ID |
 | `network_location` | 字符串 | hook → host | later | DLNA 描述地址或 RAAT 控制地址 |
 
 `client_frames`、`converted_frames`、`endpoint_frames` 和哈希可以继续保留作为验证遥测，但它们不能替代 `write_frame/read_frame`。前者描述样本证据，后者描述传输进度。公开播放位置只使用 `device_clock_position` 与 `device_clock_frequency`；`device_clock_qpc` 和 `device_padding_frames` 用于同刻诊断。
@@ -205,6 +211,18 @@ runtime_device_lost
 ```
 
 `build_id` 不匹配时，host 不得打开端点；hook 关闭共享对象后回到进程内引擎。状态接口同时报告 `requested_engine`、`active_engine` 和 `fallback_reason`，避免把“请求 audiohost”显示成“audiohost 正在输出”。
+
+## 3.1 传输控制与启动静音（2026-11-23）
+
+v3.0 只有数据通道：客户端暂停时 Host 继续把环放空再欠载，拖进度后先播约 0.5 s 拖动前的音频。3.1 从 `reserved` 尾部划出字段（控制页大小不变，`reserved` 由 128 字节减到 88 字节，`layout_version = 3`）：
+
+1. 客户端 Stop → `transport = PAUSE`，Host 停止设备、置 `device_paused`，环内音频保留；
+2. 客户端 Start → `transport = PLAY`，Host 重新 Start；
+3. 客户端 Reset → 先写 `prime_request_frames`，再递增 `flush_request_generation`；Host 停止并 Reset 设备、`read_frame = write_frame`、清 `primed_frames_total`、回到 READY 并写 `flush_ack_generation`；
+4. 首包前若 `prime_request_frames > 0` 且环里已有一个设备缓冲，Host 先提交一个 `AUDCLNT_BUFFERFLAGS_SILENT` 缓冲再 Start，剩余的跨族静音在后续周期提交，全部计入 `primed_frames_total`；
+5. 环的深度由 hook.cfg `host_ring_ms` 决定（默认 500 ms，200 ms～4 s）。
+
+诊断：NetEase 进程环境里设 `NEX_DUMP=<文件>`（DLL 交给 Host 的 PCM）与 `NEX_HOST_DUMP=<文件>`（Host 交给设备的 PCM，不含启动静音），用 `python mod/tools/compare_pcm.py a b --frame-bytes N` 逐字节对照；`audiohost=1` 时两者必须完全一致。
 
 ## EOS 与设备时钟
 

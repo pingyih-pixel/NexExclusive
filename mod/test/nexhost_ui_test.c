@@ -271,6 +271,45 @@ static void test_cfg_round_trip(void) {
     printf("PASS cfg round trip: hook.cfg written by the panel API reads back unchanged\n");
 }
 
+/* Keys the panel does not show (prime, event, memlock ...) and the chosen
+   output device survive a panel save. */
+static void test_cfg_keeps_advanced_keys(void) {
+    char temp[MAX_PATH], saved[MAX_PATH], ep[200];
+    int v[CFG_N];
+    FILE *f;
+    GetTempPathA(MAX_PATH, temp);
+    snprintf(saved, sizeof(saved), "%s", kHookCfg);
+    snprintf(kHookCfg, sizeof(kHookCfg), "%sNexExclusive-adv-%lu.cfg", temp,
+             (unsigned long)GetCurrentProcessId());
+    f = fopen(kHookCfg, "wb");
+    if (f) { fputs("bits=24\r\nprime=0\r\nevent=0\r\nendpoint={0.0.0.00000000}.{abc-1}\r\n", f); fclose(f); }
+    cfg_read(v);
+    v[5] = 0;
+    CHECK(cfg_write(v));
+    {
+        char *text = read_file(kHookCfg);
+        CHECK(text && strstr(text, "prime=0\n") && strstr(text, "event=0\n"));
+        CHECK(text && strstr(text, "bits=24\n") && strstr(text, "dither=0\n"));
+        CHECK(text && strstr(text, "bits=24") == strstr(text, "bits="));   /* written once */
+        free(text);
+    }
+    cfg_read_string("endpoint", ep, sizeof(ep));
+    CHECK(strcmp(ep, "{0.0.0.00000000}.{abc-1}") == 0);
+    CHECK(cfg_rewrite(v, "endpoint", "{0.0.0.00000000}.{def-2}"));
+    cfg_read_string("endpoint", ep, sizeof(ep));
+    CHECK(strcmp(ep, "{0.0.0.00000000}.{def-2}") == 0);
+    CHECK(cfg_rewrite(v, "endpoint", ""));                    /* follow the client again */
+    cfg_read_string("endpoint", ep, sizeof(ep));
+    CHECK(ep[0] == 0);
+    CHECK(endpoint_id_valid("{0.0.0.00000000}.{6a1b-22}"));
+    CHECK(endpoint_id_valid(""));
+    CHECK(!endpoint_id_valid("x\nbits=16"));                  /* no second line */
+    CHECK(!endpoint_id_valid("a=b"));
+    DeleteFileA(kHookCfg);
+    snprintf(kHookCfg, sizeof(kHookCfg), "%s", saved);
+    printf("PASS cfg advanced keys: hand-set keys and the output device survive a panel save\n");
+}
+
 /* Versions with end-to-end evidence (audio, panel, nexui) are not logged as
    "unverified, injection may fail". */
 static void test_verified_client_versions(void) {
@@ -297,6 +336,7 @@ int main(void) {
     test_cfg_defaults_match_policy();
     test_cfg_sanitize();
     test_cfg_round_trip();
+    test_cfg_keeps_advanced_keys();
     test_verified_client_versions();
     printf("%s: %d failure(s)\n", g_fail ? "FAILED" : "ALL TESTS PASSED", g_fail);
     return g_fail ? 1 : 0;

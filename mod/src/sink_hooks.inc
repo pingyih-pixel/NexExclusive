@@ -218,6 +218,7 @@ static HRESULT STDMETHODCALLTYPE H_Start(void *self) {
     if (!g) { LeaveCriticalSection(&g_control); log_line("Start -> no device generation"); return E_FAIL; }
     InterlockedExchange(&g->running, 1);
     g_sink.started = 1;
+    if (g->remote) remote_set_transport(NEX_AUDIO_TRANSPORT_PLAY);
     g_sink.fade_total = (UINT32)((UINT64)g_sink.out_rate * (UINT64)g_fade_ms / 1000u);
     if (g_fade_ms > 0 && g_sink.fade_total < 32) g_sink.fade_total = 32;
     g_sink.fade_left = g_sink.fade_total;
@@ -279,6 +280,12 @@ static HRESULT STDMETHODCALLTYPE H_Reset(void *self) {
         LeaveCriticalSection(&g_control);
         return hr;
     }
+    /* A seek also has to drop what the Host already holds, or the first
+       ~0.5 s after the seek is pre-seek audio. The prime request is armed
+       first so the Host's next prefill starts on silence. */
+    sink_arm_prime_after_reset(g_sink.gen);
+    if (g_sink.gen && g_sink.gen->remote && !remote_request_flush(500))
+        log_line("sink: audiohost did not acknowledge the flush within 500 ms");
     EnterCriticalSection(&g_lock);
     g_sink.w = g_sink.r = 0;
     if (g_sink.ring)
@@ -677,6 +684,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         InitializeCriticalSection(&g_lock);
         InitializeCriticalSection(&g_control);
         InitializeCriticalSection(&g_patch_lock);
+        InitializeCriticalSection(&g_log_qlock);
         DisableThreadLibraryCalls(inst);
 
         const char *env = getenv("NEX_LOG");
@@ -690,6 +698,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
                 else g_log[0] = 0;
             }
         }
+
+        if (g_log[0]) log_start_writer();
 
         g_fake_render.vtbl = g_fake_render_vtbl;
         g_fake_render.ref  = 1;

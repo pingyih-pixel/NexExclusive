@@ -86,7 +86,7 @@ The Settings page gets a separate "NexExclusive" entry with the exclusive status
 | Fade-in | Off by default, 3–20 ms optional | Turn it on if playback starts with a pop; the first milliseconds of each start are then no longer bit-perfect, and the panel says so |
 | Shared fallback | Opens a shared stream after exclusive output fails | Always off in the product path |
 
-The same settings live in `hook.cfg` as plain `key=value`; restart the client to apply. The panel is a front-end for that file. Strict native verification targets client PCM to exclusive endpoint PCM; when the endpoint accepts the source format, this can produce bit-perfect output. If it rejects the source format, the UI asks you to switch to source-rate first instead of opening shared output.
+The same settings live in `hook.cfg` as plain `key=value`; restart the client to apply. With `audiohost=1` the separate `NexAudioHost.exe` receives the final PCM the DLL produced (the client's own format in strict-native mode, possibly resampled or bit-reduced in source-rate mode) and does no sample processing itself. Advanced keys not shown in the panel - `prime`, `resync_ms`, `event`, `memlock`, `dedicated_core`, `process_priority`, `host_ring_ms`, `log`, and `endpoint` (the output device picked in the panel) - are kept as written when the panel saves. The panel is a front-end for that file. Strict native verification targets client PCM to exclusive endpoint PCM; when the endpoint accepts the source format, this can produce bit-perfect output. If it rejects the source format, the UI asks you to switch to source-rate first instead of opening shared output.
 
 ## How it works
 
