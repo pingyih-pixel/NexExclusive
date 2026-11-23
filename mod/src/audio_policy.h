@@ -162,6 +162,20 @@ NEX_AUDIO_POLICY_FN unsigned long nex_audio_policy_eos_wait_ms(unsigned long lon
     return (unsigned long)ms;
 }
 
+/* Event-driven exclusive mode hands the device one complete period per event.
+   With a resampler in front, one period must fit in the resampler's input
+   history (period * in/out + both kernel halves + slack), or the period can
+   never be completed. Otherwise the timer-driven contract is used. */
+NEX_AUDIO_POLICY_FN int nex_audio_policy_event_fits(long in_rate, long out_rate,
+                                                    long period_frames, long src_cap,
+                                                    long src_half) {
+    if (in_rate <= 0 || out_rate <= 0 || period_frames <= 0) return 0;
+    if (in_rate == out_rate) return 1;
+    long long need = ((long long)period_frames * in_rate + out_rate - 1) / out_rate
+                   + 2LL * src_half + 64;
+    return need <= src_cap;
+}
+
 /* ---- what the negotiated path does to the samples ------------------------- */
 enum {
     NEX_AUDIO_PATH_NATIVE = 0,    /* identical bytes                             */

@@ -521,6 +521,16 @@ static void test_eos_wait_bound() {
     std::printf("PASS eos wait: buffered audio + 250 ms, between 300 ms and 5 s\n");
 }
 
+/* ---- Orion 6: event mode only where one period can be completed ----------- */
+static void test_event_mode_fits() {
+    CHECK(nex_audio_policy_event_fits(44100, 44100, 4410, 32768, 544));    /* native */
+    CHECK(nex_audio_policy_event_fits(44100, 96000, 9600, 32768, 544));    /* upsampling */
+    CHECK(nex_audio_policy_event_fits(192000, 96000, 9600, 32768, 544));   /* 2:1 down */
+    CHECK(!nex_audio_policy_event_fits(384000, 96000, 9600, 32768, 544));  /* 38400 in > cap */
+    CHECK(!nex_audio_policy_event_fits(0, 48000, 4800, 32768, 544));
+    std::printf("PASS event mode: used only when a full period fits the resampler history\n");
+}
+
 int main() {
     test_16_bit_source_ladder_precedes_higher_setting();
     test_24_bit_source_ladder();
@@ -552,6 +562,7 @@ int main() {
     test_path_kind_labels();
     test_rate_family_and_prime();
     test_eos_wait_bound();
+    test_event_mode_fits();
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }

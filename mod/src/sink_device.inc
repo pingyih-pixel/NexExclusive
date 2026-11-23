@@ -172,8 +172,9 @@ static HRESULT drain_once(SinkGen *g) {
         }
         UINT32 m = g_sink.prime_left < space ? g_sink.prime_left : space;
         if (g->real_evt) {
-            if (pad != 0) return S_FALSE;
+            if (pad != 0 || (g->device_started && !g->evt_fired)) return S_FALSE;
             m = g->real_frames;
+            InterlockedExchange(&g->evt_fired, 0);
         }
         BYTE *silent = NULL;
         g->stage = STAGE_GETBUF;
@@ -221,9 +222,7 @@ static HRESULT drain_once(SinkGen *g) {
         if (ready>0) n=(UINT32)ready<space ? (UINT32)ready : space;
     } else {
         EnterCriticalSection(&g_lock);
-        n=g_sink.w-g_sink.r;
-        UINT32 end=g_sink.cap-g_sink.r%g_sink.cap;
-        if(n>end)n=end;
+        n=g_sink.w-g_sink.r;            /* ring_peek copies across the wrap */
         LeaveCriticalSection(&g_lock);
         if(n>space)n=space;
         if(n>SCRATCH_FRAMES)n=SCRATCH_FRAMES;
@@ -241,8 +240,11 @@ static HRESULT drain_once(SinkGen *g) {
             if (g_sink.h_client) SetEvent(g_sink.h_client);
             return S_FALSE;
         }
-        if (pad != 0) return S_FALSE;
+        /* Submit on the device's request only. Padding alone is not trusted:
+           several exclusive drivers report 0 between events. */
+        if (pad != 0 || (g->device_started && !g->evt_fired)) return S_FALSE;
         n = g->real_frames;
+        InterlockedExchange(&g->evt_fired, 0);
     }
     if(!n) {
         if (!g->real_evt && space && g_sink.h_client) {
@@ -420,7 +422,8 @@ static DWORD WINAPI drain_thread(LPVOID param) {
                 /* The device event is the primary wake-up. A short polling
                    fallback bounds delivery lateness if the event or this thread
                    is scheduled after the buffer has already run empty. */
-                (void)WaitForMultipleObjects(count, waiters, FALSE, 3);
+                DWORD woke = WaitForMultipleObjects(count, waiters, FALSE, 3);
+                if (g->real_evt && woke == WAIT_OBJECT_0) InterlockedExchange(&g->evt_fired, 1);
             } else Sleep(2);
         }
     }

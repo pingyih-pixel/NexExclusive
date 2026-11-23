@@ -2471,6 +2471,62 @@ static void test_audio_buffers_locked(void) {
     printf("PASS memlock: buffers locked after allocation, unlocked before free, off switch honoured\n");
 }
 
+/* ---- Orion 6: event-driven submissions --------------------------------------- */
+static void test_ring_peek_crosses_wrap(void) {
+    BYTE out[16 * 8];
+    prepare_ring();                                /* cap 32, block 8 */
+    for (int f = 0; f < 32; f++) memset(g_sink.ring + f * 8, f, 8);
+    g_sink.r = 28; g_sink.w = 36;                  /* 4 frames at the end, 4 at the start */
+    CHECK(ring_peek(out, 16) == 8);
+    CHECK(out[0] == 28 && out[3 * 8] == 31 && out[4 * 8] == 0 && out[7 * 8] == 3);
+    free_ring();
+    printf("PASS ring peek: one call returns the frames on both sides of the wrap\n");
+}
+
+static void test_event_mode_waits_for_device_request(void) {
+    prepare_ring();
+    reset_patches();
+    SinkGen *gen = mock_gen();
+    gen->real_frames = 16;
+    g_sink.cap = 32;
+    void *ac_vt[15] = {0}, *ac_orig[24] = {0};
+    ac_vt[AC_GETCURRENTPADDING] = (void *)mock_get_padding;
+    ac_vt[AC_START] = (void *)mock_start_counted;
+    ac_vt[AC_STOP] = (void *)mock_stop;
+    for (int i = 0; i < 15; i++) ac_orig[i] = ac_vt[i];
+    register_originals(ac_vt, ac_orig);
+    void *rc_vt[5] = {0}, *rc_orig[24] = {0};
+    rc_vt[RC_GETBUFFER] = (void *)mock_render_get;
+    rc_vt[RC_RELEASEBUFFER] = (void *)mock_render_release;
+    for (int i = 0; i < 5; i++) rc_orig[i] = rc_vt[i];
+    register_originals(rc_vt, rc_orig);
+    void *ac_obj[1] = {ac_vt}, *rc_obj[1] = {rc_vt};
+    gen->real = (IAudioClient *)ac_obj;
+    gen->real_render = (IAudioRenderClient *)rc_obj;
+    gen->real_evt = CreateEventA(NULL, FALSE, FALSE, NULL);
+    free(g_inb);
+    g_inb = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_block);
+    mock_padding = 0; mock_gb_calls = 0; mock_start_calls = 0;
+
+    g_sink.r = 24; g_sink.w = 56;                  /* 32 frames, wrapping */
+    CHECK(drain_once(gen) == S_OK);                /* first period before Start */
+    CHECK(mock_gb_frames == 16 && mock_start_calls == 1 && g_sink.r == 40);
+    mock_gb_calls = 0;
+    CHECK(drain_once(gen) == S_FALSE);             /* padding 0, but no event yet */
+    CHECK(mock_gb_calls == 0);
+    gen->evt_fired = 1;                            /* the device asked */
+    CHECK(drain_once(gen) == S_OK);
+    CHECK(mock_gb_calls == 1 && mock_gb_frames == 16 && g_sink.r == 56);
+    CHECK(gen->evt_fired == 0);
+
+    gen->real = NULL;
+    gen->real_render = NULL;
+    g_sink.gen = NULL;
+    gen_release(gen);                              /* closes real_evt */
+    free_ring();
+    printf("PASS event mode: one full period per device request, padding alone does not submit\n");
+}
+
 static void test_src_response(void) {
     static const struct { int in, out; const char *name; } ratios[] = {
         {44100, 48000, "44.1k->48k"},
@@ -2695,6 +2751,8 @@ int main(void) {
     test_clock_excludes_primed_silence();
     test_remote_clock_converts_device_ticks();
     test_audio_buffers_locked();
+    test_ring_peek_crosses_wrap();
+    test_event_mode_waits_for_device_request();
     test_multichannel_conversion_keeps_channels();
     test_multichannel_resample_keeps_channels();
     test_drain_thread_registers_mmcss();

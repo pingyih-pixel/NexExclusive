@@ -54,11 +54,61 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
         return FAILED(hr) ? hr : E_FAIL;
     }
 
-    /* Keep the original 100 ms client-visible buffer and poll the real
-       endpoint. This device accepts the timer-driven exclusive contract while
-       rejecting the event callback initialization after alignment negotiation. */
+    /* 100 ms device buffer. Event-driven first (Orion's EVENTCALLBACK path):
+       the device wakes the drain thread when it wants the next period, instead
+       of being polled every 3 ms. Some drivers accept the format but refuse the
+       event contract (seen: refused again after alignment negotiation); they
+       fall back to the timer-driven contract on a fresh IAudioClient. A busy
+       device stays busy either way and is not retried in timer mode. */
     REFERENCE_TIME buffer_duration = 1000000;
-    for (int attempt = 0; attempt < 8; attempt++) {
+    int use_event = g_event &&
+        nex_audio_policy_event_fits(g_sink.in_rate, rate,
+                                    (long)((UINT64)rate * (UINT64)buffer_duration / 10000000ull),
+                                    SRC_CAP, SRC_MAX_HALF);
+    HANDLE evt = NULL;
+    if (use_event) {
+        REFERENCE_TIME d = buffer_duration;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            hr = O_INITIALIZE(ac, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                              d, d, (WAVEFORMATEX *)&we, NULL);
+            if (SUCCEEDED(hr)) break;
+            if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+                UINT32 aligned = 0;
+                if (FAILED(O_GETBUFFERSIZE(ac, &aligned)) || !aligned) break;
+                d = (REFERENCE_TIME)(((UINT64)aligned * 10000000ull + (UINT32)rate / 2) / (UINT32)rate);
+                ac->lpVtbl->Release(ac);
+                ac = NULL;
+                hr = dev_activate(dev, &IID_IAudioClient, (void **)&ac);
+                if (FAILED(hr) || !ac) { if (SUCCEEDED(hr)) hr = E_FAIL; break; }
+                continue;
+            }
+            if ((unsigned long)hr != 0x8889000Aul) break;
+            Sleep(50);
+        }
+        if (SUCCEEDED(hr)) {
+            evt = CreateEventA(NULL, FALSE, FALSE, NULL);
+            hr = evt ? O_SETEVENT(ac, evt) : E_OUTOFMEMORY;
+            if (FAILED(hr)) { if (evt) CloseHandle(evt); evt = NULL; }
+        }
+        if (SUCCEEDED(hr)) {
+            log_line("probe %d/%d.%d%s: event-driven exclusive", rate, container, valid,
+                     is_float ? "f" : "");
+        } else if (!ac || (unsigned long)hr == 0x8889000Aul) {
+            log_line("probe %d/%d.%d%s: Initialize(event) 0x%08lX", rate, container, valid,
+                     is_float ? "f" : "", (unsigned long)hr);
+            if (ac) ac->lpVtbl->Release(ac);
+            return hr;
+        } else {
+            log_line("probe %d/%d.%d%s: event mode refused 0x%08lX, using timer polling",
+                     rate, container, valid, is_float ? "f" : "", (unsigned long)hr);
+            ac->lpVtbl->Release(ac);
+            ac = NULL;
+            hr = dev_activate(dev, &IID_IAudioClient, (void **)&ac);
+            if (FAILED(hr) || !ac) return FAILED(hr) ? hr : E_FAIL;
+            use_event = 0;
+        }
+    }
+    for (int attempt = 0; !use_event && attempt < 8; attempt++) {
         hr = O_INITIALIZE(ac, AUDCLNT_SHAREMODE_EXCLUSIVE, 0,
                           buffer_duration, 0, (WAVEFORMATEX *)&we, NULL);
         if (SUCCEEDED(hr)) break;
@@ -87,6 +137,7 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
     if (FAILED(O_GETBUFFERSIZE(ac, &frames)) || !frames) {
         log_line("sink: %d Hz/%d.%d bit%s passed the format check but has no buffer",
                  rate, container, valid, is_float ? " float" : "");
+        if (evt) CloseHandle(evt);
         ac->lpVtbl->Release(ac);
         return E_FAIL;
     }
@@ -97,6 +148,7 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
         log_line("probe %d/%d.%d%s: GetService(RenderClient) 0x%08lX rc=%p frames=%u",
                  rate, container, valid, is_float ? "f" : "", (unsigned long)hr,
                  (void *)rc, frames);
+        if (evt) CloseHandle(evt);
         ac->lpVtbl->Release(ac);
         return FAILED(hr) ? hr : E_POINTER;
     }
@@ -109,6 +161,7 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
                  rate, container, valid, is_float ? "f" : "", (unsigned long)hr,
                  (void *)clock, (unsigned long long)frequency);
         if(clock)clock->lpVtbl->Release(clock);
+        if(evt)CloseHandle(evt);
         rc->lpVtbl->Release(rc); ac->lpVtbl->Release(ac);
         return FAILED(hr)?hr:E_FAIL;
     }
@@ -116,7 +169,8 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
     O_GETLATENCY(ac, &lat);
     g->real_clock      = clock;
     g->clock_frequency = frequency;
-    g->real_evt        = NULL;
+    g->real_evt        = evt;
+    g->evt_fired       = 0;
     g->real            = ac;
     g->real_render     = rc;
     g->real_frames     = frames;
