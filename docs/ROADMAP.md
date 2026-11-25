@@ -138,9 +138,11 @@ AudioQuest DragonFly MM3A（额外支持 88.2）。
       宿主下发「关闭独占 / 恢复独占」，DLL 在看护线程上执行并回报状态（独占 / 共享 / 已让出 / 空闲、是否在播）。
       关闭独占时正在播放的流立刻在同一端点上重建为共享，客户端的流和时钟不变（实测切换 24 ms）
 - [x] 宿主监视 SMTC `mod/tools/nexsmtc.h`（C 里按 vtable 槽位调用 WinRT，先 QI 校验接口，动态加载 combase）
-- [x] 接管规则 `mod/tools/nexconflict.h`（原定弹窗让用户选，后改为自动）：非音乐播放器（浏览器、视频）一开始播放
-      就关闭独占并托盘提示；别的音乐播放器按 RateSync 的 PlayerTakeoverPolicy：网易云优先，网易云暂停 15 s 后让出，
-      `players_first=1` 时立即让出；别的应用停止播放 10 s 后撤销，下次继续播放时回到独占。只在 `auto_shared=1` 时自动做
+- [x] 接管规则 `mod/tools/nexconflict.h`：独占期间有别的应用开始播放就弹窗（TaskDialog，30 s 不选按保持独占）。
+      别的音乐播放器问「把独占交给它吗」，是 → 经网易云自己的媒体会话暂停网易云（TryPauseAsync）并让出声卡；
+      其他应用问「关闭独占、一起播放吗」，是 → 网易云改走共享。「记住我的选择」写进 `apps.cfg`（yield= / keep=），
+      之后该应用直接按记住的办，相当于逐步学出 RateSync 那样的偏好表；托盘可清除。别的应用停止播放 10 s 后撤销，
+      下次继续播放时回到独占。只在 `auto_shared=1` 时询问
 - [x] 托盘菜单「暂时关闭独占 / 恢复独占」：给不接入 SMTC 的应用（例如 Veyra）一个手动入口
 - [x] `nexsim conflict`：独占播放中由真实 Chrome 触发，SMTC 判定、发命令、切共享、别的进程能打开设备，端到端通过
 - [ ] 真实网易云里的验收：开 auto_shared，独占播放时用浏览器放视频，看托盘提示、日志与切换

@@ -22,6 +22,7 @@
 #include <mmdeviceapi.h>
 #include <tlhelp32.h>
 #include <shellapi.h>
+#include <commctrl.h>
 #include <shlobj.h>
 #include <shlguid.h>
 #include <commdlg.h>
@@ -3458,6 +3459,7 @@ static void usage(void) {
 #define MENU_FOLDER   3
 #define MENU_QUIT     4
 #define MENU_SHARE    5
+#define MENU_FORGET   6
 
 static NOTIFYICONDATAW g_nid;
 static int g_tray_up = 0;
@@ -3587,12 +3589,24 @@ static void open_logs(void) {
 
 /* ---- 别的应用想出声（ROADMAP 5c）------------------------------------------
    网易云独占声卡时，别的应用拿不到设备，会话层也不报任何事；但它的媒体会话
-   （SMTC）照样报 Playing。这条线程每 500 ms 看一次 SMTC，按 nexconflict.h 的
-   规则决定要不要让网易云关闭独占；命令经 nexcontrol.h 的控制块交给 DLL。
-   只在 hook.cfg 的 auto_shared=1（面板「别的应用出声时改走共享」）时自动做；
-   托盘的「暂时关闭独占」不受这个开关限制。 */
+   （SMTC）照样报 Playing。这条线程每 500 ms 看一次 SMTC；有别的应用开始播放，
+   就按 nexconflict.h 的规则问用户：
+     · 别的音乐播放器：把独占交给它吗？是 → 通过网易云自己的媒体会话暂停网易云，
+       并让出声卡，对方可以自己独占；
+     · 其他应用（浏览器、视频）：关闭独占、一起播放吗？是 → 网易云改走共享。
+   勾「记住」的回答写进 apps.cfg，之后这个应用直接按记住的办。命令经
+   nexcontrol.h 的控制块交给 DLL。只在 hook.cfg 的 auto_shared=1（面板「别的应用
+   出声时改走共享」）时询问；托盘的「暂时关闭独占」不受这个开关限制。 */
 static volatile LONG g_ctl_manual;      /* 托盘手动关闭了独占 */
 static volatile LONG g_ctl_manual_req;  /* 托盘点击：1 关闭独占，2 恢复独占 */
+
+/* 询问窗口在自己的线程里（TaskDialog 是模态的），答案经这几个变量交回 */
+static volatile LONG g_prompt_busy;
+static volatile LONG g_prompt_answer;   /* 0 未答，1 是，2 否（含超时） */
+static volatile LONG g_prompt_remember;
+static WCHAR g_prompt_app[160];
+static WCHAR g_prompt_shown[64];
+static int   g_prompt_kind;
 
 static void wide_to_utf8(const WCHAR *w, char *out, int cap) {
     if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL)) out[0] = 0;
@@ -3612,21 +3626,88 @@ static void tray_notify(const WCHAR *title, const WCHAR *text) {
     Shell_NotifyIconW(NIM_MODIFY, &n);
 }
 
-/* hook.cfg 里面板不管的整数项（例如 players_first），读不到时用默认值 */
-static int cfg_read_extra_int(const char *key, int def) {
-    char *txt = read_file(kHookCfg);
-    if (!txt) return def;
-    int v = def;
-    size_t len = strlen(key);
-    for (char *line = txt; line && *line; ) {
-        char *nl = strchr(line, '\n');
-        while (*line == ' ' || *line == '\t') line++;
-        if (strncmp(line, key, len) == 0 && line[len] == '=') v = atoi(line + len + 1);
-        if (!nl) break;
-        line = nl + 1;
-    }
+static void apps_cfg_path(char *out, size_t cap) {
+    snprintf(out, cap, "%sapps.cfg", g_base);
+}
+
+static int remembered_for(const WCHAR *app) {
+    char path[MAX_PATH], app8[480];
+    apps_cfg_path(path, sizeof(path));
+    wide_to_utf8(app, app8, sizeof(app8));
+    char *txt = read_file(path);
+    int r = nex_remembered_choice(txt, app8);
     free(txt);
-    return v;
+    return r;
+}
+
+static void remember_choice(const WCHAR *app, int yield) {
+    char path[MAX_PATH], app8[480];
+    apps_cfg_path(path, sizeof(path));
+    wide_to_utf8(app, app8, sizeof(app8));
+    FILE *f = fopen(path, "ab");
+    if (!f) { host_log("记不下选择：打不开 %s", path); return; }
+    fprintf(f, "%s=%s\n", yield ? "yield" : "keep", app8);
+    fclose(f);
+}
+
+typedef HRESULT (WINAPI *TaskDialogIndirectFn)(const TASKDIALOGCONFIG *, int *, int *, BOOL *);
+
+static HRESULT CALLBACK prompt_callback(HWND hwnd, UINT note, WPARAM wp, LPARAM lp, LONG_PTR ref) {
+    (void)lp; (void)ref;
+    if (note == TDN_CREATED) {
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        SetForegroundWindow(hwnd);
+    } else if (note == TDN_TIMER && (UINT)wp >= NEX_CONFLICT_PROMPT_TIMEOUT) {
+        SendMessageW(hwnd, TDM_CLICK_BUTTON, 102, 0);
+    }
+    return S_OK;
+}
+
+static DWORD WINAPI prompt_thread(LPVOID unused) {
+    (void)unused;
+    HMODULE cc = LoadLibraryW(L"comctl32.dll");
+    TaskDialogIndirectFn tdi = cc ? (TaskDialogIndirectFn)(void *)GetProcAddress(cc, "TaskDialogIndirect") : NULL;
+    int button = 102;
+    BOOL remember = FALSE;
+    if (tdi) {
+        WCHAR title[128], content[320], yes[200], no[160];
+        if (g_prompt_kind == NEX_APP_PLAYER) {
+            _snwprintf(title, 128, L"%ls 想播放", g_prompt_shown);
+            _snwprintf(content, 320, L"网易云正在独占声卡，%ls 现在没有声音。", g_prompt_shown);
+            _snwprintf(yes, 200, L"把独占交给 %ls\n网易云暂停并让出声卡，%ls 可以自己独占播放",
+                       g_prompt_shown, g_prompt_shown);
+            _snwprintf(no, 160, L"保持网易云独占\n%ls 这次不出声", g_prompt_shown);
+        } else {
+            _snwprintf(title, 128, L"%ls 想播放声音", g_prompt_shown);
+            _snwprintf(content, 320, L"网易云正在独占声卡，%ls 现在没有声音。", g_prompt_shown);
+            _snwprintf(yes, 200, L"关闭独占，一起播放\n网易云改走共享输出（不是原样）；"
+                       L"%ls 可能要刷新或重新打开页面才有声音", g_prompt_shown);
+            _snwprintf(no, 160, L"保持独占\n%ls 这次不出声", g_prompt_shown);
+        }
+        title[127] = content[319] = yes[199] = no[159] = 0;
+        TASKDIALOG_BUTTON buttons[2] = { {101, yes}, {102, no} };
+        TASKDIALOGCONFIG c;
+        memset(&c, 0, sizeof(c));
+        c.cbSize = sizeof(c);
+        c.dwFlags = TDF_USE_COMMAND_LINKS | TDF_CALLBACK_TIMER | TDF_ALLOW_DIALOG_CANCELLATION;
+        c.pszWindowTitle = L"NexExclusive";
+        c.pszMainIcon = TD_INFORMATION_ICON;
+        c.pszMainInstruction = title;
+        c.pszContent = content;
+        c.cButtons = 2;
+        c.pButtons = buttons;
+        c.nDefaultButton = 102;
+        c.pszVerificationText = L"记住我的选择，以后不再询问这个应用";
+        c.pszFooter = L"30 秒内不选，就保持独占。";
+        c.pfCallback = prompt_callback;
+        if (FAILED(tdi(&c, &button, NULL, &remember))) button = 102;
+    } else {
+        host_log("询问窗口不可用（TaskDialogIndirect），按保持独占处理");
+    }
+    InterlockedExchange(&g_prompt_remember, remember ? 1 : 0);
+    InterlockedExchange(&g_prompt_answer, button == 101 ? 1 : 2);
+    InterlockedExchange(&g_prompt_busy, 0);
+    return 0;
 }
 
 static DWORD WINAPI conflict_thread(LPVOID unused) {
@@ -3639,10 +3720,10 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
     HANDLE map = NULL;
     NexControl *blk = NULL;
     DWORD blk_pid = 0, open_tick = 0, cfg_tick = 0;
-    int auto_shared = 0, players_first = 0;
-    int yielded = 0;                       /* 是这条线程关闭的独占 */
-    DWORD others_last_playing = 0, client_paused_since = 0;
-    WCHAR waiting[160] = L"";              /* 正在等网易云安静的播放器，只记一次日志 */
+    int auto_shared = 0;
+    int yielded = 0;                       /* 是这条线程（按用户的回答）关闭的独占 */
+    DWORD others_last_playing = 0;
+    WCHAR asked[160] = L"";                /* 这一轮播放已经问过 / 处理过的应用 */
 
     for (;;) {
         Sleep(500);
@@ -3651,7 +3732,6 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
             int v[CFG_N];
             cfg_read(v);
             auto_shared = v[12] != 0;
-            players_first = cfg_read_extra_int("players_first", 0) != 0;
             cfg_tick = now;
         }
 
@@ -3660,7 +3740,7 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
             if (blk) UnmapViewOfFile(blk);
             if (map) CloseHandle(map);
             blk = NULL; map = NULL; blk_pid = pid; open_tick = 0;
-            yielded = 0; waiting[0] = 0;
+            yielded = 0; asked[0] = 0;
             InterlockedExchange(&g_ctl_manual, 0);
         }
         if (!blk && pid && (!open_tick || now - open_tick > 2000)) {
@@ -3694,49 +3774,95 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
             host_log("托盘：恢复独占（下次继续播放时生效）");
         }
 
-        if (blk->playing) client_paused_since = 0;
-        else if (!client_paused_since) client_paused_since = now;
+        /* 用户回答了询问（或者记住过的「是」直接走到这里） */
+        int act_kind = 0, act_yes = 0;
+        WCHAR act_app[160], act_shown[64];
+        LONG answer = InterlockedExchange(&g_prompt_answer, 0);
+        if (answer) {
+            act_kind = g_prompt_kind;
+            act_yes = answer == 1;
+            wcsncpy(act_app, g_prompt_app, 159); act_app[159] = 0;
+            wcsncpy(act_shown, g_prompt_shown, 63); act_shown[63] = 0;
+            if (InterlockedExchange(&g_prompt_remember, 0)) {
+                remember_choice(act_app, act_yes);
+                char a8[480];
+                wide_to_utf8(act_app, a8, sizeof(a8));
+                host_log("记住了：%s → %s", a8, act_yes ? "让出" : "保持独占");
+            }
+        }
 
         if (!smtc_ok) continue;
         NexSmtcEntry e[24];
         int n = nex_smtc_poll(&smtc, e, 24);
         if (n < 0) continue;
-        int others_playing = 0;
+        int others_playing = 0, asked_still_playing = 0;
         for (int i = 0; i < n; i++) {
             int kind = nex_app_kind(e[i].app);
             if (kind == NEX_APP_SELF || e[i].status != NEX_SMTC_PLAYING) continue;
             others_playing = 1;
-            if (!auto_shared || yielded || blk->share_forced ||
+            if (asked[0] && wcscmp(asked, e[i].app) == 0) { asked_still_playing = 1; continue; }
+            if (!auto_shared || answer || yielded || blk->share_forced || g_prompt_busy ||
                 blk->state != NEX_CONTROL_STATE_EXCLUSIVE) continue;
-            int act = nex_conflict_action(kind, players_first, blk->playing,
-                                          client_paused_since ? now - client_paused_since : 0);
             WCHAR shown[64];
             char shown8[192], app8[480];
             nex_app_display_name(e[i].app, shown, 64);
             wide_to_utf8(shown, shown8, sizeof(shown8));
             wide_to_utf8(e[i].app, app8, sizeof(app8));
-            if (act == NEX_CONFLICT_SHARE) {
-                nex_control_post(blk, NEX_CONTROL_CMD_SHARE);
-                yielded = 1;
-                waiting[0] = 0;
-                host_log("%s（%s）开始播放，网易云关闭独占改走共享", shown8, app8);
-                WCHAR text[256];
-                if (kind == NEX_APP_PLAYER)
-                    _snwprintf(text, 256, L"%ls 开始播放，网易云改走共享输出，两边都能出声。", shown);
-                else
-                    _snwprintf(text, 256, L"%ls 正在播放，网易云改走共享输出。"
-                               L"如果它还是没有声音，刷新或重新打开一下页面。", shown);
-                text[255] = 0;
-                tray_notify(L"已关闭独占", text);
-            } else if (act == NEX_CONFLICT_WAIT && wcscmp(waiting, e[i].app) != 0) {
-                wcsncpy(waiting, e[i].app, 159);
-                waiting[159] = 0;
-                host_log("%s 开始播放；网易云优先，等网易云暂停 %lu 秒后再让出",
-                         shown8, NEX_CONFLICT_ACTIVITY_WINDOW_MS / 1000);
+            wcsncpy(asked, e[i].app, 159);
+            asked[159] = 0;
+            asked_still_playing = 1;
+            int act = nex_conflict_action(kind, remembered_for(e[i].app));
+            if (act == NEX_CONFLICT_YIELD) {
+                host_log("%s（%s）开始播放；按记住的选择让出", shown8, app8);
+                act_kind = kind; act_yes = 1;
+                wcsncpy(act_app, e[i].app, 159); act_app[159] = 0;
+                wcsncpy(act_shown, shown, 63); act_shown[63] = 0;
+            } else if (act == NEX_CONFLICT_KEEP) {
+                host_log("%s（%s）开始播放；按记住的选择保持独占", shown8, app8);
+            } else if (act == NEX_CONFLICT_ASK) {
+                host_log("%s（%s）开始播放，询问用户", shown8, app8);
+                wcsncpy(g_prompt_app, e[i].app, 159); g_prompt_app[159] = 0;
+                wcsncpy(g_prompt_shown, shown, 63); g_prompt_shown[63] = 0;
+                g_prompt_kind = kind;
+                InterlockedExchange(&g_prompt_busy, 1);
+                HANDLE t = CreateThread(NULL, 0, prompt_thread, NULL, 0, NULL);
+                if (t) CloseHandle(t); else InterlockedExchange(&g_prompt_busy, 0);
             }
         }
+        /* 问过的应用停下了：它下次再开始播放时重新判断 */
+        if (asked[0] && !asked_still_playing && !g_prompt_busy) asked[0] = 0;
+
+        if (act_yes && !blk->share_forced) {
+            char shown8[192];
+            wide_to_utf8(act_shown, shown8, sizeof(shown8));
+            WCHAR text[256];
+            if (act_kind == NEX_APP_PLAYER) {
+                int paused = 0;
+                for (size_t k = 0; k < sizeof(kNexSelf) / sizeof(kNexSelf[0]); k++)
+                    paused += nex_smtc_pause_matching(&smtc, kNexSelf[k]);
+                nex_control_post(blk, NEX_CONTROL_CMD_SHARE);
+                host_log("把独占交给 %s：%s，并让出声卡", shown8,
+                         paused ? "已请网易云暂停" : "网易云没有媒体会话，没法自动暂停");
+                if (paused)
+                    _snwprintf(text, 256, L"网易云已暂停并让出声卡，%ls 可以独占播放了。", act_shown);
+                else
+                    _snwprintf(text, 256, L"网易云已让出独占，改走共享；请手动暂停网易云。");
+            } else {
+                nex_control_post(blk, NEX_CONTROL_CMD_SHARE);
+                host_log("为 %s 关闭独占，网易云改走共享", shown8);
+                _snwprintf(text, 256, L"网易云改走共享输出。%ls 如果还是没有声音，"
+                           L"刷新或重新打开一下页面。", act_shown);
+            }
+            text[255] = 0;
+            tray_notify(L"已关闭独占", text);
+            yielded = 1;
+        } else if (answer && !act_yes) {
+            char shown8[192];
+            wide_to_utf8(act_shown, shown8, sizeof(shown8));
+            host_log("保持独占（%s 这次不出声）", shown8);
+        }
+
         if (others_playing) others_last_playing = now;
-        else waiting[0] = 0;
         if (yielded && nex_conflict_release_due(g_ctl_manual, others_playing,
                                                 others_last_playing ? now - others_last_playing : ~0ul)) {
             nex_control_post(blk, NEX_CONTROL_CMD_EXCLUSIVE);
@@ -3758,6 +3884,7 @@ static void tray_menu(HWND hwnd) {
                 InterlockedCompareExchange(&g_ctl_manual, 0, 0)
                     ? L"恢复独占（下次继续播放时生效）"
                     : L"暂时关闭独占（让其他应用出声）");
+    AppendMenuW(m, MF_STRING, MENU_FORGET, L"清除记住的应用选择");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, MENU_QUIT,   L"退出（停止注入）");
     POINT pt;
@@ -3796,6 +3923,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InterlockedExchange(&g_ctl_manual_req,
                                 InterlockedCompareExchange(&g_ctl_manual, 0, 0) ? 2 : 1);
             break;
+        case MENU_FORGET: {
+            /* 改名而不是删除：误点了还能把 apps.cfg.bak 改回来 */
+            char path[MAX_PATH], bak[MAX_PATH];
+            apps_cfg_path(path, sizeof(path));
+            snprintf(bak, sizeof(bak), "%s.bak", path);
+            if (MoveFileExA(path, bak, MOVEFILE_REPLACE_EXISTING))
+                host_log("已清除记住的应用选择（旧文件改名为 apps.cfg.bak）");
+            break;
+        }
         case MENU_QUIT:
             DestroyWindow(hwnd);
             break;

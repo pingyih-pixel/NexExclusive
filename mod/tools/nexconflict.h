@@ -5,14 +5,16 @@
    while the device is held, that application gets no device and the audio
    session layer says nothing, but its media session still reports Playing.
 
-   Two kinds of application, two rules:
-     - anything that is not a music player (a browser, a video site, a game):
-       its sound is wanted now, so exclusive is closed at once and the client
-       plays shared next to it;
-     - another music player: RateSync's takeover rule (PlayerTakeoverPolicy).
-       A higher-priority player takes over at once; a lower-priority one waits
-       until the client has been quiet (paused) for the activity window.
-       The client is first by default.
+   The listener is asked, with a question that depends on the kind:
+     - another music player: hand exclusive over to it? Yes pauses the client
+       (through its own media session) and gives the device back, so the
+       other player can open it exclusively itself;
+     - anything else (a browser, a video, a game): close exclusive and play
+       together? Yes keeps the client playing, shared, next to it.
+   "Remember" stores the answer per application (apps.cfg beside the host),
+   so the host learns a preference list the way RateSync keeps a player
+   priority: a remembered yes acts at once, a remembered no never asks again.
+   No answer within the timeout counts as no, this time only.
    Exclusive comes back once the other application has stopped playing for
    the quiet window, at the client's next resume (the module decides that
    moment; the host only lifts the "stay shared" command).
@@ -35,10 +37,11 @@
 #include <string.h>
 
 enum { NEX_APP_SELF = 0, NEX_APP_PLAYER = 1, NEX_APP_OTHER = 2 };
-enum { NEX_CONFLICT_NONE = 0, NEX_CONFLICT_SHARE = 1, NEX_CONFLICT_WAIT = 2 };
+enum { NEX_CONFLICT_NONE = 0, NEX_CONFLICT_YIELD = 1, NEX_CONFLICT_ASK = 2, NEX_CONFLICT_KEEP = 3 };
+enum { NEX_REMEMBER_NONE = 0, NEX_REMEMBER_YIELD = 1, NEX_REMEMBER_KEEP = 2 };
 
-#define NEX_CONFLICT_ACTIVITY_WINDOW_MS 15000ul  /* RateSync's defaultActivityWindow */
-#define NEX_CONFLICT_QUIET_MS           10000ul  /* other app stopped this long: exclusive again */
+#define NEX_CONFLICT_QUIET_MS       10000ul  /* other app stopped this long: exclusive again */
+#define NEX_CONFLICT_PROMPT_TIMEOUT 30000u   /* unanswered prompt = keep, this time */
 
 /* Case-insensitive substring search on wide strings. */
 static NEX_HDR_UNUSED int nex_wcs_contains_ci(const wchar_t *hay, const wchar_t *needle) {
@@ -101,17 +104,34 @@ static NEX_HDR_UNUSED void nex_app_display_name(const wchar_t *app, wchar_t *out
 }
 
 /* What to do about an application whose media session is Playing while the
-   client holds the device exclusively.
-   players_first: other music players take priority over the client.
-   client_quiet_ms: how long the client has been paused (0 while playing). */
-static NEX_HDR_UNUSED int nex_conflict_action(int kind, int players_first, int client_playing,
-                               unsigned long client_quiet_ms) {
+   client holds the device exclusively, given what the listener said before. */
+static NEX_HDR_UNUSED int nex_conflict_action(int kind, int remembered) {
     if (kind == NEX_APP_SELF) return NEX_CONFLICT_NONE;
-    if (kind == NEX_APP_OTHER) return NEX_CONFLICT_SHARE;
-    if (players_first) return NEX_CONFLICT_SHARE;
-    if (!client_playing && client_quiet_ms >= NEX_CONFLICT_ACTIVITY_WINDOW_MS)
-        return NEX_CONFLICT_SHARE;
-    return NEX_CONFLICT_WAIT;
+    if (remembered == NEX_REMEMBER_YIELD) return NEX_CONFLICT_YIELD;
+    if (remembered == NEX_REMEMBER_KEEP) return NEX_CONFLICT_KEEP;
+    return NEX_CONFLICT_ASK;
+}
+
+/* apps.cfg: one remembered answer per line, "yield=<app id>" or
+   "keep=<app id>", app ids as the media session reports them (UTF-8). The
+   last line for an app wins, so appending is enough to change an answer. */
+static NEX_HDR_UNUSED int nex_remembered_choice(const char *text, const char *app) {
+    int found = NEX_REMEMBER_NONE;
+    if (!text || !app || !*app) return found;
+    size_t alen = strlen(app);
+    for (const char *line = text; *line; ) {
+        const char *nl = strchr(line, '\n');
+        size_t len = nl ? (size_t)(nl - line) : strlen(line);
+        while (len && (line[len - 1] == '\r' || line[len - 1] == ' ')) len--;
+        int kind = NEX_REMEMBER_NONE;
+        size_t skip = 0;
+        if (len > 6 && strncmp(line, "yield=", 6) == 0) { kind = NEX_REMEMBER_YIELD; skip = 6; }
+        else if (len > 5 && strncmp(line, "keep=", 5) == 0) { kind = NEX_REMEMBER_KEEP; skip = 5; }
+        if (kind && len - skip == alen && strncmp(line + skip, app, alen) == 0) found = kind;
+        if (!nl) break;
+        line = nl + 1;
+    }
+    return found;
 }
 
 /* After the host closed exclusive for an application: lift the command once
