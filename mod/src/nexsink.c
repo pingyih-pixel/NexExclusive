@@ -37,6 +37,7 @@
 #include <math.h>
 #include <avrt.h>
 #include "../tools/nexaudiolink.h"
+#include "../tools/nexcontrol.h"
 #include "audio_policy.h"
 
 /* ---- vtable slots ------------------------------------------------------- */
@@ -79,5 +80,6 @@
 #include "sink_device.inc"      /* drain thread, faults, fake client objects  */
 #include "sink_audiohost.inc"   /* optional shared-memory out-of-process sink */
 #include "sink_lifecycle.inc"   /* device generations, stop and teardown      */
+#include "sink_share.inc"       /* other apps on the endpoint, idle release   */
 #include "sink_endpoint.inc"    /* format negotiation, migration, engage      */
 #include "sink_hooks.inc"       /* IAudioClient/IMMDevice hooks, watchdog     */

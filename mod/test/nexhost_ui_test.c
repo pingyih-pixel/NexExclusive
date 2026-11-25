@@ -320,8 +320,45 @@ static void test_verified_client_versions(void) {
     printf("PASS client versions: 3.1.42.205594 and 3.1.43.205627 are verified\n");
 }
 
+/* ROADMAP 5c: who counts as another music player, and what the host does. */
+static void test_conflict_policy(void) {
+    CHECK(nex_app_kind(L"Chrome.GEBBYCINSSH34MXZFPEPBLRQC4") == NEX_APP_OTHER);
+    CHECK(nex_app_kind(L"MSEdge") == NEX_APP_OTHER);
+    CHECK(nex_app_kind(L"Spotify.exe") == NEX_APP_PLAYER);
+    CHECK(nex_app_kind(L"QQMusic.exe") == NEX_APP_PLAYER);
+    CHECK(nex_app_kind(L"AppleInc.AppleMusicWin_nzyj5cx40ttqa!App") == NEX_APP_PLAYER);
+    CHECK(nex_app_kind(L"cloudmusic.exe") == NEX_APP_SELF);
+    WCHAR name[64];
+    nex_app_display_name(L"Chrome.GEBBYCINSSH34MXZFPEPBLRQC4", name, 64);
+    CHECK(wcscmp(name, L"Chrome") == 0);
+    nex_app_display_name(L"QQMusic.exe", name, 64);
+    CHECK(wcscmp(name, L"QQ 音乐") == 0);
+    nex_app_display_name(L"SomeVideoApp.exe", name, 64);
+    CHECK(wcscmp(name, L"SomeVideoApp") == 0);
+    nex_app_display_name(L"", name, 64);
+    CHECK(name[0] != 0);
+    /* not a music player: exclusive closes at once, playing or paused */
+    CHECK(nex_conflict_action(NEX_APP_OTHER, 0, 1, 0) == NEX_CONFLICT_SHARE);
+    CHECK(nex_conflict_action(NEX_APP_OTHER, 0, 0, 500) == NEX_CONFLICT_SHARE);
+    CHECK(nex_conflict_action(NEX_APP_SELF, 1, 0, 99999) == NEX_CONFLICT_NONE);
+    /* another player: the client first by default; it waits while the client
+       plays and until the client has been paused for the activity window */
+    CHECK(nex_conflict_action(NEX_APP_PLAYER, 0, 1, 0) == NEX_CONFLICT_WAIT);
+    CHECK(nex_conflict_action(NEX_APP_PLAYER, 0, 0, 14999) == NEX_CONFLICT_WAIT);
+    CHECK(nex_conflict_action(NEX_APP_PLAYER, 0, 0, 15000) == NEX_CONFLICT_SHARE);
+    CHECK(nex_conflict_action(NEX_APP_PLAYER, 1, 1, 0) == NEX_CONFLICT_SHARE);
+    /* back to exclusive: only after the others stopped for the quiet window,
+       never for a manual close from the tray */
+    CHECK(nex_conflict_release_due(0, 0, 10000) == 1);
+    CHECK(nex_conflict_release_due(0, 0, 9999) == 0);
+    CHECK(nex_conflict_release_due(0, 1, 99999) == 0);
+    CHECK(nex_conflict_release_due(1, 0, 99999) == 0);
+    printf("PASS conflict policy: browsers close exclusive at once, players follow the takeover rule\n");
+}
+
 int main(void) {
     test_find_child_pids();
+    test_conflict_policy();
     test_ui_event_exists();
     test_ui_tracker_resets_on_new_main_pid();
     test_ui_child_already_loaded_is_not_reinjected();

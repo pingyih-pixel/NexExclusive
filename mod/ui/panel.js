@@ -19,7 +19,8 @@
   var DEFAULTS = {
     enable: 1, bits: 0, rate: 0, buffer: 0,
     compat: 1, dither: 2, fade_ms: 0, shared_fallback: 0,
-    src_prefer: 0, hifi: 0, audiohost: 0
+    src_prefer: 0, hifi: 0, audiohost: 0,
+    idle_release_ms: 0, auto_shared: 0
   };
 
   /* Replace DOM and styles from an older injected script version. */
@@ -49,6 +50,16 @@
         {
           key: 'audiohost', label: '独立音频宿主', type: 'switch',
           description: '把独占端点和实时提交移到独立进程；原率优先时，先在 DLL 内完成转换，再发送最终 PCM。'
+        },
+        {
+          key: 'idle_release_ms', label: '暂停时让出声卡', type: 'select',
+          options: [[0, '不让出'], [10000, '暂停 10 秒后'], [30000, '暂停 30 秒后'],
+            [60000, '暂停 1 分钟后'], [300000, '暂停 5 分钟后']],
+          description: '独占时，暂停也占着声卡，别的应用没有声音。开启后暂停够久就把声卡让出去，继续播放时再接管。'
+        },
+        {
+          key: 'auto_shared', label: '别的应用出声时改走共享', type: 'switch',
+          description: '别的应用正在出声时，和它一起走系统混音器（不是原样），而不是把它挤掉。独占期间浏览器、视频一开始播放就让出；别的音乐播放器要等网易云暂停 15 秒。它们停下后，下次继续播放时回到独占。'
         }
       ]
     },
@@ -1050,7 +1061,11 @@
     var lines = [formatSourceAudioSpec(snapshot)];
     if (input) lines.push('客户端 PCM　' + formatRate(Number(input[1])) + ' / ' + input[3] + ' bit ' + inputEncoding + '（' + input[2] + ' bit 容器）');
     if (output) lines.push('独占端点　' + formatRate(Number(output[1])) + ' / ' + output[3] + ' bit（' + output[2] + ' bit 容器）');
-    if (/\[converted\]/.test(text)) lines.push('状态　独占转换');
+    var mode = snapshot && snapshot.outputMode;
+    if (mode === 'released') lines.push('状态　暂停中，声卡已让出；继续播放时重新接管');
+    else if (mode ? mode === 'shared' : /\[shared\]/.test(text)) lines.push('状态　共享输出：经系统混音器，不是原样');
+    else if (mode === 'exclusive' && /\[shared\]/.test(text)) lines.push('状态　独占输出');
+    else if (/\[converted\]/.test(text)) lines.push('状态　独占转换');
     else if (/\[depth only\]/.test(text)) lines.push('状态　仅位深转换，未标记原样');
     else if (/\[repacked/.test(text)) lines.push('状态　原样数值，仅容器宽度改变'
       + (/\+fade\]/.test(text) ? '；开头淡入会改动前几毫秒' : ''));
@@ -1068,6 +1083,12 @@
     } else if (input || output) {
       lines.push('校验　本次流尚未生成逐样本校验记录');
     }
+    var note = snapshot && snapshot.outputNote || '';
+    var took = /exclusive takes the device from (\S+)/.exec(note);
+    var beside = /shared next to (\S+)/.exec(note);
+    if (took) lines.push('提示　继续播放时从 ' + took[1] + ' 手里收回了声卡；打开「别的应用出声时改走共享」可以和它并存');
+    else if (beside) lines.push('提示　' + beside[1] + ' 正在出声，所以这次走共享输出');
+    else if (/: shared,/.test(note)) lines.push('提示　别的应用刚出过声，这次先走共享输出');
     if (snapshot && snapshot.endpoint) lines.push('设备　' + snapshot.endpoint);
     return lines.join('\n');
   }

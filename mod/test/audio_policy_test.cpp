@@ -556,6 +556,46 @@ static void test_host_ring_depth() {
     std::printf("PASS host ring: 500 ms default, 200 ms to 4 s\n");
 }
 
+static void test_idle_release() {
+    CHECK(nex_audio_policy_idle_release_ms(0) == 0);
+    CHECK(nex_audio_policy_idle_release_ms(-5) == 0);
+    CHECK(nex_audio_policy_idle_release_ms(200) == 1000);
+    CHECK(nex_audio_policy_idle_release_ms(30000) == 30000);
+    CHECK(nex_audio_policy_idle_release_ms(99999999) == 3600000);
+    /* due: idle_ms, engaged, started, has_device, stop_token, current, paused_for */
+    CHECK(nex_audio_policy_idle_release_due(1000, 1, 0, 1, 7, 7, 1000) == 1);
+    CHECK(nex_audio_policy_idle_release_due(1000, 1, 0, 1, 7, 7, 999) == 0);
+    CHECK(nex_audio_policy_idle_release_due(0, 1, 0, 1, 7, 7, 99999) == 0);    /* off */
+    CHECK(nex_audio_policy_idle_release_due(1000, 0, 0, 1, 7, 7, 5000) == 0);  /* no stream */
+    CHECK(nex_audio_policy_idle_release_due(1000, 1, 1, 1, 7, 7, 5000) == 0);  /* playing again */
+    CHECK(nex_audio_policy_idle_release_due(1000, 1, 0, 0, 7, 7, 5000) == 0);  /* already released */
+    CHECK(nex_audio_policy_idle_release_due(1000, 1, 0, 1, 0, 0, 5000) == 0);  /* no pause armed */
+    CHECK(nex_audio_policy_idle_release_due(1000, 1, 0, 1, 7, 8, 5000) == 0);  /* device rebuilt */
+    std::printf("PASS idle release: off by default, 1 s .. 1 h, only the same stopped stream\n");
+}
+
+static void test_auto_shared_output() {
+    const int q = 3000;
+    CHECK(nex_audio_policy_share_quiet_ms(0) == 3000);
+    CHECK(nex_audio_policy_share_quiet_ms(100) == 500);
+    CHECK(nex_audio_policy_share_quiet_ms(999999) == 60000);
+    /* feature off: always exclusive, whatever is playing */
+    CHECK(nex_audio_policy_output_mode(0, 1, 1, 0, q) == NEX_AUDIO_OUTPUT_EXCLUSIVE);
+    /* scan failed: exclusive, as with the feature off */
+    CHECK(nex_audio_policy_output_mode(1, 0, 1, 0, q) == NEX_AUDIO_OUTPUT_EXCLUSIVE);
+    CHECK(nex_audio_policy_output_mode(1, 1, 1, 0, q) == NEX_AUDIO_OUTPUT_SHARED);
+    /* quiet, but only for a moment: still shared */
+    CHECK(nex_audio_policy_output_mode(1, 1, 0, 2999, q) == NEX_AUDIO_OUTPUT_SHARED);
+    CHECK(nex_audio_policy_output_mode(1, 1, 0, 3000, q) == NEX_AUDIO_OUTPUT_EXCLUSIVE);
+    CHECK(nex_audio_policy_output_mode(1, 1, 0, NEX_AUDIO_NEVER_HEARD, q) == NEX_AUDIO_OUTPUT_EXCLUSIVE);
+    /* an open but silent stream does not count, a quiet but audible one does */
+    CHECK(nex_audio_policy_session_sounding(1, 0.0f) == 0);
+    CHECK(nex_audio_policy_session_sounding(1, 0.00005f) == 0);
+    CHECK(nex_audio_policy_session_sounding(1, 0.01f) == 1);
+    CHECK(nex_audio_policy_session_sounding(0, 0.5f) == 0);
+    std::printf("PASS auto shared: off by default, shared while another app sounds or within the quiet window\n");
+}
+
 int main() {
     test_16_bit_source_ladder_precedes_higher_setting();
     test_24_bit_source_ladder();
@@ -590,6 +630,8 @@ int main() {
     test_event_mode_fits();
     test_pick_core();
     test_host_ring_depth();
+    test_idle_release();
+    test_auto_shared_output();
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }

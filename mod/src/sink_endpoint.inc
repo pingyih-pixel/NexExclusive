@@ -15,6 +15,57 @@ static UINT32 event_safe_client_frames(UINT32 want, const SinkGen *g) {
     return want;
 }
 
+/* Take an initialized IAudioClient into the generation: buffer size, render
+   client, clock. Shared by the exclusive probe and the shared open; on failure
+   the client and the event handle are released. */
+static HRESULT adopt_stream(SinkGen *g, IAudioClient *ac, HANDLE evt, int rate, int container,
+                            int valid, int is_float) {
+    HRESULT hr;
+    UINT32 frames = 0;
+    if (FAILED(O_GETBUFFERSIZE(ac, &frames)) || !frames) {
+        log_line("sink: %d Hz/%d.%d bit%s passed the format check but has no buffer",
+                 rate, container, valid, is_float ? " float" : "");
+        if (evt) CloseHandle(evt);
+        ac->lpVtbl->Release(ac);
+        return E_FAIL;
+    }
+
+    IAudioRenderClient *rc = NULL;
+    hr = O_GETSERVICE(ac, &IID_IAudioRenderClient_l, (void **)&rc);
+    if (FAILED(hr) || !rc) {
+        log_line("probe %d/%d.%d%s: GetService(RenderClient) 0x%08lX rc=%p frames=%u",
+                 rate, container, valid, is_float ? "f" : "", (unsigned long)hr,
+                 (void *)rc, frames);
+        if (evt) CloseHandle(evt);
+        ac->lpVtbl->Release(ac);
+        return FAILED(hr) ? hr : E_POINTER;
+    }
+
+    IAudioClock *clock=NULL;
+    hr=O_GETSERVICE(ac,&IID_IAudioClock_l,(void **)&clock);
+    UINT64 frequency=0;
+    if(FAILED(hr)||!clock || FAILED(clock->lpVtbl->GetFrequency(clock,&frequency)) || !frequency) {
+        log_line("probe %d/%d.%d%s: GetService(Clock) 0x%08lX clock=%p freq=%llu",
+                 rate, container, valid, is_float ? "f" : "", (unsigned long)hr,
+                 (void *)clock, (unsigned long long)frequency);
+        if(clock)clock->lpVtbl->Release(clock);
+        if(evt)CloseHandle(evt);
+        rc->lpVtbl->Release(rc); ac->lpVtbl->Release(ac);
+        return FAILED(hr)?hr:E_FAIL;
+    }
+    REFERENCE_TIME lat = 0;
+    O_GETLATENCY(ac, &lat);
+    g->real_clock      = clock;
+    g->clock_frequency = frequency;
+    g->real_evt        = evt;
+    g->evt_fired       = 0;
+    g->real            = ac;
+    g->real_render     = rc;
+    g->real_frames     = frames;
+    g->real_latency    = lat;
+    return S_OK;
+}
+
 static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container, int valid,
                              int is_float, int ch) {
     WAVEFORMATEXTENSIBLE we;
@@ -133,48 +184,48 @@ static HRESULT try_exclusive(SinkGen *g, IMMDevice *dev, int rate, int container
         return hr;
     }
 
-    UINT32 frames = 0;
-    if (FAILED(O_GETBUFFERSIZE(ac, &frames)) || !frames) {
-        log_line("sink: %d Hz/%d.%d bit%s passed the format check but has no buffer",
-                 rate, container, valid, is_float ? " float" : "");
-        if (evt) CloseHandle(evt);
-        ac->lpVtbl->Release(ac);
-        return E_FAIL;
-    }
+    return adopt_stream(g, ac, evt, rate, container, valid, is_float);
+}
 
-    IAudioRenderClient *rc = NULL;
-    hr = O_GETSERVICE(ac, &IID_IAudioRenderClient_l, (void **)&rc);
-    if (FAILED(hr) || !rc) {
-        log_line("probe %d/%d.%d%s: GetService(RenderClient) 0x%08lX rc=%p frames=%u",
-                 rate, container, valid, is_float ? "f" : "", (unsigned long)hr,
-                 (void *)rc, frames);
-        if (evt) CloseHandle(evt);
+/* auto_shared: open the endpoint in shared mode with the client's own format.
+   AUTOCONVERTPCM lets the system mixer take it to the mix format, so nothing
+   is converted here; the stream is plainly not bit-perfect and is labelled
+   [shared]. Never through the separate host: that path exists to own the
+   device exclusively. Timer-driven (no event handle), as the drain loop's
+   padding arithmetic is the same for both share modes. */
+static HRESULT try_shared(SinkGen *g, IMMDevice *dev, int ch, int *out_rate, int *out_container,
+                          int *out_valid, int *out_float) {
+    WAVEFORMATEXTENSIBLE we;
+    build_fmt_cv(&we, g_sink.in_rate, g_sink.in_container_bits, g_sink.in_valid_bits,
+                 g_sink.in_is_float, ch, g_sink.channel_mask ? g_sink.channel_mask : mask_for(ch));
+    IAudioClient *ac = NULL;
+    HRESULT hr = dev_activate(dev, &IID_IAudioClient, (void **)&ac);
+    if (FAILED(hr) || !ac) {
+        log_line("shared open: activate failed 0x%08lX", (unsigned long)hr);
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+    hr = O_INITIALIZE(ac, AUDCLNT_SHAREMODE_SHARED,
+                      AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                      1000000, 0, (WAVEFORMATEX *)&we, NULL);
+    if (FAILED(hr)) {
+        log_line("shared open %d/%d.%d%s: Initialize 0x%08lX", g_sink.in_rate,
+                 g_sink.in_container_bits, g_sink.in_valid_bits, g_sink.in_is_float ? "f" : "",
+                 (unsigned long)hr);
         ac->lpVtbl->Release(ac);
-        return FAILED(hr) ? hr : E_POINTER;
+        return hr;
     }
-
-    IAudioClock *clock=NULL;
-    hr=O_GETSERVICE(ac,&IID_IAudioClock_l,(void **)&clock);
-    UINT64 frequency=0;
-    if(FAILED(hr)||!clock || FAILED(clock->lpVtbl->GetFrequency(clock,&frequency)) || !frequency) {
-        log_line("probe %d/%d.%d%s: GetService(Clock) 0x%08lX clock=%p freq=%llu",
-                 rate, container, valid, is_float ? "f" : "", (unsigned long)hr,
-                 (void *)clock, (unsigned long long)frequency);
-        if(clock)clock->lpVtbl->Release(clock);
-        if(evt)CloseHandle(evt);
-        rc->lpVtbl->Release(rc); ac->lpVtbl->Release(ac);
-        return FAILED(hr)?hr:E_FAIL;
-    }
-    REFERENCE_TIME lat = 0;
-    O_GETLATENCY(ac, &lat);
-    g->real_clock      = clock;
-    g->clock_frequency = frequency;
-    g->real_evt        = evt;
-    g->evt_fired       = 0;
-    g->real            = ac;
-    g->real_render     = rc;
-    g->real_frames     = frames;
-    g->real_latency    = lat;
+    hr = adopt_stream(g, ac, NULL, g_sink.in_rate, g_sink.in_container_bits,
+                      g_sink.in_valid_bits, g_sink.in_is_float);
+    if (FAILED(hr)) return hr;
+    g->shared = 1;
+    g->remote = 0;
+    *out_rate = g_sink.in_rate;
+    *out_container = g_sink.in_container_bits;
+    *out_valid = g_sink.in_valid_bits;
+    *out_float = g_sink.in_is_float;
+    log_line("shared open %d/%d.%d%s: system mixer converts to the mix format",
+             g_sink.in_rate, g_sink.in_container_bits, g_sink.in_valid_bits,
+             g_sink.in_is_float ? "f" : "");
     return S_OK;
 }
 
@@ -477,7 +528,7 @@ static HRESULT sink_retarget(const char *reason) {
 /* The output device chosen in the panel (hook.cfg endpoint=), AddRef'd, or
    NULL when none is set or it is not currently active - then the caller uses
    the client's own device, so an unplugged pick never silences playback. */
-static IMMDevice *sink_pinned_device(void) {
+static IMMDevice *sink_pinned_device_q(int quiet) {
     if (!g_endpoint_id[0]) return NULL;
     WCHAR wid[200];
     if (!MultiByteToWideChar(CP_UTF8, 0, g_endpoint_id, -1, wid, 200)) return NULL;
@@ -497,9 +548,11 @@ static IMMDevice *sink_pinned_device(void) {
             dev = NULL;
         }
     }
-    if (!dev) log_line("sink: chosen endpoint %s unavailable, using the client's device", g_endpoint_id);
+    if (!dev && !quiet)
+        log_line("sink: chosen endpoint %s unavailable, using the client's device", g_endpoint_id);
     return dev;
 }
+static IMMDevice *sink_pinned_device(void) { return sink_pinned_device_q(0); }
 
 /* keep_bound: rebuild on the endpoint the client bound through
    IMMDevice::Activate, falling back to the default when there is none. */
@@ -515,24 +568,7 @@ static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
     if (g_sink.gen) { gen_release(g_sink.gen); g_sink.gen = NULL; }
     if (was_remote) remote_close();
 
-    IMMDevice *dev = sink_pinned_device();
-    if (!dev && keep_bound) {
-        EnterCriticalSection(&g_patch_lock);
-        for (int i = 0; i < 128; i++) if (g_bindings[i].client == g_sink.owner && g_bindings[i].dev) {
-            dev = g_bindings[i].dev; dev->lpVtbl->AddRef(dev); break;
-        }
-        LeaveCriticalSection(&g_patch_lock);
-    }
-    if (!dev) {
-        InterlockedIncrement(&g_internal);
-        IMMDeviceEnumerator *e = NULL;
-        if (SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
-                                       &IID_IMMDeviceEnumerator, (void **)&e)) && e) {
-            e->lpVtbl->GetDefaultAudioEndpoint(e, eRender, eConsole, &dev);
-            e->lpVtbl->Release(e);
-        }
-        InterlockedDecrement(&g_internal);
-    }
+    IMMDevice *dev = sink_resolve_device(keep_bound, 0);
     if (!dev) {
         log_line("retarget(%s): no default endpoint to move to", reason);
         sink_teardown();
@@ -562,17 +598,23 @@ static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
 
     UINT64 key = endpoint_hash(dev);
     int rate = 0, cont = 0, valid = 0, fl = 0, tried = 0;
-    g_probe_limit = 12;
-    hr = negotiate(gen, dev, g_sink.in_channels, &rate, &cont, &valid, &fl, &tried);
-    g_probe_limit = 0;
+    if (sink_pick_output(dev, reason, g_sink.idle_released) == NEX_AUDIO_OUTPUT_SHARED) {
+        hr = try_shared(gen, dev, g_sink.in_channels, &rate, &cont, &valid, &fl);
+        tried = 1;
+    } else {
+        g_probe_limit = 12;
+        hr = negotiate(gen, dev, g_sink.in_channels, &rate, &cont, &valid, &fl, &tried);
+        g_probe_limit = 0;
+    }
     dev->lpVtbl->Release(dev);
     if (FAILED(hr)) {
         log_line("retarget(%s): %d candidates rejected, stream cannot continue", reason, tried);
         sink_teardown();
         return hr;
     }
-    log_line("retarget(%s): %d Hz/%d.%d bit%s after %d candidates",
-             reason, rate, cont, valid, fl ? " float" : "", tried);
+    log_line("retarget(%s): %d Hz/%d.%d bit%s after %d candidates output=%s",
+             reason, rate, cont, valid, fl ? " float" : "", tried,
+             gen->shared ? "shared" : "exclusive");
 
     g_sink.out_rate           = rate;
     g_sink.out_container_bits = cont;
@@ -606,7 +648,11 @@ static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
     }
 
     g_sink.clock_base   = keep_clock;
-    sink_arm_prime(gen, rate);
+    if (gen->shared) { g_sink.skip_frames = 0; g_sink.prime_left = 0; }
+    else sink_arm_prime(gen, rate);
+    /* The byte verifier compares client and endpoint bytes; after a shared
+       stream the system mixer sits in between, so it has nothing to verify. */
+    if (gen->shared) g_sink.hifi_map = 0;
     g_sink.endpoint_key = key;
     g_sink.device_lost  = 0;
     g_sink.fault        = S_OK;
@@ -766,7 +812,12 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     if(!g_compat && g_force_rate && g_force_rate!=g_sink.in_rate) {
         dev->lpVtbl->Release(dev);sink_teardown_controlled();return AUDCLNT_E_UNSUPPORTED_FORMAT;
     }
-    hr=negotiate(gen,dev,g_sink.in_channels,&used_rate,&used_cont,&used_bits,&used_float,&tried);
+    if (sink_pick_output(dev, "new stream", 0) == NEX_AUDIO_OUTPUT_SHARED) {
+        hr = try_shared(gen, dev, g_sink.in_channels, &used_rate, &used_cont, &used_bits, &used_float);
+        tried = 1;
+    } else {
+        hr=negotiate(gen,dev,g_sink.in_channels,&used_rate,&used_cont,&used_bits,&used_float,&tried);
+    }
     dev->lpVtbl->Release(dev);
     if(FAILED(hr)) {
         log_line("sink: %d candidates rejected, no shared fallback implied",tried);
@@ -873,7 +924,8 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     g_sink.endpoint_key = key;
     g_sink.clock_base   = 0;
     g_sink.device_lost  = 0;
-    sink_arm_prime(gen, used_rate);
+    if (gen->shared) { g_sink.skip_frames = 0; g_sink.prime_left = 0; }
+    else sink_arm_prime(gen, used_rate);
 
     char a[160], b[240];
     describe("in", fmt, a, sizeof(a));
@@ -887,17 +939,18 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
                                           g_sink.in_valid_bits, g_sink.in_is_float,
                                           used_rate, used_cont, used_bits, used_float);
     int native = path == NEX_AUDIO_PATH_NATIVE;
-    g_sink.hifi_map = g_hifi ? (native ? 1 : 2) : 0;
+    g_sink.hifi_map = g_hifi && !gen->shared ? (native ? 1 : 2) : 0;
     g_sink.hifi_first_mismatch_frame = ~(UINT64)0;
     g_sink.hifi_client_hash = 1469598103934665603ull;
     g_sink.hifi_endpoint_hash = 1469598103934665603ull;
-    snprintf(b, sizeof(b), "out=rate:%d/cont:%d.%d/ch:%d%s hifi=%d map=%s  %s engine=%s",
+    snprintf(b, sizeof(b), "out=rate:%d/cont:%d.%d/ch:%d%s hifi=%d map=%s  %s engine=%s output=%s",
              used_rate, used_cont, used_bits, g_sink.in_channels,
              used_float ? "/float" : "",
              g_hifi,
-             g_hifi ? (native ? "client-native" : "converted") : "off",
-             nex_audio_policy_path_tag(path, g_fade_ms),
-             gen->remote ? "audiohost" : "in-process");
+             g_sink.hifi_map ? (native ? "client-native" : "converted") : "off",
+             gen->shared ? "[shared]" : nex_audio_policy_path_tag(path, g_fade_ms),
+             gen->remote ? "audiohost" : "in-process",
+             gen->shared ? "shared" : "exclusive");
     log_line("sink ENGAGED  generation=%llu  %s  ->  %s  (client buffer %lu frames, ring %lu)  ep=\"%s\" hw=%d",
              (unsigned long long)g_sink.generation,
              a, b, (unsigned long)want, (unsigned long)g_sink.cap, ep_name, ep_hw);
