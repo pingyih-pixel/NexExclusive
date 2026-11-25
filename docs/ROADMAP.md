@@ -164,6 +164,25 @@ AudioQuest DragonFly MM3A（额外支持 88.2）。
 - [ ] 真实网易云里「独占期间别的应用开始播放 → 弹窗」：需要设备上没有别的应用在出声时验收
 - [ ] 设置窗口在高 DPI、深色模式下的观感；键盘 Tab 顺序
 
+### 5e. 主窗口（2026-11-26）
+
+设计见 [superpowers/specs/2026-11-26-main-window-design.md](superpowers/specs/2026-11-26-main-window-design.md)。
+
+- [x] 打开 NexExclusive 就是主窗口：WebView2 显示 `ui/app.html`，最小化/关闭缩到托盘（可改为关闭即退出），
+      双击托盘或再次运行 exe 回来；`--tray`（开机自启）只进托盘。藏起来时释放 WebView2
+- [x] WebView2 不带 WebView2Loader.dll：直接调已安装运行时的 `CreateWebViewEnvironmentWithOptionsInternal`，
+      接口按槽位调用并先 QI（`mod/tools/nexwebview.h`）；起不来就退回 Win32 简易设置窗口
+- [x] 五页：概览（状态、信号链与改动标签）、输出、和别的应用（此刻在出声的应用、规则、记住的选择）、
+      播放器（网易云卡片、一起启动、在网易云里显示面板）、关于（介绍占位、检查更新占位、开机自启、关闭到托盘、日志、9333、卸载）
+- [x] 本机配置服务新增 `/app`、`/api/control`、`/api/apps`、`/api/host`、`/api/action`，`/api/status` 补控制块与播放器字段；
+      来源检查放行服务自己的页面
+- [x] 「一起启动网易云」「在网易云里显示面板」真正生效（launch_client / client_panel）；开机自启 Run 值迁移为带 `--tray`
+- [x] 验证：模拟服务下五页浅色/深色与全部交互；真实 WebView2 窗口（另一端口的测试宿主）显示、关闭释放、重开重建、最小化
+- [ ] 真实网易云里用主窗口验收（部署后）
+- [ ] 「检查更新」：发布渠道定了再做
+- [ ] 播放器页：多播放器方案定了再扩展
+- [ ] 图标与名字：和改名一起做
+
 ### 5b. 从 Orion 借鉴的 WASAPI 改进（2026-11-23）
 
 - [x] 新流开播前垫一个设备缓冲的静音；44.1k 族与 48k 族之间切换时多垫 `resync_ms`（默认 200 ms）；客户端时钟扣除这段静音

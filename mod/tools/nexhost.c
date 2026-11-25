@@ -39,6 +39,7 @@
 #include "nexsmtc.h"
 #include "nexcontrol.h"
 #include "nexconflict.h"
+#include "nexwebview.h"
 #include "../src/nexlogfile.h"
 
 /* ---- 程序身份 ---------------------------------------------------------- */
@@ -47,9 +48,17 @@
 #define APP_VERSION L"1.0.0"
 #define UNINST_KEY  L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\NexExclusive"
 #define RUN_KEY     L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#ifndef NEX_BUILD_ID
+#define NEX_BUILD_ID "dev"   /* build.sh 传 git 短哈希 */
+#endif
 
 /* ---- 路径与端口 --------------------------------------------------------- */
-#define CFG_PORT 9334
+#ifndef CFG_PORT
+#define CFG_PORT 9334   /* 测试构建可以 -DCFG_PORT=… 换一个，和正在跑的宿主并存 */
+#endif
+#define NEX_STR2(x) #x
+#define NEX_STR(x) NEX_STR2(x)
+#define CFG_PORT_S NEX_STR(CFG_PORT)
 #define CDP_PORT 9333
 
 /* 自带文件一律从 exe 所在目录推导。这里原来躺着 7 条写死的开发机绝对路径
@@ -73,6 +82,7 @@ static wchar_t kClientExe[MAX_PATH];
 static wchar_t kClientDir[MAX_PATH];
 static const char *g_client_src = "(未找到)";
 static int g_client_verified;
+static char g_client_ver8[64];     /* 客户端版本，UTF-8，给主窗口 */
 static char g_panel_script_id[128];
 static char g_simplify_script_id[128];
 
@@ -815,6 +825,11 @@ static void verification_json(char *out, size_t n, const char *line) {
 static SRWLOCK g_snap_lock = SRWLOCK_INIT;
 static NexControl g_ctl_snap;
 static int g_ctl_snap_ok;          /* 有快照且模块在 3 s 内更新过 */
+/* 此刻在出声的别的应用（媒体会话为 Playing），也由监视线程写 */
+typedef struct { WCHAR app[160]; int kind; } NexOtherApp;
+static NexOtherApp g_others_snap[8];
+static int g_others_count;
+static void status_extra_json(char *out, size_t n);   /* host_app.inc */
 
 /* ---- 状态：解析 sink.log 末段 ------------------------------------------ */
 static void status_json(char *out, size_t n) {
@@ -950,6 +965,8 @@ static void status_json(char *out, size_t n) {
     }
     char *rs = json_escape(remote_status);
     char *on = json_escape(output_note);
+    char extra[6144];
+    status_extra_json(extra, sizeof(extra));
     source_refresh_probe();
     if (!_stricmp(g_source.status, "pending") && !g_source.probe_started_ms &&
         g_source.updated_at_ms && GetTickCount64() - g_source.updated_at_ms > 30000) {
@@ -979,7 +996,7 @@ static void status_json(char *out, size_t n) {
              "\"source_encoding\":\"%s\",\"source_lossless\":%s,"
              "\"source_bitrate_kbps\":%d,\"source_quality_tier\":%d,"
              "\"source_quality_tier_hint\":%d,\"source_selection\":\"%s\","
-             "\"source_audio_generation\":%llu,\"source_updated_at_ms\":%llu}",
+             "\"source_audio_generation\":%llu,\"source_updated_at_ms\":%llu,%s}",
              engaged[0] || lastline[0] ? "true" : "false",
              e ? e : "", l ? l : "", f ? f : "",
              requested_audiohost ? "audiohost" : "in_process",
@@ -997,7 +1014,7 @@ static void status_json(char *out, size_t n) {
              g_source.bitrate_kbps, g_source.quality_tier,
              g_source.quality_tier_hint, g_source.selection,
              (unsigned long long)g_source.audio_generation,
-             (unsigned long long)g_source.updated_at_ms);
+             (unsigned long long)g_source.updated_at_ms, extra);
     free(e); free(l); free(f); free(rs); free(on); free(source_play_id); free(source_format); free(source_encoding);
 }
 
@@ -1405,6 +1422,10 @@ static int resolve_client(void) {
    加载，CDP 只是它失败时的备用；端口开着的时候，本机任何进程都能在客户端页面里
    执行脚本、拿到登录状态，所以默认关。设置随时可以从托盘的「设置…」改。 */
 static int g_cdp_enabled;
+/* 主窗口「播放器 / 关于」页的开关，存在 host.cfg（host_settings_load） */
+static int g_close_to_tray = 1;    /* 关闭主窗口时缩到托盘；0 = 关闭即退出 */
+static int g_launch_client = 1;    /* 启动时、客户端退出后自动拉起网易云 */
+static int g_client_panel = 1;     /* 往网易云里注入设置面板（nexui.dll / CDP） */
 
 static int launch_client(void) {
     WCHAR params[256];
@@ -1803,6 +1824,12 @@ static DWORD WINAPI ui_thread(LPVOID unused) {
             Sleep(1000);
             continue;
         }
+        if (!g_client_panel) {
+            /* 主窗口「在网易云里显示设置面板」关着：既不注入 nexui.dll，也不走 CDP */
+            InterlockedExchange(&g_ui_route, NEX_UI_ROUTE_WAIT);
+            Sleep(1000);
+            continue;
+        }
         n = find_child_pids(main_pid, L"cloudmusic.exe", kids, UI_MAX_CHILDREN);
         ui_tracker_sync(&tracker, main_pid, kids, n, GetTickCount64());
         dll_present = !guard.tripped && GetFileAttributesA(kUiDll) != INVALID_FILE_ATTRIBUTES;
@@ -1864,8 +1891,8 @@ static int http_header_value(const char *req, const char *name, char *out, size_
 }
 
 static int http_allowed_host(const char *host) {
-    return _stricmp(host, "127.0.0.1:9334") == 0 ||
-           _stricmp(host, "localhost:9334") == 0 ||
+    return _stricmp(host, "127.0.0.1:" CFG_PORT_S) == 0 ||
+           _stricmp(host, "localhost:" CFG_PORT_S) == 0 ||
            _stricmp(host, "127.0.0.1") == 0 ||
            _stricmp(host, "localhost") == 0;
 }
@@ -1894,6 +1921,9 @@ static void http_reply(SOCKET c, int code, const char *body) {
     send_all(c, head, (size_t)hl);
     send_all(c, body, strlen(body));
 }
+
+static int api_extra(const char *method, const char *path, const char *body, char *out, size_t n);
+static void serve_app_page(SOCKET c);
 
 static DWORD WINAPI http_thread(LPVOID unused) {
     (void)unused;
@@ -1958,7 +1988,11 @@ static DWORD WINAPI http_thread(LPVOID unused) {
         int has_origin = http_header_value(req, "Origin", origin, sizeof(origin));
         int has_host = http_header_value(req, "Host", host, sizeof(host));
         int has_content_type = http_header_value(req, "Content-Type", content_type, sizeof(content_type));
-        int origin_ok = !has_origin || strcmp(origin, "orpheus://orpheus") == 0;
+        /* 网易云页面里的面板（orpheus）和主窗口页面（它自己就由这里提供）可以调；
+           其他网页一律拒绝 */
+        int origin_ok = !has_origin || strcmp(origin, "orpheus://orpheus") == 0 ||
+                        strcmp(origin, "http://127.0.0.1:" CFG_PORT_S) == 0 ||
+                        strcmp(origin, "http://localhost:" CFG_PORT_S) == 0;
         int host_ok = !has_host || http_allowed_host(host);
         int content_ok = strcmp(method, "POST") != 0 ||
                          (has_content_type && http_json_content_type(content_type));
@@ -1975,6 +2009,9 @@ static DWORD WINAPI http_thread(LPVOID unused) {
             http_reply(c, 400, "{\"error\":\"POST requires application/json\"}");
         } else if (strcmp(method, "OPTIONS") == 0) {
             http_reply(c, 200, "{}");
+        } else if (strcmp(method, "GET") == 0 &&
+                   (strcmp(path, "/app") == 0 || strcmp(path, "/app/") == 0 || strncmp(path, "/app?", 5) == 0)) {
+            serve_app_page(c);
         } else if (strcmp(path, "/api/cfg") == 0 && strcmp(method, "GET") == 0) {
             int v[CFG_N];
             cfg_read(v);
@@ -2036,7 +2073,9 @@ static DWORD WINAPI http_thread(LPVOID unused) {
             status_json(out, sizeof(out));
             http_reply(c, 200, out);
         } else {
-            http_reply(c, 400, "{\"error\":\"not found\"}");
+            int code = api_extra(method, path, body_buf, out, sizeof(out));
+            if (code) http_reply(c, code, out);
+            else http_reply(c, 400, "{\"error\":\"not found\"}");
         }
 
         free(req);
@@ -2108,6 +2147,7 @@ static void check_client_version(void) {
     int known = client_version_known(ver);
     char v8[64];
     WideCharToMultiByte(CP_ACP, 0, ver, -1, v8, sizeof(v8), NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, ver, -1, g_client_ver8, sizeof(g_client_ver8), NULL, NULL);
     if (known) host_log("客户端版本 %s（已验证）", v8);
     else host_log("客户端版本 %s 未经验证——注入可能失效。若出现没声音/没效果，"
                   "先怀疑版本差异，而不是设备或配置。", v8);
@@ -2188,6 +2228,11 @@ static void watchdog_tick(void) {
     DWORD pid = find_main_client();
     DWORD now = GetTickCount();
 
+    if (!pid && !g_launch_client) {
+        /* 主窗口里关掉了「一起启动网易云」：客户端不在就等它自己出现 */
+        g_injected_pid = 0;
+        return;
+    }
     if (!pid) {
         /* 客户端退出后由后续 tick 推进重启，不能在窗口消息线程里等待。 */
         if (!g_last_restart_attempt || (DWORD)(now - g_last_restart_attempt) >= 5000) {
@@ -2304,22 +2349,21 @@ static void open_logs(void) {
 
 #include "host_conflict.inc"   /* 别的应用想出声：SMTC 监视、询问、托盘提示 */
 #include "host_settings.inc"
+#include "host_app.inc"      /* 主窗口用的接口与页面 */
+#include "host_window.inc"   /* 主窗口（WebView2） */
 
 static void tray_menu(HWND hwnd) {
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, MENU_SETTINGS, L"设置…");
+    /* 设置、日志、记住的选择都在主窗口里；托盘只留常驻需要的几项 */
+    AppendMenuW(m, MF_STRING, MENU_SETTINGS, L"打开 NexExclusive");
     SetMenuDefaultItem(m, MENU_SETTINGS, FALSE);
-    AppendMenuW(m, MF_STRING, MENU_CLIENT, L"打开网易云音乐");
-    AppendMenuW(m, MF_STRING, MENU_LOGS,   L"查看日志");
-    AppendMenuW(m, MF_STRING, MENU_FOLDER, L"打开程序目录");
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, MENU_SHARE,
                 InterlockedCompareExchange(&g_ctl_manual, 0, 0)
-                    ? L"恢复独占（下次继续播放时生效）"
-                    : L"暂时关闭独占（让其他应用出声）");
-    AppendMenuW(m, MF_STRING, MENU_FORGET, L"清除记住的应用选择");
+                    ? L"恢复独占"
+                    : L"暂时改为共享");
+    AppendMenuW(m, MF_STRING, MENU_CLIENT, L"打开网易云音乐");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, MENU_QUIT,   L"退出（停止注入）");
+    AppendMenuW(m, MF_STRING, MENU_QUIT,   L"退出（停止接管）");
     POINT pt;
     GetCursorPos(&pt);
     SetForegroundWindow(hwnd);   /* 不设的话菜单点外面不会消失 */
@@ -2334,9 +2378,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_TRAY_EVENT:
         if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) tray_menu(hwnd);
-        else if (lp == WM_LBUTTONDBLCLK) {
-            open_client_window();
-        }
+        else if (lp == WM_LBUTTONDBLCLK) main_show();
+        return 0;
+    case WM_NEX_SHOW:
+        main_show();
+        return 0;
+    case WM_NEX_OPEN_CLIENT:
+        open_client_window();
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
@@ -2357,7 +2405,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 InterlockedCompareExchange(&g_ctl_manual, 0, 0) ? 2 : 1);
             break;
         case MENU_SETTINGS:
-            settings_open();
+            main_show();
             break;
         case MENU_FORGET: {
             /* 改名而不是删除：误点了还能把 apps.cfg.bak 改回来 */
@@ -2389,19 +2437,18 @@ int main(int argc, char **argv) {
         MessageBoxW(NULL, L"无法解析 NexExclusive 自身目录，已停止启动。", L"NexExclusive", MB_ICONERROR);
         return 1;
     }
-    {
-        char cdp[8];
-        g_cdp_enabled = cfg_lookup(kHostCfg, "cdp", cdp, sizeof(cdp)) && atoi(cdp) != 0;
-    }
+    host_settings_load();
 
     WCHAR client_arg[MAX_PATH];
     client_arg[0] = 0;
     int want_install = 0, want_uninstall = 0, want_verify = 0, want_help = 0, want_console = 0, want_show = 0;
+    int want_tray = 0;   /* 开机自启：只进托盘，不弹主窗口 */
     const char *bad = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--install"))        want_install = 1;
         else if (!strcmp(argv[i], "--uninstall")) want_uninstall = 1;
+        else if (!strcmp(argv[i], "--tray")) want_tray = 1;
         else if (!strcmp(argv[i], "--verify"))    want_verify = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) want_help = 1;
         else if (!strcmp(argv[i], "--console"))   want_console = 1;
@@ -2435,11 +2482,21 @@ int main(int argc, char **argv) {
        busy。所以先到先得，后来的直接退。句柄故意不关——进程活着锁就在。 */
     HANDLE once = CreateMutexW(NULL, FALSE, L"Local\\NexExclusiveHost");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        host_log("已有一个 NexExclusive 在运行，本次启动退出");
-        if (interactive)
-            MessageBoxW(NULL, L"NexExclusive 已经在运行了。\n\n"
-                              L"看右下角托盘图标；要退出请右键它选「退出」。",
-                        L"NexExclusive", MB_ICONINFORMATION | MB_SETFOREGROUND);
+        /* 再次打开 NexExclusive：把已经在跑的那份的主窗口叫出来 */
+        HWND other = FindWindowW(L"NexExclusiveHost", NULL);
+        if (other && !want_tray) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(other, &pid);
+            AllowSetForegroundWindow(pid);
+            PostMessageW(other, WM_NEX_SHOW, 0, 0);
+            host_log("已有一个 NexExclusive 在运行，叫出它的主窗口");
+        } else {
+            host_log("已有一个 NexExclusive 在运行，本次启动退出");
+            if (interactive && !other)
+                MessageBoxW(NULL, L"NexExclusive 已经在运行了。\n\n"
+                                  L"看右下角托盘图标；要退出请右键它选「退出」。",
+                            L"NexExclusive", MB_ICONINFORMATION | MB_SETFOREGROUND);
+        }
         return 0;
     }
 
@@ -2559,7 +2616,9 @@ int main(int argc, char **argv) {
     CreateThread(NULL, 0, conflict_thread, NULL, 0, NULL);
 
     DWORD initial_pid = find_main_client();
-    if (want_show || !initial_pid || !client_window_visible(initial_pid)) {
+    if (!g_launch_client && !want_show) {
+        host_log(initial_pid ? "客户端已在运行 pid=%lu" : "没有自动启动网易云（主窗口里关掉了）", (unsigned long)initial_pid);
+    } else if (want_show || !initial_pid || !client_window_visible(initial_pid)) {
         host_log(want_show ? "收到呼出网易云窗口命令" : "客户端没有可见窗口，开始呼出");
         if (!open_client_window())
             host_log("未能确认网易云可见窗口，继续看护并等待客户端完成启动");
@@ -2585,7 +2644,10 @@ int main(int argc, char **argv) {
         return 1;
     }
     tray_add(hwnd);
+    g_tray_wnd = hwnd;
+    autostart_migrate();
     SetTimer(hwnd, TIMER_TICK, 2500, NULL);
+    if (!want_tray) main_show();
 
     watchdog_tick();   /* 先跑一次，别让用户等 2.5 秒才看到注入 */
 

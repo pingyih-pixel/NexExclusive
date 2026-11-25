@@ -124,7 +124,10 @@ build_host() {
         "$MOD_DIR/tools/nexhost.rc.in" > "$rc"
     "$CC" rc "$rc" "$res"
 
-    "$CC" cc "${FLAGS[@]}" "${WIRE_DEFS[@]}" -Wl,--subsystem,windows \
+    # 主窗口「关于」里显示的构建号：git 短哈希，没有 git 时是 dev
+    local build_id
+    build_id=$(git -C "$MOD_DIR" rev-parse --short HEAD 2>/dev/null || echo dev)
+    "$CC" cc "${FLAGS[@]}" "${WIRE_DEFS[@]}" "-DNEX_BUILD_ID=\"$build_id\"" -Wl,--subsystem,windows \
         -o "$OUT_DIR/NexExclusive.exe" "$MOD_DIR/tools/nexhost.c" "$res" \
         -lws2_32 -lole32 -loleaut32 -ladvapi32 -lshell32 -luser32 -lgdi32 \
         -lversion -lcomdlg32 -lbcrypt
@@ -141,6 +144,9 @@ build_host() {
         fi
         if [[ "$OUT_DIR/ui/simplify.js" != "$MOD_DIR/ui/simplify.js" ]]; then
             cp -- "$MOD_DIR/ui/simplify.js" "$OUT_DIR/ui/simplify.js"
+        fi
+        if [[ "$OUT_DIR/ui/app.html" != "$MOD_DIR/ui/app.html" ]]; then
+            cp -- "$MOD_DIR/ui/app.html" "$OUT_DIR/ui/app.html"   # 主窗口页面
         fi
     fi
     printf '已构建到 %s：NexExclusive.exe（含 hook.cfg / ui.json / ui/）\n' "$OUT_DIR"

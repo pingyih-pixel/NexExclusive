@@ -317,7 +317,7 @@ static int stop_client_processes(void) {
 static void remove_install_tree(const wchar_t *dir) {
     static const wchar_t *files[] = {
         L"NexExclusive.exe", L"NexAudioHost.exe", L"nexsink.dll", L"nexui.dll", L"hook.cfg",
-        L"ui.json", L"manifest.txt", L"ui\\panel.js", L"ui\\simplify.js"
+        L"ui.json", L"manifest.txt", L"ui\\panel.js", L"ui\\simplify.js", L"ui\\app.html"
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
         WCHAR path[MAX_PATH];
@@ -331,9 +331,9 @@ static void remove_install_tree(const wchar_t *dir) {
 static int install_payload_atomic(const wchar_t *src, const wchar_t *dst) {
     static const wchar_t *base_files[] = {
         L"NexExclusive.exe", L"NexAudioHost.exe", L"nexsink.dll", L"nexui.dll", L"hook.cfg",
-        L"ui.json", L"ui\\panel.js", L"ui\\simplify.js"
+        L"ui.json", L"ui\\panel.js", L"ui\\simplify.js", L"ui\\app.html"
     };
-    const wchar_t *files[9];
+    const wchar_t *files[10];
     size_t count = sizeof(base_files) / sizeof(base_files[0]);
     for (size_t i = 0; i < count; i++) files[i] = base_files[i];
     WCHAR source_manifest[MAX_PATH];
@@ -512,7 +512,7 @@ static int do_uninstall(void) {
     static const wchar_t *files[] = {
         L"nexsink.dll", L"nexui.dll", L"NexAudioHost.exe", L"hook.cfg", L"ui.json", L"host.cfg",
         L"manifest.txt",
-        L"ui\\panel.js", L"ui\\simplify.js",
+        L"ui\\panel.js", L"ui\\simplify.js", L"ui\\app.html", L"apps.cfg",
         L"host.log", L"sink.log", L"sink.prev.log", L"nexui.log", L"nexui.prev.log",
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
