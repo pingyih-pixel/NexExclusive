@@ -59,7 +59,9 @@ ZIG=/c/zig/zig-x86_64-windows-0.17.1 bash mod/build.sh all
 | `mod/src/nexui.c` | 界面 DLL：只在渲染子进程里动作，改 `cloudmusic.dll` 的 5 个 libcef 导入，在主页面执行 `ui/panel.js` 与 `ui/simplify.js` |
 | `mod/src/nexui_core.h` / `nexui_cef.h` | 界面 DLL 的纯逻辑（渲染进程判定、CEF 91 布局检查、导入表改写）与 CEF 91 C API 结构体子集 |
 | `mod/src/nexui_shared.h` | 宿主与界面 DLL 的约定：就绪/不支持事件名、界面路由决策 |
-| `mod/tools/nexhost.c` | 宿主 exe：安装卸载、托盘、音频注入、界面链路（子进程跟踪、注入 `nexui.dll`）、本机配置服务、CDP 回退 |
+| `mod/tools/nexhost.c` | 宿主 exe：托盘、音频注入、界面链路（子进程跟踪、注入 `nexui.dll`）、本机配置服务。各段按主题拆在 `host_*.inc`：`host_source.inc` 源规格、`host_cdp.inc` CDP 回退与重开曲目、`host_install.inc` 安装卸载、`host_conflict.inc` 别的应用想出声时的监视与询问、`host_settings.inc` 独立设置窗口 |
+| `mod/tools/nexcontrol.h` / `nexsmtc.h` / `nexconflict.h` | 宿主与 DLL 的控制块、Windows 媒体会话读取（C 里按槽位调用 WinRT）、接管规则（纯函数） |
+| `mod/src/nexlogfile.h` | 三份日志的轮转（超过 4 MB 改名 .1）与跨天日期标记 |
 | `mod/tools/nexaudiolink.h` / `nexaudiohost.c` | 独立音频宿主协议与 WASAPI 端点进程 |
 | `mod/ui/` | 注入客户端页面的 `panel.js` 与 `simplify.js` |
 | `mod/test/audio_policy_test.cpp` | AudioPolicy 的 C++ 测试：位深与采样率顺序、统一候选计划、假端点搜索（含设备占用）、配置规范化、格式合法性、抖动 |

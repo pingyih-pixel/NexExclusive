@@ -3,7 +3,12 @@
 
 const fs = require('fs');
 const path = require('path');
-const source = fs.readFileSync(path.join(__dirname, 'nexhost.c'), 'utf8');
+// nexhost.c includes its sections from host_*.inc; the contract is about the
+// host as a whole, so read them together.
+const source = [fs.readFileSync(path.join(__dirname, 'nexhost.c'), 'utf8')]
+  .concat(fs.readdirSync(__dirname).filter(f => /^host_.*\.inc$/.test(f)).sort()
+    .map(f => fs.readFileSync(path.join(__dirname, f), 'utf8')))
+  .join('\n');
 const audioHost = fs.readFileSync(path.join(__dirname, 'nexaudiohost.c'), 'utf8');
 const audioLink = fs.readFileSync(path.join(__dirname, 'nexaudiolink.h'), 'utf8');
 
