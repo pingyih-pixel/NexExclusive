@@ -17,7 +17,13 @@
      share     auto_shared: another process is sounding when the track
                starts, so the sink opens shared; once it is quiet, a pause
                and resume go back to exclusive
-   release and share write their own temporary hook.cfg unless --cfg is given.
+     conflict  the host's rule end to end: while the track plays exclusively,
+               start a video or audio in a browser; its media session turning
+               Playing makes this tool post "close exclusive" to the module's
+               control block, as the host does, and the stream must go shared
+               at once and let another process open the device
+   release, share and conflict write their own temporary hook.cfg unless
+   --cfg is given.
 
    Each track plays a -20 dBFS sine. Checks per track: every call succeeds;
    the client's clock never goes backwards, holds still while paused, restarts
@@ -41,6 +47,9 @@
 #include <ksmedia.h>
 #include <audiopolicy.h>
 #include <math.h>
+#include "nexsmtc.h"
+#include "nexcontrol.h"
+#include "nexconflict.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -524,6 +533,75 @@ static void scenario_share(int *late) {
     track_close(&t);
 }
 
+static NexControl *open_own_control(void) {
+    WCHAR name[64];
+    nex_control_name(name, 64, GetCurrentProcessId());
+    HANDLE map = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name);
+    if (!map) return NULL;
+    NexControl *c = (NexControl *)MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(NexControl));
+    return c && nex_control_valid(c) ? c : NULL;
+}
+
+static void scenario_conflict(int *late) {
+    TrackFormat f = {48000, 32, 1, 2};
+    Track t;
+    printf("conflict: start a browser video now (waiting up to 30 s)\n");
+    char busy_app[MAX_PATH];
+    if (other_app_sounding(busy_app, sizeof(busy_app))) {
+        printf("  SKIP: %s is already playing; conflict needs a quiet device\n", busy_app);
+        return;
+    }
+    NexControl *c = open_own_control();
+    CHECK(c != NULL, "the module did not create its control block");
+    NexSmtc smtc;
+    int smtc_ok = nex_smtc_open(&smtc);
+    CHECK(smtc_ok, "SMTC unavailable: %s", smtc.error);
+    if (!c || !smtc_ok) return;
+    if (!track_open(&t, f)) { track_close(&t); return; }
+    track_start(&t);
+    track_play(&t, 1.0, late);
+    Sleep(500);
+    CHECK(c->state == NEX_CONTROL_STATE_EXCLUSIVE && c->playing,
+          "control block does not say exclusive/playing (state %ld playing %ld)",
+          (long)c->state, (long)c->playing);
+    int posted = 0;
+    WCHAR who[160] = L"";
+    for (int i = 0; i < 120 && !posted; i++) {
+        track_play(&t, 0.25, late);
+        NexSmtcEntry e[16];
+        int n = nex_smtc_poll(&smtc, e, 16);
+        for (int k = 0; k < n && !posted; k++) {
+            int kind = nex_app_kind(e[k].app);
+            if (e[k].status != NEX_SMTC_PLAYING) continue;
+            if (nex_conflict_action(kind, 0, c->playing, 0) != NEX_CONFLICT_SHARE) continue;
+            nex_control_post(c, NEX_CONTROL_CMD_SHARE);
+            wcsncpy(who, e[k].app, 159);
+            posted = 1;
+        }
+    }
+    CHECK(posted, "no other application reported Playing within 30 s");
+    if (posted) {
+        printf("  %ls reported Playing; posted close-exclusive\n", who);
+        track_play(&t, 1.5, late);
+        CHECK(c->ack_seq == c->cmd_seq && c->ack_result == 0,
+              "command not applied (ack %ld/%ld result 0x%08lX)",
+              (long)c->ack_seq, (long)c->cmd_seq, (unsigned long)c->ack_result);
+        CHECK(c->state == NEX_CONTROL_STATE_SHARED, "still not shared (state %ld)", (long)c->state);
+        CHECK(log_contains(g_log_path, "listener closed exclusive"), "no switch in the log");
+        int freed = probe_shared();
+        printf("  after the switch: another process %s\n",
+               freed == 0 ? "opened the device" : freed == 3 ? "got DEVICE_IN_USE" : "failed");
+        CHECK(freed == 0, "the device is still taken (probe %d)", freed);
+        track_play(&t, 1.0, late);
+        nex_control_post(c, NEX_CONTROL_CMD_EXCLUSIVE);
+        track_play(&t, 1.0, late);
+        CHECK(c->share_forced == 0, "exclusive was not allowed again");
+    }
+    IAudioClient_Stop(t.client);
+    track_close(&t);
+    nex_smtc_close(&smtc);
+}
+
 /* Lines in the sink log that mean something went wrong. */
 static void scan_log(const char *path) {
     FILE *f = fopen(path, "r");
@@ -580,7 +658,8 @@ int main(int argc, char **argv) {
     if (!cfg) {
         int needs = 0;
         for (int i = 0; i < count; i++)
-            needs |= !strcmp(scenarios[i], "release") || !strcmp(scenarios[i], "share");
+            needs |= !strcmp(scenarios[i], "release") || !strcmp(scenarios[i], "share") ||
+                     !strcmp(scenarios[i], "conflict");
         if (needs) {
             GetTempPathA(MAX_PATH, own_cfg);
             snprintf(own_cfg + strlen(own_cfg), MAX_PATH - strlen(own_cfg),
@@ -621,9 +700,11 @@ int main(int argc, char **argv) {
         if (all || !strcmp(s, "seek")) scenario_seek(&late);
         if (!strcmp(s, "release")) scenario_release(&late);
         if (!strcmp(s, "share")) scenario_share(&late);
+        if (!strcmp(s, "conflict")) scenario_conflict(&late);
         if (late) printf("  (client event silent for 500 ms: %d time(s) so far)\n", late);
         if (!all && strcmp(s, "handoff") && strcmp(s, "format") && strcmp(s, "pause") &&
-            strcmp(s, "seek") && strcmp(s, "release") && strcmp(s, "share"))
+            strcmp(s, "seek") && strcmp(s, "release") && strcmp(s, "share") &&
+            strcmp(s, "conflict"))
             printf("unknown scenario %s\n", s);
     }
     CHECK(late == 0, "the client event stayed silent for 500 ms %d time(s)", late);

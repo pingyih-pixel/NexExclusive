@@ -618,6 +618,7 @@ static DWORD WINAPI watch_thread(LPVOID unused) {
     while (g_watch_running) {
         if (g_h_wake) WaitForSingleObject(g_h_wake, 400); else Sleep(400);
         if (!g_watch_running) break;
+        sink_control_tick();
         if (!g_sink.engaged) { failures = 0; continue; }
         sink_watch_share_tick();
 
@@ -659,6 +660,7 @@ static DWORD WINAPI watch_thread(LPVOID unused) {
 static DWORD WINAPI setup_thread(LPVOID unused) {
     (void)unused;
     log_line("=== nexsink attached ===");
+    sink_control_create();
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
     IMMDeviceEnumerator *e = NULL;

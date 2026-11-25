@@ -1994,6 +1994,90 @@ static void test_idle_release_gives_device_back(void) {
     printf("PASS idle release: long pause gives the device back, resume takes it again\n");
 }
 
+/* Control block: the host's "close exclusive" switches a running exclusive
+   stream to shared at once and keeps it there; "exclusive again" lets the
+   next resume go back. The state the host reads follows the device side. */
+static void test_control_block_share_and_back(void) {
+    HRESULT (*saved)(const char *) = g_rebuild_device;
+    int saved_auto = g_auto_shared, saved_idle = g_idle_release_ms;
+    NexControl *saved_block = g_ctl_block;
+    NexControl block;
+    memset(&block, 0, sizeof(block));
+    block.magic = NEX_CONTROL_MAGIC;
+    block.version = NEX_CONTROL_VERSION;
+    block.size = sizeof(block);
+    g_ctl_block = &block;
+    HandoffClient client = { handoff_vtbl, 1 };
+    prepare_ring();
+    reset_patches();
+    mock_rebuild_setup();
+    g_sink.owner = &client;
+    g_sink.engaged = 1;
+    g_sink.out_rate = 48000;
+    memset(&g_fake_clock, 0, sizeof(g_fake_clock));
+    g_fake_clock.vtbl = g_fake_clock_vtbl;
+    g_fake_clock.ref = 1;
+    g_fake_clock.generation = g_sink.generation;
+    g_sink.proxy_clock = &g_fake_clock;
+    g_sink.gen = NULL;
+    g_rebuild_device = mock_rebuild_device;
+    g_auto_shared = 0;
+    g_idle_release_ms = 0;
+    InterlockedExchange(&g_share_forced, 0);
+    rebuild_calls = 0;
+
+    CHECK(H_Start(&client) == S_OK && rebuild_calls == 1);
+    sink_control_tick();
+    CHECK(block.state == NEX_CONTROL_STATE_EXCLUSIVE && block.playing == 1);
+    CHECK(block.share_forced == 0 && block.heartbeat != 0);
+
+    /* close exclusive while playing: rebuilt now, still playing */
+    LONG seq = nex_control_post(&block, NEX_CONTROL_CMD_SHARE);
+    sink_control_tick();
+    CHECK(block.ack_seq == seq && block.ack_result == S_OK);
+    CHECK(rebuild_calls == 2 && g_sink.started && g_sink.gen);
+    CHECK(g_share_forced == 1 && block.share_forced == 1);
+    CHECK(sink_pick_output(NULL, "test", 0) == NEX_AUDIO_OUTPUT_SHARED);
+    g_sink.gen->shared = 1;              /* what try_shared would have opened */
+    sink_control_tick();
+    CHECK(block.state == NEX_CONTROL_STATE_SHARED);
+    /* a repeated command is harmless: already shared, nothing rebuilt */
+    seq = nex_control_post(&block, NEX_CONTROL_CMD_SHARE);
+    sink_control_tick();
+    CHECK(block.ack_seq == seq && rebuild_calls == 2);
+
+    /* while forced, a pause and resume stays shared */
+    CHECK(H_Stop(&client) == S_OK);
+    CHECK(H_Start(&client) == S_OK);
+    CHECK(rebuild_calls == 2 && g_sink.gen && g_sink.gen->shared);
+
+    /* exclusive again: nothing happens mid-track, the next resume goes back */
+    seq = nex_control_post(&block, NEX_CONTROL_CMD_EXCLUSIVE);
+    sink_control_tick();
+    CHECK(block.ack_seq == seq && g_share_forced == 0 && block.share_forced == 0);
+    CHECK(rebuild_calls == 2 && g_sink.gen->shared);
+    CHECK(H_Stop(&client) == S_OK);
+    CHECK(H_Start(&client) == S_OK);
+    CHECK(rebuild_calls == 3 && g_sink.gen && !g_sink.gen->shared);
+    CHECK(H_Stop(&client) == S_OK);
+    sink_control_tick();
+    CHECK(block.state == NEX_CONTROL_STATE_EXCLUSIVE && block.playing == 0);
+
+    /* an unknown command is acknowledged with an error, not applied */
+    seq = nex_control_post(&block, 77);
+    sink_control_tick();
+    CHECK(block.ack_seq == seq && block.ack_result == E_INVALIDARG);
+
+    g_rebuild_device = saved;
+    sink_teardown_controlled();
+    sink_control_tick();
+    CHECK(block.state == NEX_CONTROL_STATE_IDLE);
+    g_ctl_block = saved_block;
+    g_auto_shared = saved_auto;
+    g_idle_release_ms = saved_idle;
+    printf("PASS control block: close exclusive now, stay shared, back at the next resume\n");
+}
+
 /* Between the abandonment in Stop and the rebuild in the next Start there is
    no device clock. The client keeps polling it; an error there reads as "the
    track ended", so the last position is reported instead. */
@@ -2896,6 +2980,7 @@ int main(void) {
     test_lifecycle_stress();
     test_start_rebuilds_abandoned_generation();
     test_idle_release_gives_device_back();
+    test_control_block_share_and_back();
     test_clock_holds_position_while_generation_abandoned();
     DeleteCriticalSection(&g_lock);
     DeleteCriticalSection(&g_control);

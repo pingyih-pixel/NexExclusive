@@ -37,6 +37,7 @@
 #include <math.h>
 #include <avrt.h>
 #include "../tools/nexaudiolink.h"
+#include "../tools/nexcontrol.h"
 #include "audio_policy.h"
 
 /* ---- vtable slots ------------------------------------------------------- */

@@ -160,11 +160,20 @@ static IMMDevice *sink_resolve_device(int keep_bound, int quiet) {
     return dev;
 }
 
+/* Set by the host (CMD_SHARE: the listener chose "close exclusive" in the
+   prompt, or from the tray). While set, every device side opens shared, and
+   a shared one never goes back to exclusive on its own. */
+static volatile LONG g_share_forced;
+
 /* How to open the device side about to be built on dev. reclaim is set when
    the device was given back during a pause: with auto_shared off the stream
    still takes it exclusively (the listener pressed play), but the log says
    whose sound that cuts off so the panel can explain it. */
 static int sink_pick_output(IMMDevice *dev, const char *reason, int reclaim) {
+    if (InterlockedCompareExchange(&g_share_forced, 0, 0)) {
+        log_line("output(%s): shared, exclusive closed by the listener", reason);
+        return NEX_AUDIO_OUTPUT_SHARED;
+    }
     if (!g_auto_shared && !reclaim) return NEX_AUDIO_OUTPUT_EXCLUSIVE;
     OthersScan s;
     sink_scan_others(dev, &s);
@@ -248,6 +257,7 @@ static int sink_end_shared_if_quiet(const char *reason) {
     /* Only a resume: the first Start of a stream that was just opened shared
        has nothing new to decide. */
     if (!g_sink.pause_token) return 0;
+    if (InterlockedCompareExchange(&g_share_forced, 0, 0)) return 0;
     /* auto_shared switched off while a shared stream exists: back to
        exclusive without asking anyone. */
     int mode = NEX_AUDIO_OUTPUT_EXCLUSIVE;
@@ -266,4 +276,82 @@ static int sink_end_shared_if_quiet(const char *reason) {
     g_sink.gen = NULL;
     log_line("output(%s): leaving shared output, rebuilding exclusive", reason);
     return 1;
+}
+
+/* ---- control block (tools/nexcontrol.h) ---------------------------------- */
+static NexControl *g_ctl_block;
+static HANDLE g_ctl_map;
+/* Defined with the endpoint code (sink_endpoint.inc); a test swaps it. */
+static HRESULT (*g_rebuild_device)(const char *reason);
+
+/* Created once at attach; a host that predates the control block simply never
+   opens it. */
+static void sink_control_create(void) {
+    WCHAR name[64];
+    nex_control_name(name, 64, GetCurrentProcessId());
+    g_ctl_map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+                                   sizeof(NexControl), name);
+    if (!g_ctl_map) { log_line("control: mapping failed %lu", GetLastError()); return; }
+    g_ctl_block = (NexControl *)MapViewOfFile(g_ctl_map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(NexControl));
+    if (!g_ctl_block) { log_line("control: view failed %lu", GetLastError()); return; }
+    memset(g_ctl_block, 0, sizeof(*g_ctl_block));
+    g_ctl_block->version = NEX_CONTROL_VERSION;
+    g_ctl_block->size = sizeof(NexControl);
+    g_ctl_block->pid = GetCurrentProcessId();
+    MemoryBarrier();
+    g_ctl_block->magic = NEX_CONTROL_MAGIC;
+    log_line("control: block ready (%ls)", name);
+}
+
+/* CMD_SHARE while exclusive takes effect at once: the drain thread stops, the
+   device side is rebuilt shared on the same endpoint, and the client keeps its
+   stream and timeline (the same path a pause-time rebuild takes). The control
+   lock is held for the switch, so a client GetBuffer waits tens of
+   milliseconds instead of being told its stream broke. */
+static HRESULT sink_apply_control(LONG cmd) {
+    if (cmd == NEX_CONTROL_CMD_EXCLUSIVE) {
+        if (InterlockedExchange(&g_share_forced, 0))
+            log_line("control: exclusive allowed again; the next resume returns to it");
+        return S_OK;
+    }
+    if (cmd != NEX_CONTROL_CMD_SHARE) return E_INVALIDARG;
+    int was = InterlockedExchange(&g_share_forced, 1);
+    HRESULT hr = S_OK;
+    EnterCriticalSection(&g_control);
+    if (g_sink.engaged && g_sink.gen && !g_sink.gen->shared) {
+        LONG was_started = g_sink.started;
+        sink_stop();
+        g_sink.started = was_started;
+        hr = g_rebuild_device("listener closed exclusive");
+        log_line("control: closed exclusive while %s -> 0x%08lX",
+                 was_started ? "playing" : "paused", (unsigned long)hr);
+    } else if (!was) {
+        log_line("control: exclusive closed; the next device side opens shared");
+    }
+    LeaveCriticalSection(&g_control);
+    return hr;
+}
+
+static LONG sink_control_state(void) {
+    if (!g_sink.engaged) return NEX_CONTROL_STATE_IDLE;
+    if (!g_sink.gen) return NEX_CONTROL_STATE_RELEASED;
+    return g_sink.gen->shared ? NEX_CONTROL_STATE_SHARED : NEX_CONTROL_STATE_EXCLUSIVE;
+}
+
+/* Watch thread, every poll: apply a pending command, then publish. The state
+   is read under the control lock but never waited for: while an engage or a
+   rebuild holds it, the previous state stays published one more poll. */
+static void sink_control_tick(void) {
+    NexControl *c = g_ctl_block;
+    if (!c) return;
+    LONG seq = 0;
+    LONG cmd = nex_control_pending(c, &seq);
+    if (seq) nex_control_ack(c, seq, sink_apply_control(cmd));
+    if (TryEnterCriticalSection(&g_control)) {
+        InterlockedExchange(&c->state, sink_control_state());
+        InterlockedExchange(&c->playing, g_sink.engaged && g_sink.started);
+        LeaveCriticalSection(&g_control);
+    }
+    InterlockedExchange(&c->share_forced, InterlockedCompareExchange(&g_share_forced, 0, 0));
+    InterlockedExchange(&c->heartbeat, (LONG)GetTickCount());
 }
