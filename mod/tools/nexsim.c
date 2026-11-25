@@ -471,9 +471,23 @@ static void scenario_share(int *late) {
     printf("share: another process is sounding when the track starts\n");
     char busy_app[MAX_PATH];
     int busy_before = other_app_sounding(busy_app, sizeof(busy_app));
-    HANDLE other = spawn_child("--child-play 4", 1);
+    /* A previous scenario may have left its stream paused, and a paused
+       exclusive stream still owns the device until idle_release_ms gives it
+       back; the helper would get DEVICE_IN_USE and exit. Start it once the
+       device is free, and wait until it is actually audible. */
+    HANDLE other = NULL;
+    char heard[MAX_PATH];
+    for (int attempt = 0; attempt < 4 && !busy_before; attempt++) {
+        if (other) CloseHandle(other);
+        other = spawn_child("--child-play 4", 1);
+        for (int i = 0; i < 15 && !other_app_sounding(heard, sizeof(heard)); i++) Sleep(100);
+        if (other_app_sounding(heard, sizeof(heard))) break;
+        Sleep(700);                      /* not yet free: try again */
+    }
+    if (busy_before && !other) other = spawn_child("--child-play 4", 1);
     CHECK(other != NULL, "could not start the other process");
-    Sleep(1200);
+    CHECK(busy_before || other_app_sounding(heard, sizeof(heard)),
+          "the other process never became audible");
     if (!track_open(&t, f)) { track_close(&t); if (other) CloseHandle(other); return; }
     track_start(&t);
     track_play(&t, g_seconds, late);
@@ -607,6 +621,7 @@ int main(int argc, char **argv) {
         if (all || !strcmp(s, "seek")) scenario_seek(&late);
         if (!strcmp(s, "release")) scenario_release(&late);
         if (!strcmp(s, "share")) scenario_share(&late);
+        if (late) printf("  (client event silent for 500 ms: %d time(s) so far)\n", late);
         if (!all && strcmp(s, "handoff") && strcmp(s, "format") && strcmp(s, "pause") &&
             strcmp(s, "seek") && strcmp(s, "release") && strcmp(s, "share"))
             printf("unknown scenario %s\n", s);
