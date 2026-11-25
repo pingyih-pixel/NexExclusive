@@ -188,4 +188,45 @@ static NEX_HDR_UNUSED int nex_smtc_poll(NexSmtc *s, NexSmtcEntry *out, int max) 
     return count;
 }
 
+/* Ask every session whose app id contains `match` (case-insensitive) to pause:
+   TryPauseAsync, slot 11 after TryPlayAsync. The asynchronous result is not
+   awaited; the next poll shows whether it took. Returns how many were asked. */
+static NEX_HDR_UNUSED int nex_smtc_pause_matching(NexSmtc *s, const WCHAR *match) {
+    if (!s->manager || !match || !*match) return 0;
+    void *view = NULL;
+    if (FAILED(nex_rt_get(s->manager, 7, &view)) || !view) return 0;
+    UINT32 n = 0;
+    int asked = 0;
+    size_t mlen = wcslen(match);
+    if (SUCCEEDED(nex_rt_get(view, 7, &n))) {
+        for (UINT32 i = 0; i < n; i++) {
+            void *raw = NULL;
+            if (FAILED(((HRESULT (STDMETHODCALLTYPE *)(void *, UINT32, void **))NEX_VT(view)[6])
+                       (view, i, &raw)) || !raw) continue;
+            void *session = nex_rt_as(raw, &NEX_IID_SMTC_SESSION);
+            nex_rt_release(raw);
+            if (!session) continue;
+            NexHString app = NULL;
+            int hit = 0;
+            if (SUCCEEDED(nex_rt_get(session, 6, &app)) && app) {
+                UINT32 len = 0;
+                const WCHAR *p = s->raw_buffer(app, &len);
+                for (UINT32 k = 0; p && !hit && k + mlen <= len; k++)
+                    hit = _wcsnicmp(p + k, match, mlen) == 0;
+                s->delete_string(app);
+            }
+            if (hit) {
+                void *op = NULL;
+                if (SUCCEEDED(nex_rt_get(session, 11, &op)) && op) {   /* TryPauseAsync */
+                    nex_rt_release(op);
+                    asked++;
+                }
+            }
+            nex_rt_release(session);
+        }
+    }
+    nex_rt_release(view);
+    return asked;
+}
+
 #endif

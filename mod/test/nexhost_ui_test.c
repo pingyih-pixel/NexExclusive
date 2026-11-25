@@ -337,23 +337,26 @@ static void test_conflict_policy(void) {
     CHECK(wcscmp(name, L"SomeVideoApp") == 0);
     nex_app_display_name(L"", name, 64);
     CHECK(name[0] != 0);
-    /* not a music player: exclusive closes at once, playing or paused */
-    CHECK(nex_conflict_action(NEX_APP_OTHER, 0, 1, 0) == NEX_CONFLICT_SHARE);
-    CHECK(nex_conflict_action(NEX_APP_OTHER, 0, 0, 500) == NEX_CONFLICT_SHARE);
-    CHECK(nex_conflict_action(NEX_APP_SELF, 1, 0, 99999) == NEX_CONFLICT_NONE);
-    /* another player: the client first by default; it waits while the client
-       plays and until the client has been paused for the activity window */
-    CHECK(nex_conflict_action(NEX_APP_PLAYER, 0, 1, 0) == NEX_CONFLICT_WAIT);
-    CHECK(nex_conflict_action(NEX_APP_PLAYER, 0, 0, 14999) == NEX_CONFLICT_WAIT);
-    CHECK(nex_conflict_action(NEX_APP_PLAYER, 0, 0, 15000) == NEX_CONFLICT_SHARE);
-    CHECK(nex_conflict_action(NEX_APP_PLAYER, 1, 1, 0) == NEX_CONFLICT_SHARE);
+    /* every other application is asked about, unless an answer was remembered */
+    CHECK(nex_conflict_action(NEX_APP_OTHER, NEX_REMEMBER_NONE) == NEX_CONFLICT_ASK);
+    CHECK(nex_conflict_action(NEX_APP_PLAYER, NEX_REMEMBER_NONE) == NEX_CONFLICT_ASK);
+    CHECK(nex_conflict_action(NEX_APP_PLAYER, NEX_REMEMBER_YIELD) == NEX_CONFLICT_YIELD);
+    CHECK(nex_conflict_action(NEX_APP_OTHER, NEX_REMEMBER_KEEP) == NEX_CONFLICT_KEEP);
+    CHECK(nex_conflict_action(NEX_APP_SELF, NEX_REMEMBER_YIELD) == NEX_CONFLICT_NONE);
+    /* apps.cfg: exact app ids, the last line for an app wins */
+    const char *cfg = "yield=Spotify.exe\r\nkeep=Chrome.ABC\nyield=Chrome.ABCD\nkeep=Spotify.exe\n";
+    CHECK(nex_remembered_choice(cfg, "Spotify.exe") == NEX_REMEMBER_KEEP);
+    CHECK(nex_remembered_choice(cfg, "Chrome.ABC") == NEX_REMEMBER_KEEP);
+    CHECK(nex_remembered_choice(cfg, "Chrome.ABCD") == NEX_REMEMBER_YIELD);
+    CHECK(nex_remembered_choice(cfg, "Chrome") == NEX_REMEMBER_NONE);
+    CHECK(nex_remembered_choice(NULL, "x") == NEX_REMEMBER_NONE);
     /* back to exclusive: only after the others stopped for the quiet window,
        never for a manual close from the tray */
     CHECK(nex_conflict_release_due(0, 0, 10000) == 1);
     CHECK(nex_conflict_release_due(0, 0, 9999) == 0);
     CHECK(nex_conflict_release_due(0, 1, 99999) == 0);
     CHECK(nex_conflict_release_due(1, 0, 99999) == 0);
-    printf("PASS conflict policy: browsers close exclusive at once, players follow the takeover rule\n");
+    printf("PASS conflict policy: every other app is asked about, remembered answers act directly\n");
 }
 
 int main(void) {

@@ -573,7 +573,8 @@ static void scenario_conflict(int *late) {
         for (int k = 0; k < n && !posted; k++) {
             int kind = nex_app_kind(e[k].app);
             if (e[k].status != NEX_SMTC_PLAYING) continue;
-            if (nex_conflict_action(kind, 0, c->playing, 0) != NEX_CONFLICT_SHARE) continue;
+            /* the host would ask here; this tool answers yes */
+            if (nex_conflict_action(kind, NEX_REMEMBER_NONE) != NEX_CONFLICT_ASK) continue;
             nex_control_post(c, NEX_CONTROL_CMD_SHARE);
             wcsncpy(who, e[k].app, 159);
             posted = 1;
