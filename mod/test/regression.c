@@ -1994,6 +1994,61 @@ static void test_idle_release_gives_device_back(void) {
     printf("PASS idle release: long pause gives the device back, resume takes it again\n");
 }
 
+/* A shared stream returns to exclusive when the next same-format track
+   starts, and the generation token stays: the previous track's objects are
+   still accepted, so its last packet is not thrown away. */
+static void test_shared_track_boundary(void) {
+    HRESULT (*saved)(const char *) = g_rebuild_device;
+    int saved_auto = g_auto_shared;
+    HandoffClient client = { handoff_vtbl, 1 };
+    prepare_ring();
+    reset_patches();
+    mock_rebuild_setup();
+    g_sink.owner = &client;
+    g_sink.engaged = 1;
+    g_sink.out_rate = 48000;
+    memset(&g_fake_clock, 0, sizeof(g_fake_clock));
+    g_fake_clock.vtbl = g_fake_clock_vtbl;
+    g_fake_clock.ref = 1;
+    g_fake_clock.generation = g_sink.generation;
+    g_sink.proxy_clock = &g_fake_clock;
+    g_rebuild_device = mock_rebuild_device;
+    g_auto_shared = 0;
+    InterlockedExchange(&g_share_forced, 0);
+    rebuild_calls = 0;
+    SinkGen *g = mock_gen();
+    g->shared = 1;
+    g_sink.started = 1;
+    UINT64 token = g_sink.generation;
+    FakeObj *render = g_sink.proxy_render;
+
+    /* forced shared: the track change keeps it */
+    InterlockedExchange(&g_share_forced, 1);
+    g_sink.handoff_pending_start = 1;
+    CHECK(H_Start(&client) == S_OK);
+    CHECK(rebuild_calls == 0 && g_sink.gen == g);
+
+    /* not forced: rebuilt exclusive at the boundary, token unchanged */
+    InterlockedExchange(&g_share_forced, 0);
+    g_sink.handoff_pending_start = 1;
+    CHECK(H_Start(&client) == S_OK);
+    CHECK(rebuild_calls == 1 && g_sink.gen && !g_sink.gen->shared);
+    CHECK(g_sink.started == 1);
+    CHECK(g_sink.generation == token && render->generation == token);
+    CHECK(g_fake_clock.generation == token);
+
+    /* already exclusive: a later track change does nothing */
+    g_sink.handoff_pending_start = 1;
+    CHECK(H_Start(&client) == S_OK);
+    CHECK(rebuild_calls == 1);
+
+    g_sink.started = 0;
+    g_rebuild_device = saved;
+    g_auto_shared = saved_auto;
+    sink_teardown_controlled();
+    printf("PASS shared track boundary: back to exclusive at the next track, old packets still accepted\n");
+}
+
 /* nexlogfile.h: a log past the limit becomes <name>.1, and the day marker is
    written once per day (and again after a rotation). */
 static void test_log_rotation(void) {
@@ -3022,6 +3077,7 @@ int main(void) {
     test_idle_release_gives_device_back();
     test_control_block_share_and_back();
     test_log_rotation();
+    test_shared_track_boundary();
     test_clock_holds_position_while_generation_abandoned();
     DeleteCriticalSection(&g_lock);
     DeleteCriticalSection(&g_control);

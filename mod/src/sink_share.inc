@@ -278,11 +278,49 @@ static int sink_end_shared_if_quiet(const char *reason) {
     return 1;
 }
 
+/* Defined with the endpoint code (sink_endpoint.inc); a test swaps it. */
+static HRESULT (*g_rebuild_device)(const char *reason);
+
+/* A same-format track change while playing (sink_handoff_same_format) is how
+   NetEase moves between most tracks - 640 of 676 changes in one real log - so
+   a shared stream that waited for a pause would stay shared for an album.
+   This runs when the successor client starts: if nobody else is to be heard
+   and the listener did not force shared, the device side is rebuilt
+   exclusive while the drain keeps its ring. The rebuild normally moves the
+   stream to a new generation token, which would reject the previous track's
+   last packet still in flight; here the token is put back afterwards, so
+   both clients' objects stay valid and the tail plays out. What is heard is
+   the device reopening at the track boundary. Returns the rebuild's result,
+   S_FALSE when nothing was due. */
+static HRESULT sink_shared_track_boundary(void) {
+    if (!g_sink.gen || !g_sink.gen->shared || !g_sink.started) return S_FALSE;
+    if (InterlockedCompareExchange(&g_share_forced, 0, 0)) return S_FALSE;
+    int mode = NEX_AUDIO_OUTPUT_EXCLUSIVE;
+    if (g_auto_shared) {
+        IMMDevice *dev = sink_resolve_device(1, 1);
+        if (!dev) return S_FALSE;
+        mode = sink_pick_output(dev, "track change", 0);
+        dev->lpVtbl->Release(dev);
+    }
+    if (mode == NEX_AUDIO_OUTPUT_SHARED) return S_FALSE;
+    UINT64 token = g_sink.generation;
+    sink_stop();
+    g_sink.started = 1;
+    HRESULT hr = g_rebuild_device("track change: back to exclusive");
+    if (SUCCEEDED(hr) && g_sink.engaged && g_sink.proxy_render && g_sink.proxy_clock) {
+        g_sink.generation = token;
+        g_sink.proxy_render->generation = token;
+        g_sink.proxy_clock->generation = token;
+    }
+    log_line("output(track change): left shared output at the track boundary -> 0x%08lX",
+             (unsigned long)hr);
+    return hr;
+}
+
 /* ---- control block (tools/nexcontrol.h) ---------------------------------- */
 static NexControl *g_ctl_block;
 static HANDLE g_ctl_map;
-/* Defined with the endpoint code (sink_endpoint.inc); a test swaps it. */
-static HRESULT (*g_rebuild_device)(const char *reason);
+
 
 /* Created once at attach; a host that predates the control block simply never
    opens it. */

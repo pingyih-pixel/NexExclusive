@@ -182,6 +182,8 @@ static HRESULT STDMETHODCALLTYPE H_Start(void *self) {
 
     if (g_sink.handoff_pending_start) {
         g_sink.handoff_pending_start = 0;
+        /* a shared stream goes back to exclusive at this track boundary */
+        sink_shared_track_boundary();
         LeaveCriticalSection(&g_control);
         /* The successor's client contract has started successfully; the
            generation's drain thread was already running, so starting it a

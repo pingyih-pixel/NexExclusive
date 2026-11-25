@@ -3784,9 +3784,8 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
     NexControl *blk = NULL;
     DWORD blk_pid = 0, open_tick = 0, cfg_tick = 0;
     int auto_shared = 0;
-    int yielded = 0;                       /* 是这条线程（按用户的回答）关闭的独占 */
-    DWORD others_last_playing = 0;
-    WCHAR asked[160] = L"";                /* 这一轮播放已经问过 / 处理过的应用 */
+    NexConflictState cs;                   /* 判断逻辑的状态（nexconflict.h） */
+    memset(&cs, 0, sizeof(cs));
 
     for (;;) {
         Sleep(500);
@@ -3803,7 +3802,7 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
             if (blk) UnmapViewOfFile(blk);
             if (map) CloseHandle(map);
             blk = NULL; map = NULL; blk_pid = pid; open_tick = 0;
-            yielded = 0; asked[0] = 0;
+            memset(&cs, 0, sizeof(cs));
             InterlockedExchange(&g_ctl_manual, 0);
         }
         if (!blk && pid && (!open_tick || now - open_tick > 2000)) {
@@ -3844,7 +3843,7 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
         } else if (req == 2) {
             nex_control_post(blk, NEX_CONTROL_CMD_EXCLUSIVE);
             InterlockedExchange(&g_ctl_manual, 0);
-            yielded = 0;
+            cs.yielded = 0;
             host_log("托盘：恢复独占（下次继续播放时生效）");
         }
 
@@ -3887,42 +3886,43 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
             continue;
         }
         smtc_failures = 0;
-        int others_playing = 0, asked_still_playing = 0;
+        NexConflictApp apps[24];
         for (int i = 0; i < n; i++) {
-            int kind = nex_app_kind(e[i].app);
-            if (kind == NEX_APP_SELF || e[i].status != NEX_SMTC_PLAYING) continue;
-            others_playing = 1;
-            if (asked[0] && wcscmp(asked, e[i].app) == 0) { asked_still_playing = 1; continue; }
-            if (!auto_shared || answer || yielded || blk->share_forced || g_prompt_busy ||
-                blk->state != NEX_CONTROL_STATE_EXCLUSIVE) continue;
+            apps[i].app = e[i].app;
+            apps[i].kind = nex_app_kind(e[i].app);
+            apps[i].playing = e[i].status == NEX_SMTC_PLAYING;
+            apps[i].remembered = apps[i].kind != NEX_APP_SELF && apps[i].playing
+                               ? remembered_for(e[i].app) : NEX_REMEMBER_NONE;
+        }
+        NexConflictStep step;
+        nex_conflict_step(&cs, apps, n, auto_shared,
+                          blk->state == NEX_CONTROL_STATE_EXCLUSIVE, blk->share_forced,
+                          InterlockedCompareExchange(&g_ctl_manual, 0, 0),
+                          g_prompt_busy || answer, now, &step);
+        int pick = step.ask >= 0 ? step.ask : step.act >= 0 ? step.act : step.kept;
+        if (pick >= 0) {
             WCHAR shown[64];
             char shown8[192], app8[480];
-            nex_app_display_name(e[i].app, shown, 64);
+            nex_app_display_name(e[pick].app, shown, 64);
             wide_to_utf8(shown, shown8, sizeof(shown8));
-            wide_to_utf8(e[i].app, app8, sizeof(app8));
-            wcsncpy(asked, e[i].app, 159);
-            asked[159] = 0;
-            asked_still_playing = 1;
-            int act = nex_conflict_action(kind, remembered_for(e[i].app));
-            if (act == NEX_CONFLICT_YIELD) {
+            wide_to_utf8(e[pick].app, app8, sizeof(app8));
+            if (step.act >= 0) {
                 host_log("%s（%s）开始播放；按记住的选择让出", shown8, app8);
-                act_kind = kind; act_yes = 1;
-                wcsncpy(act_app, e[i].app, 159); act_app[159] = 0;
+                act_kind = apps[pick].kind; act_yes = 1;
+                wcsncpy(act_app, e[pick].app, 159); act_app[159] = 0;
                 wcsncpy(act_shown, shown, 63); act_shown[63] = 0;
-            } else if (act == NEX_CONFLICT_KEEP) {
+            } else if (step.kept >= 0) {
                 host_log("%s（%s）开始播放；按记住的选择保持独占", shown8, app8);
-            } else if (act == NEX_CONFLICT_ASK) {
+            } else {
                 host_log("%s（%s）开始播放，询问用户", shown8, app8);
-                wcsncpy(g_prompt_app, e[i].app, 159); g_prompt_app[159] = 0;
+                wcsncpy(g_prompt_app, e[pick].app, 159); g_prompt_app[159] = 0;
                 wcsncpy(g_prompt_shown, shown, 63); g_prompt_shown[63] = 0;
-                g_prompt_kind = kind;
+                g_prompt_kind = apps[pick].kind;
                 InterlockedExchange(&g_prompt_busy, 1);
                 HANDLE t = CreateThread(NULL, 0, prompt_thread, NULL, 0, NULL);
                 if (t) CloseHandle(t); else InterlockedExchange(&g_prompt_busy, 0);
             }
         }
-        /* 问过的应用停下了：它下次再开始播放时重新判断 */
-        if (asked[0] && !asked_still_playing && !g_prompt_busy) asked[0] = 0;
 
         if (act_yes && !blk->share_forced) {
             char shown8[192];
@@ -3947,18 +3947,15 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
             }
             text[255] = 0;
             tray_notify(L"已关闭独占", text);
-            yielded = 1;
+            cs.yielded = 1;
         } else if (answer && !act_yes) {
             char shown8[192];
             wide_to_utf8(act_shown, shown8, sizeof(shown8));
             host_log("保持独占（%s 这次不出声）", shown8);
         }
 
-        if (others_playing) others_last_playing = now;
-        if (yielded && nex_conflict_release_due(g_ctl_manual, others_playing,
-                                                others_last_playing ? now - others_last_playing : ~0ul)) {
+        if (step.release) {
             nex_control_post(blk, NEX_CONTROL_CMD_EXCLUSIVE);
-            yielded = 0;
             host_log("别的应用已停止播放 %lu 秒，下次继续播放时回到独占",
                      NEX_CONFLICT_QUIET_MS / 1000);
         }

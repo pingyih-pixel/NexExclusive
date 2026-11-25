@@ -384,10 +384,70 @@ static void test_tray_tip_text(void) {
     printf("PASS tray tip: exclusive with format and path, shared, released, idle\n");
 }
 
+/* One watcher poll at a time: when the host asks, acts, stays quiet, lets go. */
+static void test_conflict_step(void) {
+    NexConflictState st;
+    NexConflictStep out;
+    memset(&st, 0, sizeof(st));
+    NexConflictApp apps[2] = {
+        { L"cloudmusic.exe", NEX_APP_SELF, 1, NEX_REMEMBER_NONE },
+        { L"Chrome.X", NEX_APP_OTHER, 1, NEX_REMEMBER_NONE },
+    };
+    /* feature off, or the client not exclusive: nothing */
+    nex_conflict_step(&st, apps, 2, 0, 1, 0, 0, 0, 1000, &out);
+    CHECK(out.ask < 0 && out.act < 0 && !out.release);
+    nex_conflict_step(&st, apps, 2, 1, 0, 0, 0, 0, 1000, &out);
+    CHECK(out.ask < 0);
+    /* the client playing itself never counts */
+    apps[1].playing = 0;
+    nex_conflict_step(&st, apps, 2, 1, 1, 0, 0, 0, 1000, &out);
+    CHECK(out.ask < 0 && out.act < 0);
+    /* Chrome starts: ask once, not again while it keeps playing */
+    apps[1].playing = 1;
+    nex_conflict_step(&st, apps, 2, 1, 1, 0, 0, 0, 2000, &out);
+    CHECK(out.ask == 1);
+    nex_conflict_step(&st, apps, 2, 1, 1, 0, 0, 1, 2500, &out);   /* prompt open */
+    CHECK(out.ask < 0);
+    nex_conflict_step(&st, apps, 2, 1, 1, 0, 0, 0, 3000, &out);   /* answered no */
+    CHECK(out.ask < 0);
+    /* it stops and starts again: a new episode, asked again */
+    apps[1].playing = 0;
+    nex_conflict_step(&st, apps, 2, 1, 1, 0, 0, 0, 4000, &out);
+    CHECK(st.asked[0] == 0);
+    apps[1].playing = 1;
+    nex_conflict_step(&st, apps, 2, 1, 1, 0, 0, 0, 5000, &out);
+    CHECK(out.ask == 1);
+    /* a remembered yes acts at once, a remembered no only logs */
+    memset(&st, 0, sizeof(st));
+    apps[1].remembered = NEX_REMEMBER_YIELD;
+    nex_conflict_step(&st, apps, 2, 1, 1, 0, 0, 0, 6000, &out);
+    CHECK(out.act == 1 && out.ask < 0);
+    memset(&st, 0, sizeof(st));
+    apps[1].remembered = NEX_REMEMBER_KEEP;
+    nex_conflict_step(&st, apps, 2, 1, 1, 0, 0, 0, 6000, &out);
+    CHECK(out.kept == 1 && out.ask < 0 && out.act < 0);
+    /* after yielding: exclusive comes back 10 s after the others stopped */
+    memset(&st, 0, sizeof(st));
+    st.yielded = 1;
+    nex_conflict_step(&st, apps, 2, 1, 0, 1, 0, 0, 10000, &out);  /* still playing */
+    CHECK(!out.release);
+    apps[1].playing = 0;
+    nex_conflict_step(&st, apps, 2, 1, 0, 1, 0, 0, 19000, &out);
+    CHECK(!out.release);
+    nex_conflict_step(&st, apps, 2, 1, 0, 1, 0, 0, 20000, &out);
+    CHECK(out.release && !st.yielded);
+    /* a manual close from the tray is never lifted */
+    st.yielded = 1;
+    nex_conflict_step(&st, apps, 2, 1, 0, 1, 1, 0, 99000, &out);
+    CHECK(!out.release && st.yielded);
+    printf("PASS conflict step: ask once per episode, remembered answers, release after quiet\n");
+}
+
 int main(void) {
     test_find_child_pids();
     test_conflict_policy();
     test_tray_tip_text();
+    test_conflict_step();
     test_ui_event_exists();
     test_ui_tracker_resets_on_new_main_pid();
     test_ui_child_already_loaded_is_not_reinjected();
