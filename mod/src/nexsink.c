@@ -39,6 +39,7 @@
 #include "../tools/nexaudiolink.h"
 #include "../tools/nexcontrol.h"
 #include "audio_policy.h"
+#include "nexlogfile.h"
 
 /* ---- vtable slots ------------------------------------------------------- */
 #define SLOT_QI              0

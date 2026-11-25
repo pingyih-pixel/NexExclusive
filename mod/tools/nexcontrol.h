@@ -28,7 +28,7 @@
 #include <wchar.h>
 
 #define NEX_CONTROL_MAGIC   0x4C52544358454E00ull   /* "\0NEXCTRL" */
-#define NEX_CONTROL_VERSION 1
+#define NEX_CONTROL_VERSION 2   /* 2: format, path and endpoint name */
 
 enum {
     NEX_CONTROL_CMD_NONE      = 0,
@@ -56,6 +56,13 @@ typedef struct NexControl {
     volatile LONG ack_seq;        /* = cmd_seq once applied */
     volatile LONG ack_result;     /* HRESULT of the last command */
     volatile LONG heartbeat;      /* GetTickCount of the module's last update */
+    /* v2: what is playing, so the host can show it without reading sink.log.
+       Written by the module only; valid while state != IDLE. */
+    volatile LONG in_rate, in_bits, in_float;      /* the client's PCM */
+    volatile LONG out_rate, out_bits, out_container, out_float;   /* the device side */
+    volatile LONG path;           /* NEX_AUDIO_PATH_* (audio_policy.h); -1 unknown */
+    volatile LONG remote;         /* the separate audio host owns the device */
+    char          endpoint[128];  /* friendly name, UTF-8 */
     UINT32        reserved[16];
 } NexControl;
 

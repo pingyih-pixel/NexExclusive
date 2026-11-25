@@ -141,4 +141,62 @@ static NEX_HDR_UNUSED int nex_conflict_release_due(int manual, int others_playin
     return !manual && !others_playing && others_quiet_ms >= NEX_CONFLICT_QUIET_MS;
 }
 
+/* ---- one poll of the host's watcher, as a pure step ----------------------
+   The host thread (nexhost.c conflict_thread) gathers the inputs - the
+   module's control block, the media sessions, apps.cfg - calls this once per
+   poll and carries out what comes back. Keeping the decisions here is what
+   lets the host test cover them without a device, a client or a prompt. */
+typedef struct {
+    const wchar_t *app;
+    int kind;            /* NEX_APP_* */
+    int playing;         /* media session status is Playing */
+    int remembered;      /* NEX_REMEMBER_* for this app */
+} NexConflictApp;
+
+typedef struct {
+    int yielded;                  /* the host closed exclusive on the listener's answer */
+    int heard;                    /* another app has been seen playing */
+    unsigned long last_playing;   /* when one was last seen playing */
+    wchar_t asked[160];           /* the app this playing episode was decided for */
+} NexConflictState;
+
+typedef struct {
+    int ask;             /* index into apps: show the prompt for it, or -1 */
+    int act;             /* index: a remembered yes, act on it now, or -1 */
+    int kept;            /* index: a remembered no (for the log), or -1 */
+    int release;         /* post CMD_EXCLUSIVE: the others have been quiet long enough */
+} NexConflictStep;
+
+static NEX_HDR_UNUSED void nex_conflict_step(NexConflictState *st, const NexConflictApp *apps, int n,
+                                             int auto_shared, int client_exclusive,
+                                             int share_forced, int manual, int busy,
+                                             unsigned long now, NexConflictStep *out) {
+    out->ask = out->act = out->kept = -1;
+    out->release = 0;
+    int others_playing = 0, asked_playing = 0;
+    for (int i = 0; i < n; i++) {
+        if (apps[i].kind == NEX_APP_SELF || !apps[i].playing) continue;
+        others_playing = 1;
+        if (st->asked[0] && wcscmp(st->asked, apps[i].app) == 0) { asked_playing = 1; continue; }
+        if (!auto_shared || st->yielded || share_forced || busy || !client_exclusive) continue;
+        if (out->ask >= 0 || out->act >= 0 || out->kept >= 0) continue;   /* one per poll */
+        int act = nex_conflict_action(apps[i].kind, apps[i].remembered);
+        if (act == NEX_CONFLICT_NONE) continue;
+        wcsncpy(st->asked, apps[i].app, 159);
+        st->asked[159] = 0;
+        asked_playing = 1;
+        if (act == NEX_CONFLICT_ASK) out->ask = i;
+        else if (act == NEX_CONFLICT_YIELD) out->act = i;
+        else out->kept = i;
+    }
+    /* the decided app stopped: its next start is a new episode */
+    if (st->asked[0] && !asked_playing && !busy) st->asked[0] = 0;
+    if (others_playing) { st->heard = 1; st->last_playing = now; }
+    if (st->yielded && nex_conflict_release_due(manual, others_playing,
+                                                st->heard ? now - st->last_playing : ~0ul)) {
+        out->release = 1;
+        st->yielded = 0;
+    }
+}
+
 #endif

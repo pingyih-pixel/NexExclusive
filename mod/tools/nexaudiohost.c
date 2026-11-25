@@ -13,6 +13,7 @@
 #include <wchar.h>
 #include <string.h>
 #include <stdarg.h>
+#include "../src/nexlogfile.h"
 #include "nexaudiolink.h"
 
 #define NEX_AUDIO_EOS_TIMEOUT_MS 5000u
@@ -47,10 +48,13 @@ static wchar_t g_host_log_path[MAX_PATH];
 
 static void host_log(const char *format, ...) {
     if (!g_host_log_path[0]) return;
+    static NexLogDay day;
+    int rotated = nex_log_rotate_w(g_host_log_path, NEX_LOG_MAX_BYTES);
     FILE *fp = _wfopen(g_host_log_path, L"a");
     if (!fp) return;
     SYSTEMTIME now;
     GetLocalTime(&now);
+    nex_log_day_marker(fp, &day, &now, rotated);
     fprintf(fp, "%02u:%02u:%02u.%03u [%lu] ", now.wHour, now.wMinute, now.wSecond,
             now.wMilliseconds, (unsigned long)GetCurrentProcessId());
     va_list args;

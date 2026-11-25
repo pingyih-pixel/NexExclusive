@@ -113,6 +113,8 @@ static HANDLE g_log_event;
 static volatile LONG g_log_async;
 static int g_log_enabled = 1;          /* hook.cfg log=0 turns file logging off */
 
+/* last calendar day written to sink.log (nexlogfile.h) */
+static NexLogDay g_log_day;
 static DWORD WINAPI log_writer(LPVOID unused) {
     static char batch[LOG_QUEUE_LINES][LOG_LINE_BYTES];
     (void)unused;
@@ -126,8 +128,10 @@ static DWORD WINAPI log_writer(LPVOID unused) {
         g_logq.dropped = 0;
         LeaveCriticalSection(&g_log_qlock);
         if (!n && !dropped) continue;
+        int rotated = nex_log_rotate_a(g_log, NEX_LOG_MAX_BYTES);
         FILE *f = fopen(g_log, "a");
         if (!f) continue;
+        { SYSTEMTIME day; GetLocalTime(&day); nex_log_day_marker(f, &g_log_day, &day, rotated); }
         for (int i = 0; i < n; i++) fputs(batch[i], f);
         if (dropped) fprintf(f, "log: %lu line(s) dropped (queue full)\n", (unsigned long)dropped);
         fclose(f);
@@ -164,8 +168,9 @@ static void log_line(const char *fmt, ...) {
         LeaveCriticalSection(&g_log_qlock);
         SetEvent(g_log_event);
     } else {
+        int rotated = nex_log_rotate_a(g_log, NEX_LOG_MAX_BYTES);
         FILE *f = fopen(g_log, "a");
-        if (f) { fputs(line, f); fclose(f); }
+        if (f) { nex_log_day_marker(f, &g_log_day, &st, rotated); fputs(line, f); fclose(f); }
         LeaveCriticalSection(&g_log_qlock);
     }
     OutputDebugStringA(buf);
@@ -340,6 +345,8 @@ typedef struct {
 
     UINT32             fade_total;      /* frames in the opening ramp */
     UINT32             fade_left;
+
+    char               ep_name[128];    /* friendly name of the endpoint in use */
 
     /* idle release: which pause the timer belongs to, and since when */
     UINT64             pause_token;     /* set at Stop; 0 = not paused / timer void */
@@ -623,8 +630,11 @@ static void load_config(void) {
     }
     /* audiohost selects who owns the endpoint. It is independent of hifi:
        converted streams use the same SRC and quantiser before entering the host. */
-    /* Shared output is never a product path. Keep reading the legacy key so old
-       configs remain parseable, then force the invariant here. */
+    /* shared_fallback - a silent downgrade to shared when exclusive fails - is
+       never a product path. Keep reading the legacy key so old configs remain
+       parseable, then force the invariant here. Shared output the listener
+       chose (auto_shared, the prompt, the tray) is a different thing: it is
+       opt-in and always shown as shared (sink_share.inc). */
     g_shared_fallback = 0;
     g_cfg_epoch++;
     {

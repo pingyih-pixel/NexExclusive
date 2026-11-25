@@ -597,6 +597,12 @@ static HRESULT sink_retarget_endpoint(const char *reason, int keep_bound) {
     }
 
     UINT64 key = endpoint_hash(dev);
+    {
+        int hw = -1;
+        char name[192] = "";
+        ep_describe(dev, name, sizeof(name), &hw);
+        if (name[0]) snprintf(g_sink.ep_name, sizeof(g_sink.ep_name), "%s", name);
+    }
     int rate = 0, cont = 0, valid = 0, fl = 0, tried = 0;
     if (sink_pick_output(dev, reason, g_sink.idle_released) == NEX_AUDIO_OUTPUT_SHARED) {
         hr = try_shared(gen, dev, g_sink.in_channels, &rate, &cont, &valid, &fl);
@@ -790,6 +796,7 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     char ep_name[192] = "";
     int  ep_hw = -1;
     ep_describe(dev, ep_name, sizeof(ep_name), &ep_hw);
+    snprintf(g_sink.ep_name, sizeof(g_sink.ep_name), "%s", ep_name);
     /* remember the input format */
     g_sink.in_rate      = (int)fmt->nSamplesPerSec;
     g_sink.in_channels  = fmt->nChannels;
