@@ -33,6 +33,7 @@
 #endif
 
 #include <wchar.h>
+#include <stdio.h>
 #include <wctype.h>
 #include <string.h>
 
@@ -132,6 +133,51 @@ static NEX_HDR_UNUSED int nex_remembered_choice(const char *text, const char *ap
         line = nl + 1;
     }
     return found;
+}
+
+/* Every remembered app with its final answer, in the order first seen, for
+   the main window's list. Returns how many (at most max). */
+typedef struct { char app[200]; int choice; } NexRememberedApp;
+
+static NEX_HDR_UNUSED int nex_apps_parse(const char *text, NexRememberedApp *out, int max) {
+    int n = 0;
+    for (const char *line = text; line && *line; ) {
+        const char *nl = strchr(line, '\n');
+        size_t len = nl ? (size_t)(nl - line) : strlen(line);
+        while (len && (line[len - 1] == '\r' || line[len - 1] == ' ')) len--;
+        int kind = NEX_REMEMBER_NONE;
+        size_t skip = 0;
+        if (len > 6 && strncmp(line, "yield=", 6) == 0) { kind = NEX_REMEMBER_YIELD; skip = 6; }
+        else if (len > 5 && strncmp(line, "keep=", 5) == 0) { kind = NEX_REMEMBER_KEEP; skip = 5; }
+        size_t alen = len - skip;
+        if (kind && alen > 0 && alen < sizeof(out[0].app)) {
+            int i = 0;
+            while (i < n && !(strlen(out[i].app) == alen && strncmp(out[i].app, line + skip, alen) == 0)) i++;
+            if (i == n && n < max) {
+                memcpy(out[n].app, line + skip, alen);
+                out[n].app[alen] = 0;
+                n++;
+            }
+            if (i < n) out[i].choice = kind;
+        }
+        if (!nl) break;
+        line = nl + 1;
+    }
+    return n;
+}
+
+/* apps.cfg text for a list (one line per app, no duplicates). */
+static NEX_HDR_UNUSED size_t nex_apps_render(const NexRememberedApp *apps, int n, char *out, size_t cap) {
+    size_t used = 0;
+    if (cap) out[0] = 0;
+    for (int i = 0; i < n; i++) {
+        if (apps[i].choice != NEX_REMEMBER_YIELD && apps[i].choice != NEX_REMEMBER_KEEP) continue;
+        int w = snprintf(out + used, cap - used, "%s=%s\n",
+                         apps[i].choice == NEX_REMEMBER_YIELD ? "yield" : "keep", apps[i].app);
+        if (w < 0 || (size_t)w >= cap - used) break;
+        used += (size_t)w;
+    }
+    return used;
 }
 
 /* After the host closed exclusive for an application: lift the command once

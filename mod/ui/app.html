@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NexExclusive</title>
+<style>
+/* NexExclusive 主窗口（docs/superpowers/specs/2026-11-26-main-window-design.md）。
+   Windows 11 设置的骨架：左侧导航 + 一张张设置横条，原生样式的控件，系统强调蓝。
+   数据全部来自同源的本机配置服务 127.0.0.1:9334。 */
+:root {
+  --bg: #f3f3f3; --card: #fbfbfb; --card-b: rgba(0,0,0,.065); --hover: rgba(0,0,0,.035);
+  --text: #1b1b1b; --sub: #5f5f5f; --faint: #8a8a8a;
+  --nav-on: rgba(0,0,0,.055); --accent: #005fb8; --accent-fg: #ffffff; --tile: #e9ecf0;
+  --ctl: #ffffff; --ctl-b: rgba(0,0,0,.11); --ctl-bb: rgba(0,0,0,.2);
+  --ok: #0f7b3f; --ok-bg: #dff3e6; --chg: #9a5b00; --chg-bg: #fdf0d8; --info-bg: #e8f0fa; --info-b: #cfe0f5;
+  --bad: #c42b1c; --knob-off: #5f5f5f; --track-off: #8a8a8a;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #202020; --card: #2b2b2b; --card-b: rgba(255,255,255,.06); --hover: rgba(255,255,255,.04);
+    --text: #ffffff; --sub: #c5c5c5; --faint: #9a9a9a;
+    --nav-on: rgba(255,255,255,.07); --accent: #60cdff; --accent-fg: #000000; --tile: #353535;
+    --ctl: #2d2d2d; --ctl-b: rgba(255,255,255,.09); --ctl-bb: rgba(255,255,255,.14);
+    --ok: #6ccb8f; --ok-bg: #1f3a29; --chg: #f0b14f; --chg-bg: #3a2c12; --info-bg: #1e2a38; --info-b: #2c3e55;
+    --bad: #ff99a4; --knob-off: #cfcfcf; --track-off: #9a9a9a;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box }
+html, body { height: 100% }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  -webkit-font-smoothing: antialiased; user-select: none }
+.app { display: flex; height: 100% }
+
+/* navigation */
+nav { width: 248px; flex: none; padding: 12px 8px; display: flex; flex-direction: column; gap: 3px }
+.me { display: flex; gap: 12px; align-items: center; padding: 6px 12px 18px }
+.me .tile { width: 44px; height: 44px; border-radius: 22px; background: var(--tile); display: flex; align-items: center; justify-content: center; flex: none }
+.me b { display: block; font-size: 14px; font-weight: 600 }
+.me span { font-size: 12px; color: var(--sub) }
+.ni { position: relative; display: flex; align-items: center; gap: 14px; height: 36px; padding: 0 12px; border-radius: 5px; color: var(--text); text-decoration: none; cursor: default }
+.ni:hover { background: var(--hover) }
+.ni.on { background: var(--nav-on) }
+.ni.on::before { content: ""; position: absolute; left: 0; top: 10px; width: 3px; height: 16px; border-radius: 2px; background: var(--accent) }
+svg.ic { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; flex: none }
+.tile svg.ic { width: 22px; height: 22px; stroke: var(--accent); stroke-width: 1.5 }
+
+/* pages */
+main { flex: 1; overflow-y: auto; padding: 4px 32px 32px 20px; min-width: 0 }
+h1 { font: 600 28px/1.2 "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", sans-serif; margin: 6px 0 18px }
+.lbl { font-size: 14px; font-weight: 600; margin: 20px 0 8px 2px }
+.cards { display: flex; flex-direction: column; gap: 3px }
+.card { background: var(--card); border: 1px solid var(--card-b); border-radius: 6px; min-height: 64px; padding: 10px 18px; display: flex; align-items: center; gap: 16px }
+.card.tall { padding: 16px 18px }
+.card > svg.ic { width: 20px; height: 20px }
+.card .t { min-width: 0 }
+.card .d { font-size: 12px; color: var(--sub); margin-top: 1px }
+.grow { flex: 1 }
+.note { font-size: 12px; color: var(--sub); margin: 8px 2px 0 }
+.hidden { display: none !important }
+
+/* controls */
+.tog { display: inline-flex; align-items: center; gap: 12px; background: none; border: 0; color: var(--text); font: inherit; font-size: 13.5px; padding: 4px; cursor: default; white-space: nowrap }
+.tog i { width: 40px; height: 20px; border-radius: 10px; background: var(--accent); position: relative; flex: none; transition: background .12s }
+.tog i::after { content: ""; position: absolute; right: 4px; top: 4px; width: 12px; height: 12px; border-radius: 50%; background: var(--accent-fg); transition: right .12s }
+.tog[aria-checked="false"] i { background: transparent; box-shadow: inset 0 0 0 1px var(--track-off) }
+.tog[aria-checked="false"] i::after { right: 24px; background: var(--knob-off) }
+.tog:focus-visible, select:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
+select { appearance: none; height: 32px; min-width: 168px; max-width: 320px; padding: 0 32px 0 12px; border-radius: 4px;
+  background: var(--ctl) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23888' stroke-width='1.3'/%3E%3C/svg%3E") no-repeat right 12px center;
+  border: 1px solid var(--ctl-b); border-bottom-color: var(--ctl-bb); color: var(--text); font: inherit; font-size: 13.5px }
+.btn { height: 32px; padding: 0 14px; border-radius: 4px; background: var(--ctl); border: 1px solid var(--ctl-b); border-bottom-color: var(--ctl-bb);
+  color: var(--text); font: inherit; font-size: 13.5px; white-space: nowrap; cursor: default }
+.btn:hover:not(:disabled) { background: var(--hover) }
+.btn:disabled { color: var(--faint) }
+.btn.pri { background: var(--accent); color: var(--accent-fg); border-color: var(--accent) }
+.btn.danger { color: var(--bad) }
+.tag { display: inline-flex; align-items: center; height: 22px; padding: 0 9px; border-radius: 11px; font-size: 12px; white-space: nowrap }
+.tag.ok { background: var(--ok-bg); color: var(--ok) }
+.tag.chg { background: var(--chg-bg); color: var(--chg) }
+.tag.n { background: var(--tile); color: var(--sub) }
+
+/* overview */
+.status .tile { width: 48px; height: 48px; border-radius: 10px; background: var(--tile); display: flex; align-items: center; justify-content: center; flex: none }
+.status .tile svg.ic { width: 24px; height: 24px; stroke: var(--accent); stroke-width: 1.5 }
+.status .big { font-size: 20px; font-weight: 600 }
+.chain { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; min-width: 0 }
+.st .k { font-size: 12px; color: var(--sub) }
+.st .v { font-size: 15px; font-weight: 600; margin-top: 2px; white-space: nowrap; font-variant-numeric: tabular-nums }
+.arr { color: var(--faint); font-size: 18px }
+.link { color: var(--accent); cursor: default }
+.details { display: grid; grid-template-columns: max-content 1fr; gap: 4px 24px; font-size: 12.5px; padding: 12px 18px; margin-top: 3px;
+  background: var(--card); border: 1px solid var(--card-b); border-radius: 6px }
+.details dt { color: var(--sub) } .details dd { margin: 0; font-variant-numeric: tabular-nums }
+
+/* info bar (saved, apply now) */
+.bar { display: flex; align-items: center; gap: 12px; background: var(--info-bg); border: 1px solid var(--info-b); border-radius: 6px; padding: 10px 14px; margin-top: 16px; font-size: 13px }
+.appi { width: 28px; height: 28px; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 12px; font-weight: 700; flex: none }
+.x { background: none; border: 0; color: var(--faint); font-size: 16px; padding: 4px 6px; cursor: default }
+.x:hover { color: var(--text) }
+.empty { padding: 18px; color: var(--sub); font-size: 13px }
+.intro { font-size: 13px; line-height: 1.7; color: var(--sub); margin-top: 4px; max-width: 560px }
+.offline { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); background: var(--card); border: 1px solid var(--card-b); border-radius: 6px; padding: 8px 14px; font-size: 13px; box-shadow: 0 6px 20px rgba(0,0,0,.18) }
+</style>
+</head>
+<body>
+<div class="app">
+  <nav aria-label="页面">
+    <div class="me"><div class="tile" id="me-ic"></div><div><b id="me-state">正在连接…</b><span id="me-fmt">&nbsp;</span></div></div>
+    <a class="ni" href="#overview" data-page="overview"><svg class="ic" viewBox="0 0 16 16"><path d="M2.5 6.5 8 2l5.5 4.5V14h-11z"/></svg>概览</a>
+    <a class="ni" href="#output" data-page="output"><svg class="ic" viewBox="0 0 16 16"><path d="M2 10V6h3l4-3v10l-4-3z"/><path d="M11.5 5.5a3.5 3.5 0 0 1 0 5"/></svg>输出</a>
+    <a class="ni" href="#apps" data-page="apps"><svg class="ic" viewBox="0 0 16 16"><rect x="1.5" y="3" width="6" height="10" rx="1"/><rect x="8.5" y="3" width="6" height="10" rx="1"/></svg>和别的应用</a>
+    <a class="ni" href="#player" data-page="player"><svg class="ic" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="9" rx="1.5"/><path d="M6 14h4"/></svg>播放器</a>
+    <a class="ni" href="#about" data-page="about"><svg class="ic" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 7.5V11M8 5h.01"/></svg>关于</a>
+  </nav>
+
+  <main>
+    <!-- ===== 概览 ===== -->
+    <section id="page-overview">
+      <h1>概览</h1>
+      <div class="cards"><div class="card tall status">
+        <div class="tile" id="ov-ic"></div>
+        <div class="t"><div class="big" id="ov-state">正在连接…</div><div class="d" id="ov-sub">&nbsp;</div></div>
+        <div class="grow"></div>
+        <button class="btn" id="ov-share" type="button">暂时改为共享</button>
+      </div></div>
+
+      <div class="lbl">信号链</div>
+      <div class="cards"><div class="card tall">
+        <div class="chain">
+          <div class="st"><div class="k">音源</div><div class="v" id="ch-src">—</div></div>
+          <div class="arr">→</div>
+          <div class="st"><div class="k">网易云</div><div class="v" id="ch-cli">—</div></div>
+          <div class="arr">→</div>
+          <div class="st"><div class="k" id="ch-dev-k">设备</div><div class="v" id="ch-dev">—</div></div>
+        </div>
+        <div class="grow"></div>
+        <span class="tag n" id="ch-tag">—</span>
+      </div></div>
+      <div class="note"><span id="ch-why">&nbsp;</span> <span class="link" id="ch-more" role="button" tabindex="0">详细参数 ›</span></div>
+      <dl class="details hidden" id="ch-details"></dl>
+
+      <div class="lbl">常用</div>
+      <div class="cards">
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M3 12V8h3.5L11 4.5v11L6.5 12z"/></svg><div class="t">独占输出</div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" data-cfg="enable"><span>关</span><i></i></button></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><rect x="5" y="4" width="3" height="12" rx="1"/><rect x="12" y="4" width="3" height="12" rx="1"/></svg><div class="t">暂停后让出声卡<div class="d">让别的应用也能出声</div></div><div class="grow"></div><select data-cfg="idle_release_ms"></select></div>
+      </div>
+    </section>
+
+    <!-- ===== 输出 ===== -->
+    <section id="page-output" class="hidden">
+      <h1>输出</h1>
+      <div class="cards">
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M3 12V8h3.5L11 4.5v11L6.5 12z"/></svg><div class="t">独占输出<div class="d">绕过系统混音器，直接连到声卡</div></div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" data-cfg="enable"><span>关</span><i></i></button></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M4 6h12M4 10h8M4 14h10"/></svg><div class="t">输出策略<div class="d">设备不支持音源格式时怎么办</div></div><div class="grow"></div><select data-cfg="hifi"></select></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><rect x="3" y="5" width="14" height="10" rx="2"/><path d="M7 15v2M13 15v2"/></svg><div class="t">输出设备<div class="d">选定的设备不可用时，回到网易云自己的设备</div></div><div class="grow"></div><select id="endpoint"></select></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><rect x="3" y="3" width="6" height="14" rx="1"/><rect x="11" y="3" width="6" height="14" rx="1"/></svg><div class="t">独立音频宿主<div class="d">由单独的进程占用声卡，网易云卡顿时不容易断音</div></div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" data-cfg="audiohost"><span>关</span><i></i></button></div>
+      </div>
+      <div class="lbl">格式</div>
+      <div class="cards">
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M3 10h2l2-5 3 10 2-6 2 3h3"/></svg><div class="t">采样率</div><div class="grow"></div><select data-cfg="rate"></select></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><rect x="3" y="6" width="14" height="8" rx="1.5"/><path d="M6 9v2M9 9v2"/></svg><div class="t">缓冲<div class="d">爆音或欠载时可以加大</div></div><div class="grow"></div><select data-cfg="buffer"></select></div>
+      </div>
+      <div class="lbl">设备不接受音源格式时</div>
+      <div class="cards">
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M4 7h7M4 13h12M14 4l3 3-3 3"/></svg><div class="t">允许转换<div class="d">重采样或换位深后继续独占输出</div></div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" data-cfg="compat"><span>关</span><i></i></button></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M3 15c3 0 3-10 7-10s4 10 7 10"/></svg><div class="t">重采样策略</div><div class="grow"></div><select data-cfg="src_prefer"></select></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M3 10h1M6 7v6M9 9v2M12 5v10M15 8v4"/></svg><div class="t">抖动<div class="d">只在降位深时有意义</div></div><div class="grow"></div><select data-cfg="dither"></select></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M3 16 17 4"/></svg><div class="t">开头淡入<div class="d">减少起播爆音，但会改动开头几毫秒</div></div><div class="grow"></div><select data-cfg="fade_ms"></select></div>
+      </div>
+    </section>
+
+    <!-- ===== 和别的应用 ===== -->
+    <section id="page-apps" class="hidden">
+      <h1>和别的应用</h1>
+      <div id="now-wrap" class="hidden">
+        <div class="lbl" style="margin-top:0">现在</div>
+        <div class="cards" id="now-list"></div>
+      </div>
+      <div class="lbl" id="rules-lbl" style="margin-top:0">规则</div>
+      <div class="cards">
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><rect x="5" y="4" width="3" height="12" rx="1"/><rect x="12" y="4" width="3" height="12" rx="1"/></svg><div class="t">暂停后让出声卡<div class="d">网易云暂停时也占着声卡，暂停够久就还给系统</div></div><div class="grow"></div><select data-cfg="idle_release_ms"></select></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M4 5h12v8H9l-4 3v-3H4z"/></svg><div class="t">别的应用想出声时问我<div class="d">音乐播放器问要不要交出独占，其他应用问要不要一起播放</div></div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" data-cfg="auto_shared"><span>关</span><i></i></button></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M3 7h14M3 13h14"/></svg><div class="t">暂时改为共享<div class="d">检测不到的应用想出声时手动用；关掉后下次继续播放时回到独占</div></div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" id="manual-share"><span>关</span><i></i></button></div>
+      </div>
+      <div class="lbl">记住的选择</div>
+      <div class="cards" id="apps-list"></div>
+    </section>
+
+    <!-- ===== 播放器 ===== -->
+    <section id="page-player" class="hidden">
+      <h1>播放器</h1>
+      <div class="cards">
+        <div class="card tall" style="align-items:flex-start">
+          <div class="appi" style="background:#d33a31;width:40px;height:40px;border-radius:9px;font-size:15px">云</div>
+          <div class="t"><div style="font-size:16px;font-weight:600">网易云音乐</div><div class="d" id="pl-ver">—</div>
+            <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap" id="pl-tags"></div></div>
+          <div class="grow"></div><button class="btn" type="button" data-action="open_client">打开网易云</button>
+        </div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M5 4l10 6-10 6z"/></svg><div class="t">打开 NexExclusive 时一起启动网易云<div class="d">关掉后只在网易云自己打开时接管</div></div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" data-host="launchClient"><span>关</span><i></i></button></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="12" rx="1.5"/><path d="M3 8h14"/></svg><div class="t">在网易云里显示设置面板<div class="d">下次启动网易云时生效</div></div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" data-host="clientPanel"><span>关</span><i></i></button></div>
+      </div>
+      <div class="note">以后支持更多播放器时，每个播放器在这里有一张这样的卡片。</div>
+    </section>
+
+    <!-- ===== 关于 ===== -->
+    <section id="page-about" class="hidden">
+      <h1>关于</h1>
+      <div class="cards">
+        <div class="card tall" style="align-items:flex-start;gap:18px">
+          <div class="status"><div class="tile" style="width:56px;height:56px;border-radius:12px"><svg class="ic" viewBox="0 0 24 24"><path d="M4 15V9h4l5-4v14l-5-4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/></svg></div></div>
+          <div class="t" style="flex:1">
+            <div style="font-size:18px;font-weight:600">NexExclusive</div>
+            <div class="intro">让音乐播放器绕过 Windows 混音器，以独占模式把声音原样送到声卡；需要时也能和别的应用一起出声。</div>
+            <div class="d" style="margin-top:8px" id="ab-ver">—</div>
+          </div>
+          <button class="btn" type="button" disabled title="更新方式还没定，暂不可用">检查更新</button>
+        </div>
+      </div>
+      <div class="lbl">启动与窗口</div>
+      <div class="cards">
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7"/><path d="M10 6v4l3 2"/></svg><div class="t">开机自动启动<div class="d">开机后只在托盘里，不弹出这个窗口</div></div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" data-host="autostart"><span>关</span><i></i></button></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="10" rx="1.5"/><path d="M13 16h4"/></svg><div class="t">关闭窗口时缩到托盘<div class="d">关掉的话，关闭窗口就退出 NexExclusive</div></div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" data-host="closeToTray"><span>关</span><i></i></button></div>
+      </div>
+      <div class="lbl">诊断与高级</div>
+      <div class="cards">
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M5 3h7l3 3v11H5z"/><path d="M8 10h5M8 13h5"/></svg><div class="t">日志<div class="d" id="ab-logs">—</div></div><div class="grow"></div><button class="btn" type="button" data-action="open_logs">打开日志</button><button class="btn" type="button" data-action="open_folder">打开程序目录</button></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M10 3l6 3v4c0 4-3 6-6 7-3-1-6-3-6-7V6z"/></svg><div class="t">备用面板通道（调试端口 9333）<div class="d">网易云里的面板加载不上时才需要；开着时本机其他程序能操作网易云页面。重启 NexExclusive 后生效</div></div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" data-host="cdp"><span>关</span><i></i></button></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M5 6h10l-1 11H6zM8 6V4h4v2"/></svg><div class="t">卸载 NexExclusive<div class="d" id="un-d">停止接管、删除程序和设置；网易云本身不受影响</div></div><div class="grow"></div>
+          <button class="btn danger" type="button" id="un-ask">卸载</button>
+          <button class="btn hidden" type="button" id="un-no">取消</button>
+          <button class="btn danger hidden" type="button" id="un-yes">确认卸载</button></div>
+      </div>
+    </section>
+
+    <div class="bar hidden" id="saved"><span style="color:var(--accent)">ⓘ</span><span id="saved-text">已保存，从下一首开始生效。</span><span class="grow"></span><button class="btn pri" type="button" id="apply-now">立即应用到当前曲目</button></div>
+  </main>
+</div>
+<div class="offline hidden" id="offline">连不上 NexExclusive 的本机服务，正在重试…</div>
+
+<script>
+(function () {
+  'use strict';
+  var API = '/api/';
+  var cfg = null, host = null, status = null, endpoints = null, apps = null;
+  var $ = function (id) { return document.getElementById(id); };
+
+  /* ---- options, same values as the in-client panel (mod/ui/panel.js) ---- */
+  var OPTIONS = {
+    hifi: [[0, '原率优先（推荐）'], [1, '严格原样']],
+    idle_release_ms: [[0, '不让出'], [10000, '10 秒后'], [30000, '30 秒后'], [60000, '1 分钟后'], [300000, '5 分钟后']],
+    rate: [[0, '跟随音源'], [44100, '44.1 kHz'], [48000, '48 kHz'], [88200, '88.2 kHz'], [96000, '96 kHz']],
+    buffer: [[0, '自动'], [512, '512 帧'], [1024, '1024 帧'], [2048, '2048 帧'], [4096, '4096 帧']],
+    src_prefer: [[0, '带宽优先'], [1, '整数比优先']],
+    dither: [[0, '关闭'], [1, '开启'], [2, '自动']],
+    fade_ms: [[0, '关闭'], [3, '3 ms'], [5, '5 ms'], [10, '10 ms'], [20, '20 ms']]
+  };
+
+  var ICON = {
+    exclusive: '<svg class="ic" viewBox="0 0 24 24"><path d="M4 15V9h4l5-4v14l-5-4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></svg>',
+    shared: '<svg class="ic" viewBox="0 0 24 24"><rect x="3" y="6" width="7" height="12" rx="1.5"/><rect x="14" y="6" width="7" height="12" rx="1.5"/></svg>',
+    idle: '<svg class="ic" viewBox="0 0 24 24"><path d="M4 15V9h4l5-4v14l-5-4z"/><path d="M17 10l4 4M21 10l-4 4"/></svg>'
+  };
+
+  function req(method, path, body) {
+    var opt = { method: method, cache: 'no-store' };
+    if (body !== undefined) { opt.headers = { 'Content-Type': 'application/json' }; opt.body = JSON.stringify(body); }
+    return fetch(API + path, opt).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+        return j;
+      });
+    });
+  }
+
+  function rateText(hz) {
+    if (!hz) return '';
+    var k = hz / 1000;
+    return (k % 1 ? k.toFixed(1) : String(k)) + ' kHz';
+  }
+  function fmt(rate, bits, isFloat) {
+    if (!rate) return '—';
+    return rateText(rate) + ' / ' + bits + ' bit' + (isFloat ? ' 浮点' : '');
+  }
+
+  /* ---- controls ---- */
+  function fillSelects() {
+    document.querySelectorAll('select[data-cfg]').forEach(function (sel) {
+      var list = OPTIONS[sel.dataset.cfg] || [];
+      sel.innerHTML = '';
+      list.forEach(function (o) { var op = document.createElement('option'); op.value = o[0]; op.textContent = o[1]; sel.appendChild(op); });
+    });
+  }
+  function setToggle(el, on) {
+    el.setAttribute('aria-checked', on ? 'true' : 'false');
+    el.querySelector('span').textContent = on ? '开' : '关';
+  }
+
+  function renderCfg() {
+    if (!cfg) return;
+    document.querySelectorAll('[data-cfg]').forEach(function (el) {
+      var v = Number(cfg[el.dataset.cfg] || 0);
+      if (el.tagName === 'SELECT') {
+        if (!Array.prototype.some.call(el.options, function (o) { return Number(o.value) === v; })) {
+          var op = document.createElement('option'); op.value = v; op.textContent = String(v); el.appendChild(op);
+        }
+        el.value = String(v);
+      } else setToggle(el, v !== 0);
+    });
+  }
+
+  function saveCfg(key, value) {
+    var next = Object.assign({}, cfg); next[key] = value;
+    return req('POST', 'cfg', next).then(function (j) { cfg = j; renderCfg(); showSaved(); })
+      .catch(function (e) { showSaved('没能保存：' + e.message); renderCfg(); });
+  }
+
+  var savedTimer = 0;
+  function showSaved(text) {
+    $('saved-text').textContent = text || '已保存，从下一首开始生效。';
+    $('apply-now').classList.toggle('hidden', !!text);
+    $('saved').classList.remove('hidden');
+    clearTimeout(savedTimer);
+    savedTimer = setTimeout(function () { $('saved').classList.add('hidden'); }, 12000);
+  }
+
+  document.addEventListener('change', function (e) {
+    var el = e.target;
+    if (el.tagName === 'SELECT' && el.dataset.cfg) saveCfg(el.dataset.cfg, Number(el.value));
+  });
+  document.addEventListener('click', function (e) {
+    var t = e.target.closest('button');
+    if (!t) return;
+    if (t.dataset.cfg) saveCfg(t.dataset.cfg, t.getAttribute('aria-checked') === 'true' ? 0 : 1);
+    else if (t.dataset.host) {
+      var body = {}; body[t.dataset.host] = t.getAttribute('aria-checked') === 'true' ? 0 : 1;
+      req('POST', 'host', body).then(loadHost);
+    } else if (t.dataset.action) req('POST', 'action', { action: t.dataset.action });
+  });
+
+  $('apply-now').addEventListener('click', function () {
+    $('saved-text').textContent = '正在重开当前曲目…';
+    req('POST', 'restart', {}).then(function () { showSaved('已按新设置重开当前曲目。'); })
+      .catch(function () { showSaved('没有正在播放的曲目，下一首开始生效。'); });
+  });
+
+  $('ov-share').addEventListener('click', function () {
+    req('POST', 'control', { action: status && status.manualShared ? 'exclusive' : 'share' }).then(pollSoon);
+  });
+  $('manual-share').addEventListener('click', function () {
+    req('POST', 'control', { action: status && status.manualShared ? 'exclusive' : 'share' }).then(pollSoon);
+  });
+  $('ch-more').addEventListener('click', function () { $('ch-details').classList.toggle('hidden'); });
+  $('ch-more').addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') $('ch-details').classList.toggle('hidden'); });
+
+  $('endpoint').addEventListener('change', function () {
+    req('POST', 'endpoint', { id: this.value }).then(function (j) { endpoints = j; renderEndpoints(); showSaved(); });
+  });
+
+  $('un-ask').addEventListener('click', function () {
+    $('un-d').textContent = '确定要卸载吗？会停止 NexExclusive 和网易云，删除程序与设置。';
+    ['un-ask'].forEach(function (id) { $(id).classList.add('hidden'); });
+    ['un-no', 'un-yes'].forEach(function (id) { $(id).classList.remove('hidden'); });
+  });
+  $('un-no').addEventListener('click', function () {
+    $('un-d').textContent = '停止接管、删除程序和设置；网易云本身不受影响';
+    $('un-ask').classList.remove('hidden');
+    ['un-no', 'un-yes'].forEach(function (id) { $(id).classList.add('hidden'); });
+  });
+  $('un-yes').addEventListener('click', function () { req('POST', 'action', { action: 'uninstall' }); });
+
+  /* ---- status ---- */
+  var PATH = {
+    native: ['原样', 'ok', '数值原样送到设备，没有任何改动。'],
+    repacked: ['原样数值', 'ok', '数值不变，只是换了容器宽度。'],
+    depth: ['位深转换', 'chg', '采样率没变，只换了位深。'],
+    converted: ['重采样', 'chg', '设备不接受这个采样率，转换后送出。'],
+    shared: ['经系统混音器', 'chg', '共享输出由 Windows 混音，不是原样。']
+  };
+
+  function renderStatus() {
+    var s = status || {}, c = s.control || {}, cl = s.client || {};
+    var state = c.ok ? c.state : (cl.pid ? 'idle' : 'none');
+    var title = { exclusive: '独占输出中', shared: '共享输出中', released: '已让出声卡', idle: '等待播放', none: '网易云没有运行' }[state] || '等待播放';
+    var icon = state === 'shared' ? ICON.shared : (state === 'exclusive' ? ICON.exclusive : ICON.idle);
+    var dev = c.endpoint || (typeof s.endpoint === 'string' ? s.endpoint : '');
+    var others = (s.othersPlaying || []).map(function (o) { return o.name; });
+    var sub = [];
+    if (dev) sub.push(dev);
+    if (cl.pid) sub.push('网易云音乐');
+    if (state === 'shared' && others.length) sub.push('和 ' + others.join('、') + ' 一起播放');
+    else if (state === 'released') sub.push('暂停中，继续播放时重新接管');
+    else if (c.ok) sub.push(c.playing ? '正在播放' : '已暂停');
+    $('ov-state').textContent = title;
+    $('ov-sub').textContent = sub.join(' · ') || ' ';
+    $('ov-ic').innerHTML = icon; $('me-ic').innerHTML = icon;
+    $('me-state').textContent = title;
+    $('me-fmt').textContent = c.ok && c.outRate ? (state === 'shared' ? fmt(c.inRate, c.inBits, false) : rateText(c.outRate) + ' · ' + c.outBits + ' bit') : ' ';
+    $('ov-share').textContent = s.manualShared ? '恢复独占' : '暂时改为共享';
+    $('ov-share').disabled = !cl.pid;
+    setToggle($('manual-share'), !!s.manualShared);
+
+    /* signal chain */
+    var srcFmt = s.source_status === 'observed' || s.source_rate
+      ? ((s.source_format || '') + ' ' + rateText(s.source_rate) + (s.source_valid_bits ? ' / ' + s.source_valid_bits + ' bit' : '')).trim()
+      : '未取得';
+    $('ch-src').textContent = srcFmt || '未取得';
+    $('ch-cli').textContent = c.ok ? fmt(c.inRate, c.inBits, c.inFloat) : '—';
+    $('ch-dev-k').textContent = state === 'shared' ? '设备（共享）' : '设备（独占）';
+    $('ch-dev').textContent = c.ok && state !== 'released' ? (state === 'shared' ? '系统混音格式' : fmt(c.outRate, c.outBits, c.outFloat)) : '—';
+    var p = PATH[c.path] || null;
+    var tag = $('ch-tag');
+    tag.className = 'tag ' + (p ? p[1] : 'n');
+    tag.textContent = p ? p[0] : '—';
+    $('ch-why').textContent = p ? p[2] : (cl.pid ? '开始播放后显示。' : '网易云运行并开始播放后显示。');
+    var rows = [];
+    if (c.ok) {
+      rows.push(['网易云输出', fmt(c.inRate, c.inBits, c.inFloat)]);
+      if (state !== 'shared') rows.push(['设备格式', fmt(c.outRate, c.outBits, c.outFloat) + (c.outContainer && c.outContainer !== c.outBits ? '（' + c.outBits + ' in ' + c.outContainer + '）' : '')]);
+      rows.push(['输出方式', c.remote ? '独立音频宿主' : '网易云进程内']);
+    }
+    if (s.source_bitrate_kbps) rows.push(['音源码率', s.source_bitrate_kbps + ' kbps']);
+    if (s.underrunEvents !== undefined) rows.push(['欠载', s.underrunEvents + ' 次']);
+    $('ch-details').innerHTML = rows.map(function (r) { return '<dt>' + r[0] + '</dt><dd>' + r[1] + '</dd>'; }).join('') || '<dt>暂无</dt><dd></dd>';
+
+    /* who else is sounding */
+    var now = s.othersPlaying || [];
+    $('now-wrap').classList.toggle('hidden', !now.length);
+    $('rules-lbl').style.marginTop = now.length ? '' : '0';
+    $('now-list').innerHTML = now.map(function (o) {
+      return '<div class="card"><div class="appi" style="background:' + appColor(o.name) + '">' + esc(o.name.charAt(0)) + '</div>' +
+        '<div class="t">' + esc(o.name) + '<div class="d">' + (c.forcedShared ? '正在播放 · 网易云已改走共享，它停下 10 秒后回到独占' : '正在播放') + '</div></div><div class="grow"></div>' +
+        (c.forcedShared ? '<button class="btn" type="button" data-now="exclusive">回到独占</button>' : '') + '</div>';
+    }).join('');
+
+    /* player */
+    $('pl-ver').textContent = cl.version ? cl.version + (cl.verified ? ' · 已验证' : ' · 未经验证的版本') : (cl.pid ? '版本未知' : '没有运行');
+    var tags = [];
+    tags.push(cl.pid ? '<span class="tag ok">已接管</span>' : '<span class="tag n">没有运行</span>');
+    if (cl.pid) tags.push(cl.panel === 'renderer' || cl.panel === 'cdp' ? '<span class="tag ok">面板已加载</span>' : '<span class="tag n">面板未加载</span>');
+    $('pl-tags').innerHTML = tags.join('');
+  }
+
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest('[data-now]');
+    if (b) req('POST', 'control', { action: 'exclusive' }).then(pollSoon);
+  });
+
+  function esc(t) { return String(t).replace(/[&<>"]/g, function (ch) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]; }); }
+  function appColor(name) {
+    var colors = ['#4285f4', '#1db954', '#6e56cf', '#e8710a', '#0f9d58', '#d93025', '#7a5cff', '#00838f'];
+    var h = 0; for (var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+    return colors[h % colors.length];
+  }
+
+  /* ---- remembered apps ---- */
+  function renderApps() {
+    var list = (apps && apps.apps) || [];
+    if (!list.length) { $('apps-list').innerHTML = '<div class="card empty">还没有记住的应用。弹窗里勾选「记住我的选择」后会出现在这里。</div>'; return; }
+    $('apps-list').innerHTML = list.map(function (a, i) {
+      var yieldLabel = a.kind === 'player' ? '交出独占' : '一起播放';
+      return '<div class="card"><div class="appi" style="background:' + appColor(a.name) + '">' + esc(a.name.charAt(0)) + '</div>' +
+        '<div class="t">' + esc(a.name) + '<div class="d">' + (a.kind === 'player' ? '音乐播放器' : '其他应用') + '</div></div><div class="grow"></div>' +
+        '<select data-app="' + i + '"><option value="yield"' + (a.choice === 'yield' ? ' selected' : '') + '>' + yieldLabel + '</option>' +
+        '<option value="keep"' + (a.choice === 'keep' ? ' selected' : '') + '>保持独占</option></select>' +
+        '<button class="x" type="button" title="忘掉这个应用" data-forget="' + i + '">✕</button></div>';
+    }).join('');
+  }
+  document.addEventListener('change', function (e) {
+    var el = e.target;
+    if (el.dataset && el.dataset.app !== undefined) {
+      var a = apps.apps[Number(el.dataset.app)];
+      req('POST', 'apps', { app: a.app, choice: el.value }).then(loadApps);
+    }
+  });
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest('[data-forget]');
+    if (!b) return;
+    var a = apps.apps[Number(b.dataset.forget)];
+    req('POST', 'apps', { app: a.app, choice: 'forget' }).then(loadApps);
+  });
+
+  /* ---- endpoints, host ---- */
+  function renderEndpoints() {
+    var sel = $('endpoint');
+    sel.innerHTML = '';
+    var follow = document.createElement('option'); follow.value = ''; follow.textContent = '跟随网易云'; sel.appendChild(follow);
+    ((endpoints && endpoints.endpoints) || []).forEach(function (ep) {
+      var op = document.createElement('option'); op.value = ep.id; op.textContent = ep.name || ep.id; sel.appendChild(op);
+    });
+    sel.value = (endpoints && endpoints.current) || '';
+  }
+  function renderHost() {
+    if (!host) return;
+    document.querySelectorAll('[data-host]').forEach(function (el) { setToggle(el, !!host[el.dataset.host]); });
+    $('ab-ver').textContent = '版本 ' + host.version + ' · 构建 ' + host.build;
+    var kb = function (b) { return b < 0 ? '无' : (b > 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB'); };
+    $('ab-logs').textContent = 'sink.log ' + kb(host.logs.sink) + ' · host.log ' + kb(host.logs.host) + '，超过 4 MB 自动轮换';
+  }
+
+  function loadCfg() { return req('GET', 'cfg').then(function (j) { cfg = j; renderCfg(); }); }
+  function loadHost() { return req('GET', 'host').then(function (j) { host = j; renderHost(); }); }
+  function loadApps() { return req('GET', 'apps').then(function (j) { apps = j; renderApps(); }); }
+  function loadEndpoints() { return req('GET', 'endpoints').then(function (j) { endpoints = j; renderEndpoints(); }); }
+
+  var pollTimer = 0;
+  function poll() {
+    clearTimeout(pollTimer);
+    req('GET', 'status').then(function (j) {
+      status = j; $('offline').classList.add('hidden'); renderStatus();
+    }).catch(function () { $('offline').classList.remove('hidden'); })
+      .then(function () { pollTimer = setTimeout(poll, document.hidden ? 5000 : 1500); });
+  }
+  function pollSoon() { setTimeout(poll, 300); }
+
+  /* ---- pages ---- */
+  var PAGES = ['overview', 'output', 'apps', 'player', 'about'];
+  function route() {
+    var page = (location.hash || '#overview').slice(1);
+    if (PAGES.indexOf(page) < 0) page = 'overview';
+    PAGES.forEach(function (p) { $('page-' + p).classList.toggle('hidden', p !== page); });
+    document.querySelectorAll('.ni').forEach(function (a) { a.classList.toggle('on', a.dataset.page === page); });
+    if (page === 'output') loadEndpoints().catch(function () {});
+    if (page === 'apps') loadApps().catch(function () {});
+    if (page === 'player' || page === 'about') loadHost().catch(function () {});
+  }
+  window.addEventListener('hashchange', route);
+
+  fillSelects();
+  loadCfg().catch(function () {});
+  loadHost().catch(function () {});
+  route();
+  poll();
+})();
+</script>
+</body>
+</html>

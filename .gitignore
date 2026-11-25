@@ -41,3 +41,6 @@ mod/zig.path
 .idea/
 Thumbs.db
 desktop.ini
+
+# 设计讨论用的草图（brainstorming 可视化页面）
+.superpowers/

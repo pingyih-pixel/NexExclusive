@@ -443,11 +443,75 @@ static void test_conflict_step(void) {
     printf("PASS conflict step: ask once per episode, remembered answers, release after quiet\n");
 }
 
+/* Main window: remembered apps list, status fields, API routing. */
+static void test_main_window_api(void) {
+    NexRememberedApp a[8];
+    int n = nex_apps_parse("yield=Spotify.exe\r\nkeep=Chrome.ABC\nnoise line\nkeep=Spotify.exe\nyield=Chrome.ABC\n", a, 8);
+    CHECK(n == 2);
+    CHECK(strcmp(a[0].app, "Spotify.exe") == 0 && a[0].choice == NEX_REMEMBER_KEEP);
+    CHECK(strcmp(a[1].app, "Chrome.ABC") == 0 && a[1].choice == NEX_REMEMBER_YIELD);
+    a[0].choice = NEX_REMEMBER_NONE;                 /* forgotten: not written back */
+    char text[256];
+    nex_apps_render(a, n, text, sizeof(text));
+    CHECK(strcmp(text, "yield=Chrome.ABC\n") == 0);
+    CHECK(nex_apps_parse("", a, 8) == 0);
+
+    /* status fields come from the control block snapshot */
+    char out[6144];
+    AcquireSRWLockExclusive(&g_snap_lock);
+    memset(&g_ctl_snap, 0, sizeof(g_ctl_snap));
+    g_ctl_snap.state = NEX_CONTROL_STATE_EXCLUSIVE;
+    g_ctl_snap.playing = 1;
+    g_ctl_snap.in_rate = 48000; g_ctl_snap.in_bits = 32; g_ctl_snap.in_float = 1;
+    g_ctl_snap.out_rate = 48000; g_ctl_snap.out_bits = 24; g_ctl_snap.out_container = 32;
+    g_ctl_snap.path = 2;
+    snprintf(g_ctl_snap.endpoint, sizeof(g_ctl_snap.endpoint), "Speakers \"MM3A\"");
+    g_ctl_snap_ok = 1;
+    wcscpy(g_others_snap[0].app, L"Chrome.GEBBY");
+    g_others_snap[0].kind = NEX_APP_OTHER;
+    g_others_count = 1;
+    ReleaseSRWLockExclusive(&g_snap_lock);
+    status_extra_json(out, sizeof(out));
+    CHECK(strstr(out, "\"state\":\"exclusive\"") != NULL);
+    CHECK(strstr(out, "\"playing\":true") != NULL);
+    CHECK(strstr(out, "\"outBits\":24") != NULL);
+    CHECK(strstr(out, "\"path\":\"depth\"") != NULL);
+    CHECK(strstr(out, "Speakers \\\"MM3A\\\"") != NULL);   /* escaped for JSON */
+    CHECK(strstr(out, "{\"app\":\"Chrome.GEBBY\",\"name\":\"Chrome\",\"kind\":\"other\"}") != NULL);
+    CHECK(strstr(out, "\"client\":{\"pid\":") != NULL);
+    AcquireSRWLockExclusive(&g_snap_lock);
+    g_ctl_snap.state = NEX_CONTROL_STATE_SHARED;
+    g_ctl_snap_ok = 1;
+    g_others_count = 0;
+    ReleaseSRWLockExclusive(&g_snap_lock);
+    status_extra_json(out, sizeof(out));
+    CHECK(strstr(out, "\"path\":\"shared\"") != NULL && strstr(out, "\"othersPlaying\":[]") != NULL);
+    AcquireSRWLockExclusive(&g_snap_lock);
+    g_ctl_snap_ok = 0;
+    ReleaseSRWLockExclusive(&g_snap_lock);
+    status_extra_json(out, sizeof(out));
+    CHECK(strstr(out, "\"ok\":false") != NULL && strstr(out, "\"state\":\"\"") != NULL);
+
+    /* routing: control commands reach the watcher; unknown paths fall through */
+    InterlockedExchange(&g_ctl_manual_req, 0);
+    CHECK(api_extra("POST", "/api/control", "{\"action\":\"share\"}", out, sizeof(out)) == 200);
+    CHECK(g_ctl_manual_req == 1);
+    CHECK(api_extra("POST", "/api/control", "{\"action\":\"exclusive\"}", out, sizeof(out)) == 200);
+    CHECK(g_ctl_manual_req == 2);
+    CHECK(api_extra("POST", "/api/control", "{\"action\":\"bogus\"}", out, sizeof(out)) == 400);
+    CHECK(api_extra("POST", "/api/apps", "{\"app\":\"a=b\",\"choice\":\"keep\"}", out, sizeof(out)) == 400);
+    CHECK(api_extra("POST", "/api/action", "{\"action\":\"format_c\"}", out, sizeof(out)) == 400);
+    CHECK(api_extra("GET", "/api/nothing", "", out, sizeof(out)) == 0);
+    InterlockedExchange(&g_ctl_manual_req, 0);
+    printf("PASS main window api: remembered apps, status fields, routing\n");
+}
+
 int main(void) {
     test_find_child_pids();
     test_conflict_policy();
     test_tray_tip_text();
     test_conflict_step();
+    test_main_window_api();
     test_ui_event_exists();
     test_ui_tracker_resets_on_new_main_pid();
     test_ui_child_already_loaded_is_not_reinjected();

@@ -45,7 +45,7 @@ OUT_DIR="$BUILD" bash "$MOD_DIR/build.sh" all
 
 # 发布包里只要这 8 个。player.exe / inject*.exe / *_eps.exe 是开发和诊断用的，
 # 放进去只会让用户困惑，也会让杀软多几个可疑样本。
-FILES=(NexExclusive.exe NexAudioHost.exe nexsink.dll nexui.dll hook.cfg ui.json ui/panel.js ui/simplify.js)
+FILES=(NexExclusive.exe NexAudioHost.exe nexsink.dll nexui.dll hook.cfg ui.json ui/panel.js ui/simplify.js ui/app.html)
 printf '==> 收集文件\n'
 for f in "${FILES[@]}"; do
     if [[ ! -f "$BUILD/$f" ]]; then

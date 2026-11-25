@@ -285,6 +285,21 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
             apps[i].remembered = apps[i].kind != NEX_APP_SELF && apps[i].playing
                                ? remembered_for(e[i].app) : NEX_REMEMBER_NONE;
         }
+        {   /* 给主窗口：此刻在出声的别的应用 */
+            NexOtherApp snap[8];
+            int k = 0;
+            for (int i = 0; i < n && k < 8; i++) {
+                if (apps[i].kind == NEX_APP_SELF || !apps[i].playing) continue;
+                wcsncpy(snap[k].app, e[i].app, 159);
+                snap[k].app[159] = 0;
+                snap[k].kind = apps[i].kind;
+                k++;
+            }
+            AcquireSRWLockExclusive(&g_snap_lock);
+            memcpy(g_others_snap, snap, sizeof(snap[0]) * (size_t)k);
+            g_others_count = k;
+            ReleaseSRWLockExclusive(&g_snap_lock);
+        }
         NexConflictStep step;
         nex_conflict_step(&cs, apps, n, auto_shared,
                           blk->state == NEX_CONTROL_STATE_EXCLUSIVE, blk->share_forced,
