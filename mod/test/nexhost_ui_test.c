@@ -359,9 +359,35 @@ static void test_conflict_policy(void) {
     printf("PASS conflict policy: every other app is asked about, remembered answers act directly\n");
 }
 
+/* The tray tooltip says what the device side is doing (control block v2). */
+static void test_tray_tip_text(void) {
+    NexControl c;
+    WCHAR tip[128];
+    memset(&c, 0, sizeof(c));
+    tray_tip_text(NULL, 0, tip, 128);
+    CHECK(wcscmp(tip, L"NexExclusive — 等待播放") == 0);
+    c.state = NEX_CONTROL_STATE_EXCLUSIVE; c.playing = 1;
+    c.out_rate = 44100; c.out_bits = 24; c.path = 2;
+    tray_tip_text(&c, 1, tip, 128);
+    CHECK(wcscmp(tip, L"NexExclusive — 独占 · 44.1 kHz / 24 bit · 位深转换") == 0);
+    c.out_rate = 96000; c.path = 0; c.playing = 0;
+    tray_tip_text(&c, 1, tip, 128);
+    CHECK(wcscmp(tip, L"NexExclusive — 独占 · 96 kHz / 24 bit · 原样 · 暂停") == 0);
+    c.state = NEX_CONTROL_STATE_SHARED; c.in_rate = 48000; c.in_bits = 32; c.playing = 1;
+    tray_tip_text(&c, 1, tip, 128);
+    CHECK(wcscmp(tip, L"NexExclusive — 共享输出 · 48 kHz / 32 bit（经系统混音器）") == 0);
+    c.state = NEX_CONTROL_STATE_RELEASED;
+    tray_tip_text(&c, 1, tip, 128);
+    CHECK(wcscmp(tip, L"NexExclusive — 暂停中，声卡已让出") == 0);
+    tray_tip_text(&c, 0, tip, 128);      /* stale block: nothing claimed */
+    CHECK(wcscmp(tip, L"NexExclusive — 等待播放") == 0);
+    printf("PASS tray tip: exclusive with format and path, shared, released, idle\n");
+}
+
 int main(void) {
     test_find_child_pids();
     test_conflict_policy();
+    test_tray_tip_text();
     test_ui_event_exists();
     test_ui_tracker_resets_on_new_main_pid();
     test_ui_child_already_loaded_is_not_reinjected();

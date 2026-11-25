@@ -350,6 +350,23 @@ static void sink_control_tick(void) {
     if (TryEnterCriticalSection(&g_control)) {
         InterlockedExchange(&c->state, sink_control_state());
         InterlockedExchange(&c->playing, g_sink.engaged && g_sink.started);
+        if (g_sink.engaged) {
+            c->in_rate = g_sink.in_rate;
+            c->in_bits = g_sink.in_valid_bits;
+            c->in_float = g_sink.in_is_float;
+            c->out_rate = g_sink.out_rate;
+            c->out_bits = g_sink.out_valid_bits ? g_sink.out_valid_bits : g_sink.out_bits;
+            c->out_container = g_sink.out_container_bits;
+            c->out_float = g_sink.out_is_float;
+            c->path = g_sink.gen && g_sink.gen->shared ? -1 :
+                      nex_audio_policy_path_kind(g_sink.in_rate, g_sink.in_container_bits,
+                                                 g_sink.in_valid_bits, g_sink.in_is_float,
+                                                 g_sink.out_rate, g_sink.out_container_bits,
+                                                 c->out_bits, g_sink.out_is_float);
+            c->remote = g_sink.gen && g_sink.gen->remote;
+            memcpy(c->endpoint, g_sink.ep_name, sizeof(c->endpoint));
+            c->endpoint[sizeof(c->endpoint) - 1] = 0;
+        }
         LeaveCriticalSection(&g_control);
     }
     InterlockedExchange(&c->share_forced, InterlockedCompareExchange(&g_share_forced, 0, 0));

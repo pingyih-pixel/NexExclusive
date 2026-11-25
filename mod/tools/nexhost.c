@@ -39,6 +39,7 @@
 #include "nexsmtc.h"
 #include "nexcontrol.h"
 #include "nexconflict.h"
+#include "../src/nexlogfile.h"
 
 /* ---- 路径与端口 --------------------------------------------------------- */
 #define CFG_PORT 9334
@@ -156,7 +157,10 @@ static void host_log(const char *fmt, ...) {
     SYSTEMTIME st;
     GetLocalTime(&st);
     EnterCriticalSection(&g_log_lock);
+    static NexLogDay host_day;
+    int rotated = nex_log_rotate_a(kHostLog, NEX_LOG_MAX_BYTES);
     FILE *f = fopen(kHostLog, "a");
+    if (f) nex_log_day_marker(f, &host_day, &st, rotated);
     if (f) {
         fprintf(f, "%02d:%02d:%02d.%03d [%lu] ", st.wHour, st.wMinute, st.wSecond,
                 st.wMilliseconds, (unsigned long)GetCurrentThreadId());
@@ -799,6 +803,12 @@ static void verification_json(char *out, size_t n, const char *line) {
     free(escaped);
 }
 
+/* 控制块的最新一份快照（监视线程每 500 ms 写一次），给状态接口和托盘提示用。
+   SRWLOCK 静态初始化，测试里不经 main 也能用。 */
+static SRWLOCK g_snap_lock = SRWLOCK_INIT;
+static NexControl g_ctl_snap;
+static int g_ctl_snap_ok;          /* 有快照且模块在 3 s 内更新过 */
+
 /* ---- 状态：解析 sink.log 末段 ------------------------------------------ */
 static void status_json(char *out, size_t n) {
     char *tail = read_tail(kSinkLog, 12288);
@@ -921,6 +931,16 @@ static void status_json(char *out, size_t n) {
     unsigned long long latency_ms = line_ull(remote_status, "latency_ms=");
     unsigned long long write_waits = line_ull(remote_status, "write_waits=");
     unsigned long long write_wait_max = line_ull(remote_status, "write_wait_max_ms=");
+    {   /* 控制块比日志新：有新鲜快照就以它为准 */
+        AcquireSRWLockExclusive(&g_snap_lock);
+        if (g_ctl_snap_ok) {
+            const char *m = g_ctl_snap.state == NEX_CONTROL_STATE_EXCLUSIVE ? "exclusive"
+                          : g_ctl_snap.state == NEX_CONTROL_STATE_SHARED ? "shared"
+                          : g_ctl_snap.state == NEX_CONTROL_STATE_RELEASED ? "released" : "";
+            if (*m) snprintf(output_mode, sizeof(output_mode), "%s", m);
+        }
+        ReleaseSRWLockExclusive(&g_snap_lock);
+    }
     char *rs = json_escape(remote_status);
     char *on = json_escape(output_note);
     source_refresh_probe();
@@ -3626,6 +3646,46 @@ static void tray_notify(const WCHAR *title, const WCHAR *text) {
     Shell_NotifyIconW(NIM_MODIFY, &n);
 }
 
+
+static void rate_text(long rate, WCHAR *out, size_t cap) {
+    if (rate % 1000) _snwprintf(out, cap, L"%ld.%ld kHz", rate / 1000, (rate % 1000) / 100);
+    else _snwprintf(out, cap, L"%ld kHz", rate / 1000);
+    out[cap - 1] = 0;
+}
+
+/* 托盘提示：一眼看出现在是独占、共享还是让出了，以及什么格式 */
+static void tray_tip_text(const NexControl *c, int ok, WCHAR *out, size_t cap) {
+    WCHAR rate[32];
+    if (!ok || !c || c->state == NEX_CONTROL_STATE_IDLE) {
+        _snwprintf(out, cap, L"NexExclusive — 等待播放");
+    } else if (c->state == NEX_CONTROL_STATE_RELEASED) {
+        _snwprintf(out, cap, L"NexExclusive — 暂停中，声卡已让出");
+    } else if (c->state == NEX_CONTROL_STATE_SHARED) {
+        rate_text(c->in_rate, rate, 32);
+        _snwprintf(out, cap, L"NexExclusive — 共享输出 · %ls / %ld bit%ls（经系统混音器）",
+                   rate, (long)c->in_bits, c->playing ? L"" : L" · 暂停");
+    } else {
+        static const WCHAR *paths[] = { L" · 原样", L" · 原样数值", L" · 位深转换", L" · 重采样" };
+        rate_text(c->out_rate, rate, 32);
+        _snwprintf(out, cap, L"NexExclusive — 独占 · %ls / %ld bit%ls%ls", rate, (long)c->out_bits,
+                   c->path >= 0 && c->path <= 3 ? paths[c->path] : L"",
+                   c->playing ? L"" : L" · 暂停");
+    }
+    out[cap - 1] = 0;
+}
+
+static void tray_set_tip(const WCHAR *tip) {
+    if (!g_tray_up) return;
+    NOTIFYICONDATAW n;
+    memset(&n, 0, sizeof(n));
+    n.cbSize = sizeof(n);
+    n.hWnd = g_nid.hWnd;
+    n.uID = TRAY_ID;
+    n.uFlags = NIF_TIP;
+    wcsncpy(n.szTip, tip, 127);
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+
 static void apps_cfg_path(char *out, size_t cap) {
     snprintf(out, cap, "%sapps.cfg", g_base);
 }
@@ -3716,6 +3776,9 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
     int smtc_ok = nex_smtc_open(&smtc);
     if (smtc_ok) host_log("媒体会话监视就绪（SMTC）");
     else host_log("媒体会话监视不可用：%s；托盘的「暂时关闭独占」仍可用", smtc.error);
+    int smtc_failures = 0;
+    DWORD smtc_retry = GetTickCount();
+    WCHAR last_tip[128] = L"";
 
     HANDLE map = NULL;
     NexControl *blk = NULL;
@@ -3760,6 +3823,17 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
                 }
             }
         }
+        {   /* 快照与托盘提示 */
+            int ok = blk && nex_control_valid(blk) &&
+                     (DWORD)(now - (DWORD)blk->heartbeat) < 3000;
+            AcquireSRWLockExclusive(&g_snap_lock);
+            if (ok) g_ctl_snap = *blk;
+            g_ctl_snap_ok = ok;
+            ReleaseSRWLockExclusive(&g_snap_lock);
+            WCHAR tip[128];
+            tray_tip_text(blk, ok, tip, 128);
+            if (wcscmp(tip, last_tip) != 0) { tray_set_tip(tip); wcscpy(last_tip, tip); }
+        }
         if (!blk) continue;
 
         LONG req = InterlockedExchange(&g_ctl_manual_req, 0);
@@ -3791,10 +3865,28 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
             }
         }
 
-        if (!smtc_ok) continue;
+        /* SMTC 服务重启（例如资源管理器重启）后旧的管理器对象就失效了：
+           连续失败 10 次（5 s）就关掉重开；打开失败的话 30 s 重试一次 */
+        if (!smtc_ok) {
+            if (now - smtc_retry > 30000) {
+                smtc_retry = now;
+                smtc_ok = nex_smtc_open(&smtc);
+                if (smtc_ok) { smtc_failures = 0; host_log("媒体会话监视已重新连上"); }
+            }
+            continue;
+        }
         NexSmtcEntry e[24];
         int n = nex_smtc_poll(&smtc, e, 24);
-        if (n < 0) continue;
+        if (n < 0) {
+            if (++smtc_failures >= 10) {
+                nex_smtc_close(&smtc);
+                smtc_ok = 0;
+                smtc_retry = now - 30001;   /* 下一轮就重开 */
+                host_log("媒体会话读取连续失败，重新连接");
+            }
+            continue;
+        }
+        smtc_failures = 0;
         int others_playing = 0, asked_still_playing = 0;
         for (int i = 0; i < n; i++) {
             int kind = nex_app_kind(e[i].app);

@@ -1994,6 +1994,43 @@ static void test_idle_release_gives_device_back(void) {
     printf("PASS idle release: long pause gives the device back, resume takes it again\n");
 }
 
+/* nexlogfile.h: a log past the limit becomes <name>.1, and the day marker is
+   written once per day (and again after a rotation). */
+static void test_log_rotation(void) {
+    char dir[MAX_PATH], path[MAX_PATH], old[MAX_PATH + 4];
+    GetTempPathA(MAX_PATH, dir);
+    snprintf(path, sizeof(path), "%snex-rotate-%lu.log", dir, (unsigned long)GetCurrentProcessId());
+    snprintf(old, sizeof(old), "%s.1", path);
+    DeleteFileA(path); DeleteFileA(old);
+    CHECK(nex_log_rotate_a(path, 10) == 0);            /* nothing there yet */
+    FILE *f = fopen(path, "w");
+    fputs("0123456789", f);
+    fclose(f);
+    CHECK(nex_log_rotate_a(path, 10) == 0);            /* at the limit, not past it */
+    f = fopen(path, "a"); fputs("x", f); fclose(f);
+    CHECK(nex_log_rotate_a(path, 10) == 1);
+    CHECK(GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES);
+    CHECK(GetFileAttributesA(old) != INVALID_FILE_ATTRIBUTES);
+    NexLogDay last = {0, 0, 0};
+    SYSTEMTIME a = {0}, b = {0};
+    a.wYear = 2026; a.wMonth = 11; a.wDay = 25;
+    b = a; b.wDay = 26;
+    f = fopen(path, "w");
+    nex_log_day_marker(f, &last, &a, 0);
+    nex_log_day_marker(f, &last, &a, 0);               /* same day: nothing */
+    nex_log_day_marker(f, &last, &b, 0);
+    nex_log_day_marker(f, &last, &b, 1);               /* forced after a rotation */
+    fclose(f);
+    char buf[256] = {0};
+    f = fopen(path, "r");
+    size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    CHECK(got > 0);
+    CHECK(strcmp(buf, "---- 2026-11-25 ----\n---- 2026-11-26 ----\n---- 2026-11-26 ----\n") == 0);
+    DeleteFileA(path); DeleteFileA(old);
+    printf("PASS log rotation: past the limit becomes .1, one day marker per day\n");
+}
+
 /* Control block: the host's "close exclusive" switches a running exclusive
    stream to shared at once and keeps it there; "exclusive again" lets the
    next resume go back. The state the host reads follows the device side. */
@@ -2107,6 +2144,9 @@ static void test_lifecycle_stress(void) {
     void *clock_vt[6] = {0}, *clock_obj[1] = {clock_vt};
     ac_vt[SLOT_RELEASE] = (void *)stress_ref;
     ac_vt[AC_GETCURRENTPADDING] = (void *)stress_padding;
+    /* The device is full and stopped after every Stop, so a resume starts it
+       on the queued frames (the timer-mode resume rule); it needs a Start. */
+    ac_vt[AC_START] = (void *)mock_start;
     ac_vt[AC_STOP] = (void *)mock_stop;
     ac_vt[AC_RESET] = (void *)mock_reset;
     clock_vt[SLOT_RELEASE] = (void *)stress_ref;
@@ -2981,6 +3021,7 @@ int main(void) {
     test_start_rebuilds_abandoned_generation();
     test_idle_release_gives_device_back();
     test_control_block_share_and_back();
+    test_log_rotation();
     test_clock_holds_position_while_generation_abandoned();
     DeleteCriticalSection(&g_lock);
     DeleteCriticalSection(&g_control);

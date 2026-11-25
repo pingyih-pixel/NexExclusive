@@ -188,10 +188,13 @@ static NEX_HDR_UNUSED int nex_smtc_poll(NexSmtc *s, NexSmtcEntry *out, int max) 
     return count;
 }
 
-/* Ask every session whose app id contains `match` (case-insensitive) to pause:
-   TryPauseAsync, slot 11 after TryPlayAsync. The asynchronous result is not
-   awaited; the next poll shows whether it took. Returns how many were asked. */
-static NEX_HDR_UNUSED int nex_smtc_pause_matching(NexSmtc *s, const WCHAR *match) {
+/* Session commands, by vtable slot: TryPlayAsync 10, TryPauseAsync 11. */
+enum { NEX_SMTC_CMD_PLAY = 10, NEX_SMTC_CMD_PAUSE = 11 };
+
+/* Send a command to every session whose app id contains `match`
+   (case-insensitive). The asynchronous result is not awaited; the next poll
+   shows whether it took. Returns how many were asked. */
+static NEX_HDR_UNUSED int nex_smtc_send_matching(NexSmtc *s, const WCHAR *match, int cmd) {
     if (!s->manager || !match || !*match) return 0;
     void *view = NULL;
     if (FAILED(nex_rt_get(s->manager, 7, &view)) || !view) return 0;
@@ -217,7 +220,8 @@ static NEX_HDR_UNUSED int nex_smtc_pause_matching(NexSmtc *s, const WCHAR *match
             }
             if (hit) {
                 void *op = NULL;
-                if (SUCCEEDED(nex_rt_get(session, 11, &op)) && op) {   /* TryPauseAsync */
+                if ((cmd == NEX_SMTC_CMD_PLAY || cmd == NEX_SMTC_CMD_PAUSE) &&
+                    SUCCEEDED(nex_rt_get(session, cmd, &op)) && op) {
                     nex_rt_release(op);
                     asked++;
                 }
@@ -227,6 +231,10 @@ static NEX_HDR_UNUSED int nex_smtc_pause_matching(NexSmtc *s, const WCHAR *match
     }
     nex_rt_release(view);
     return asked;
+}
+
+static NEX_HDR_UNUSED int nex_smtc_pause_matching(NexSmtc *s, const WCHAR *match) {
+    return nex_smtc_send_matching(s, match, NEX_SMTC_CMD_PAUSE);
 }
 
 #endif
