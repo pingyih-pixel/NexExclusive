@@ -57,12 +57,12 @@ fi
 WIRE_DEFS=(-DNEX_AUDIO_BUILD_ID=0x$WIRE_HASH -DNEX_AUDIO_EXPECTED_BUILD_ID=0x$WIRE_HASH)
 TARGET=${1:-all}
 if (( $# > 1 )); then
-    printf '用法：%s [sink|ui|host|audiohost|all|test]\n' "$0" >&2
+    printf '用法：%s [sink|ui|host|audiohost|sim|probe|all|test]\n' "$0" >&2
     exit 2
 fi
 case "$TARGET" in
-    sink|ui|host|audiohost|sim|all|test) ;;
-    *) printf '用法：%s [sink|ui|host|audiohost|sim|all|test]\n' "$0" >&2; exit 2 ;;
+    sink|ui|host|audiohost|sim|probe|all|test) ;;
+    *) printf '用法：%s [sink|ui|host|audiohost|sim|probe|all|test]\n' "$0" >&2; exit 2 ;;
 esac
 
 OUT_DIR=${OUT_DIR-$MOD_DIR}
@@ -163,6 +163,14 @@ build_sim() {
     printf '已构建到 %s：nexsim.exe\n' "$OUT_DIR"
 }
 
+build_probe() {
+    # 会话层实验（ROADMAP 5c）：独占时别的进程能不能出声、系统发不发通知。
+    # 不加载 nexsink.dll，会短暂独占默认设备，所以不在 test 里跑。
+    "$CC" cc "${FLAGS[@]}" -municode -Wl,--subsystem,console \
+        -o "$OUT_DIR/sessprobe.exe" "$MOD_DIR/tools/sessprobe.c" -lole32 -loleaut32 -luuid
+    printf '已构建到 %s：sessprobe.exe\n' "$OUT_DIR"
+}
+
 build_test() {
     "$CC" c++ "${FLAGS[@]}" -o "$OUT_DIR/audio_policy_test.exe" "$MOD_DIR/test/audio_policy_test.cpp"
     "$OUT_DIR/audio_policy_test.exe"
@@ -189,6 +197,7 @@ case "$TARGET" in
     host) build_host ;;
     audiohost) build_audiohost ;;
     sim)  build_sim ;;
+    probe) build_probe ;;
     all)  build_sink; build_ui; build_host; build_audiohost ;;
     test) build_test ;;
 esac

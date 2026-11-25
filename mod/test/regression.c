@@ -1904,6 +1904,96 @@ static void test_start_rebuilds_abandoned_generation(void) {
     printf("PASS 6c: Start after an abandoned generation rebuilds the device side\n");
 }
 
+/* idle_release_ms: a long pause gives the device back; the next Start takes
+   it again through the same rebuild path, and anything that ends the pause
+   first (a Start, a rebuilt device side) voids the timer. */
+static void test_idle_release_gives_device_back(void) {
+    HRESULT (*saved)(const char *) = g_rebuild_device;
+    int saved_idle = g_idle_release_ms, saved_auto = g_auto_shared;
+    HandoffClient client = { handoff_vtbl, 1 };
+    prepare_ring();
+    reset_patches();
+    mock_rebuild_setup();
+    g_sink.owner = &client;
+    g_sink.engaged = 1;
+    g_sink.out_rate = 48000;
+    memset(&g_fake_clock, 0, sizeof(g_fake_clock));
+    g_fake_clock.vtbl = g_fake_clock_vtbl;
+    g_fake_clock.ref = 1;
+    g_fake_clock.generation = g_sink.generation;
+    g_sink.proxy_clock = &g_fake_clock;
+    g_sink.gen = NULL;
+    g_rebuild_device = mock_rebuild_device;
+    g_auto_shared = 0;
+    g_idle_release_ms = 1000;
+    rebuild_calls = 0;
+
+    CHECK(H_Start(&client) == S_OK);
+    CHECK(rebuild_calls == 1);
+    CHECK(H_Stop(&client) == S_OK);
+    CHECK(g_sink.pause_token == g_sink.generation && g_sink.gen != NULL);
+
+    /* not yet */
+    g_sink.pause_tick = GetTickCount() - 400;
+    sink_watch_share_tick();
+    CHECK(g_sink.gen != NULL && !g_sink.idle_released);
+
+    /* due: the device side goes, the stream stays */
+    g_sink.pause_tick = GetTickCount() - 1500;
+    sink_watch_share_tick();
+    CHECK(g_sink.gen == NULL);
+    CHECK(g_sink.idle_released == 1 && g_sink.pause_token == 0);
+    CHECK(g_sink.engaged && g_sink.proxy_render && g_sink.proxy_clock);
+    {   /* the client's clock is held, not failed, while released */
+        UINT64 pos = 1;
+        CHECK(fc_GetPosition(&g_fake_clock, &pos, NULL) == S_OK);
+        CHECK(pos == g_sink.clock_last);
+    }
+    sink_watch_share_tick();            /* nothing left to release */
+    CHECK(g_sink.gen == NULL);
+
+    /* resume takes the device again */
+    CHECK(H_Start(&client) == S_OK);
+    CHECK(rebuild_calls == 2 && g_sink.gen && g_sink.started);
+    CHECK(!g_sink.idle_released && g_sink.pause_token == 0);
+
+    /* a short pause that ends before the timer: nothing happens */
+    CHECK(H_Stop(&client) == S_OK);
+    CHECK(H_Start(&client) == S_OK);
+    g_sink.pause_tick = GetTickCount() - 5000;
+    CHECK(H_Stop(&client) == S_OK);
+    g_sink.pause_token = 0;             /* as after the Start above, before this Stop */
+    sink_watch_share_tick();
+    CHECK(g_sink.gen != NULL);
+
+    /* the device side was rebuilt during the pause: the old timer is void */
+    g_sink.pause_token = g_sink.generation;
+    g_sink.generation++;
+    g_sink.pause_tick = GetTickCount() - 5000;
+    sink_watch_share_tick();
+    CHECK(g_sink.gen != NULL);
+    g_sink.generation--;
+
+    /* feature off: a long pause keeps the device */
+    g_idle_release_ms = 0;
+    g_sink.pause_token = g_sink.generation;
+    sink_watch_share_tick();
+    CHECK(g_sink.gen != NULL);
+
+    /* a shared device side returns to exclusive at the next resume once
+       auto_shared no longer wants it */
+    g_sink.gen->shared = 1;
+    CHECK(H_Start(&client) == S_OK);
+    CHECK(rebuild_calls == 3 && g_sink.gen && !g_sink.gen->shared);
+    CHECK(H_Stop(&client) == S_OK);
+
+    g_rebuild_device = saved;
+    g_idle_release_ms = saved_idle;
+    g_auto_shared = saved_auto;
+    sink_teardown_controlled();
+    printf("PASS idle release: long pause gives the device back, resume takes it again\n");
+}
+
 /* Between the abandonment in Stop and the rebuild in the next Start there is
    no device clock. The client keeps polling it; an error there reads as "the
    track ended", so the last position is reported instead. */
@@ -2527,6 +2617,19 @@ static void test_event_mode_waits_for_device_request(void) {
     CHECK(mock_start_calls == 1 && gen->device_started && mock_gb_calls == 0);
     mock_padding = 0;
 
+    /* Timer-driven (a shared stream, or a driver that refused events), paused
+       with its buffer full: no room ever appears while the device is stopped,
+       so the resume must start it on the queued frames as well. Seen on a
+       real device with auto_shared: the client event went silent forever. */
+    CloseHandle(gen->real_evt);
+    gen->real_evt = NULL;
+    gen->device_started = 0;
+    mock_padding = 16; mock_gb_calls = 0; mock_start_calls = 0;
+    g_sink.r = 24; g_sink.w = 40;                  /* the client already has more queued */
+    CHECK(drain_once(gen) == S_OK);
+    CHECK(mock_start_calls == 1 && gen->device_started && mock_gb_calls == 0);
+    mock_padding = 0;
+
     gen->real = NULL;
     gen->real_render = NULL;
     g_sink.gen = NULL;
@@ -2792,6 +2895,7 @@ int main(void) {
     test_module_dir();
     test_lifecycle_stress();
     test_start_rebuilds_abandoned_generation();
+    test_idle_release_gives_device_back();
     test_clock_holds_position_while_generation_abandoned();
     DeleteCriticalSection(&g_lock);
     DeleteCriticalSection(&g_control);

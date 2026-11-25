@@ -17,6 +17,9 @@ static int g_event       = 1;   /* try event-driven exclusive first, timer polli
 static int g_memlock     = 1;   /* VirtualLock the buffers the drain path touches */
 static int g_prime       = 1;   /* one device buffer of silence before a fresh start */
 static int g_resync_ms   = 200; /* extra silence when the DAC changes clock family */
+static int g_idle_release_ms = 0; /* give the device back after this long paused; 0 = never */
+static int g_auto_shared = 0;   /* open shared next to another sounding application */
+static int g_share_quiet_ms = NEX_AUDIO_SHARE_QUIET_DEFAULT_MS;
 /* Which rate to prefer when the device refuses the source rate.
      0 = bandwidth: nearest higher first, then lower from high to low.
      1 = simplicity: integer conversion ratios first, then bandwidth order.
@@ -264,6 +267,7 @@ typedef struct SinkGen {
     volatile LONG       last_submit;    /* GetTickCount of the last ReleaseBuffer */
     volatile LONG       stage;          /* where the thread is, for diagnosis */
     int                 remote;         /* audiohost owns the endpoint */
+    int                 shared;         /* auto_shared opened a shared stream, not exclusive */
 } SinkGen;
 
 /* ---- sink state --------------------------------------------------------- */
@@ -336,6 +340,11 @@ typedef struct {
 
     UINT32             fade_total;      /* frames in the opening ramp */
     UINT32             fade_left;
+
+    /* idle release: which pause the timer belongs to, and since when */
+    UINT64             pause_token;     /* set at Stop; 0 = not paused / timer void */
+    DWORD              pause_tick;
+    int                idle_released;   /* the device was given back during this pause */
 } Sink;
 
 static Sink g_sink;
@@ -541,6 +550,10 @@ static void load_config(void) {
     char endpoint_before[sizeof(g_endpoint_id)];
     memcpy(endpoint_before, g_endpoint_id, sizeof(endpoint_before));
     g_endpoint_id[0] = 0;
+    /* Keys that are absent mean "off", not "whatever the previous file said". */
+    g_idle_release_ms = 0;
+    g_auto_shared = 0;
+    g_share_quiet_ms = NEX_AUDIO_SHARE_QUIET_DEFAULT_MS;
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
@@ -567,6 +580,9 @@ static void load_config(void) {
         else if (_strnicmp(p, "dedicated_core=", 15) == 0) g_dedicated_core = atoi(p + 15) != 0;
         else if (_strnicmp(p, "process_priority=", 17) == 0) g_process_priority = atoi(p + 17) != 0;
         else if (_strnicmp(p, "resync_ms=", 10) == 0) g_resync_ms = atoi(p + 10);
+        else if (_strnicmp(p, "idle_release_ms=", 16) == 0) g_idle_release_ms = atoi(p + 16);
+        else if (_strnicmp(p, "auto_shared=", 12) == 0) g_auto_shared = atoi(p + 12) != 0;
+        else if (_strnicmp(p, "share_quiet_ms=", 15) == 0) g_share_quiet_ms = atoi(p + 15);
         else if (_strnicmp(p, "src_prefer=", 11) == 0) {
             char v[32];
             snprintf(v, sizeof(v), "%s", p + 11);
@@ -581,6 +597,8 @@ static void load_config(void) {
     fclose(f);
     if (g_resync_ms < 0 || g_resync_ms > 2000) g_resync_ms = 200;
     g_host_ring_ms = nex_audio_policy_host_ring_ms(g_host_ring_ms);
+    g_idle_release_ms = nex_audio_policy_idle_release_ms(g_idle_release_ms);
+    g_share_quiet_ms = nex_audio_policy_share_quiet_ms(g_share_quiet_ms);
     {
         /* Legal ranges, defaults and the strict-native overrides are policy:
            see nex_audio_policy_normalize_config. */
@@ -636,5 +654,7 @@ static void load_config(void) {
              g_prime, g_resync_ms, g_event, g_memlock, g_dedicated_core, g_process_priority,
              g_host_ring_ms,
              g_log_enabled, g_endpoint_id[0] ? g_endpoint_id : "(follow client)");
+    log_line("config: idle_release_ms=%d auto_shared=%d share_quiet_ms=%d",
+             g_idle_release_ms, g_auto_shared, g_share_quiet_ms);
 }
 

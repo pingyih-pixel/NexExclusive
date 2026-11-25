@@ -210,6 +210,79 @@ NEX_AUDIO_POLICY_FN int nex_audio_policy_host_ring_ms(int ms) {
     return ms;
 }
 
+/* ---- letting go of the device during a pause (hook.cfg idle_release_ms) ---
+   A paused exclusive stream still owns the endpoint: Stop leaves it
+   initialized, and every other application gets AUDCLNT_E_DEVICE_IN_USE
+   until it is released (measured on a USB DAC, Windows 11). After this many
+   milliseconds of pause the device side is dropped; the client keeps its
+   stream, ring and timeline, and the next Start rebuilds the device side.
+   0 = never (default). */
+#define NEX_AUDIO_IDLE_RELEASE_MIN_MS 1000
+#define NEX_AUDIO_IDLE_RELEASE_MAX_MS 3600000
+NEX_AUDIO_POLICY_FN int nex_audio_policy_idle_release_ms(int ms) {
+    if (ms <= 0) return 0;
+    if (ms < NEX_AUDIO_IDLE_RELEASE_MIN_MS) return NEX_AUDIO_IDLE_RELEASE_MIN_MS;
+    if (ms > NEX_AUDIO_IDLE_RELEASE_MAX_MS) return NEX_AUDIO_IDLE_RELEASE_MAX_MS;
+    return ms;
+}
+
+/* The release is decided late, on a timer, so it re-checks that nothing moved
+   since the pause began: the stream is still engaged and stopped, it still has
+   a device side, and it is the same pause (stop_token, taken at Stop, still
+   matches the current one). A Start, a seek that rebuilt the device, or a new
+   track in between all invalidate the token, and the timer does nothing. */
+NEX_AUDIO_POLICY_FN int nex_audio_policy_idle_release_due(int idle_ms, int engaged, int started,
+                                                          int has_device,
+                                                          unsigned long long stop_token,
+                                                          unsigned long long current_token,
+                                                          unsigned long paused_for_ms) {
+    if (idle_ms <= 0 || !engaged || started || !has_device) return 0;
+    if (!stop_token || stop_token != current_token) return 0;
+    return paused_for_ms >= (unsigned long)idle_ms;
+}
+
+/* ---- automatic shared output (hook.cfg auto_shared, share_quiet_ms) --------
+   Off by default: the product is exclusive output. With auto_shared=1, each
+   time a device side is built (a new stream, a resume after the device was
+   released, a seek while paused) the sink checks whether another application
+   is sounding on that endpoint. If one is, or one was within share_quiet_ms,
+   the stream opens in shared mode next to it instead of taking the device
+   away; otherwise exclusive. The quiet window keeps a short gap in the other
+   application's audio (between two videos, a buffering stall) from flipping
+   the stream back and forth.
+   others_known = 0 means the session scan itself failed: stay exclusive, the
+   same as with the feature off.
+   quiet_for_ms is how long ago another application was last heard;
+   NEX_AUDIO_NEVER_HEARD when none has been. */
+#define NEX_AUDIO_SHARE_QUIET_DEFAULT_MS 3000
+#define NEX_AUDIO_SHARE_QUIET_MIN_MS     500
+#define NEX_AUDIO_SHARE_QUIET_MAX_MS     60000
+#define NEX_AUDIO_NEVER_HEARD            0xFFFFFFFFul
+enum { NEX_AUDIO_OUTPUT_EXCLUSIVE = 0, NEX_AUDIO_OUTPUT_SHARED = 1 };
+NEX_AUDIO_POLICY_FN int nex_audio_policy_share_quiet_ms(int ms) {
+    if (ms <= 0) return NEX_AUDIO_SHARE_QUIET_DEFAULT_MS;
+    if (ms < NEX_AUDIO_SHARE_QUIET_MIN_MS) return NEX_AUDIO_SHARE_QUIET_MIN_MS;
+    if (ms > NEX_AUDIO_SHARE_QUIET_MAX_MS) return NEX_AUDIO_SHARE_QUIET_MAX_MS;
+    return ms;
+}
+NEX_AUDIO_POLICY_FN int nex_audio_policy_output_mode(int auto_shared, int others_known,
+                                                     int others_active,
+                                                     unsigned long quiet_for_ms,
+                                                     int quiet_ms) {
+    if (!auto_shared || !others_known) return NEX_AUDIO_OUTPUT_EXCLUSIVE;
+    if (others_active) return NEX_AUDIO_OUTPUT_SHARED;
+    if (quiet_for_ms < (unsigned long)quiet_ms) return NEX_AUDIO_OUTPUT_SHARED;
+    return NEX_AUDIO_OUTPUT_EXCLUSIVE;
+}
+
+/* A session counts as "sounding" when it is Active and its peak meter is above
+   this. Active alone is not enough: some programs keep a silent stream open
+   the whole time. The threshold is about -80 dBFS. */
+#define NEX_AUDIO_OTHER_PEAK_MIN 0.0001f
+NEX_AUDIO_POLICY_FN int nex_audio_policy_session_sounding(int active, float peak) {
+    return active && peak > NEX_AUDIO_OTHER_PEAK_MIN;
+}
+
 /* ---- what the negotiated path does to the samples ------------------------- */
 enum {
     NEX_AUDIO_PATH_NATIVE = 0,    /* identical bytes                             */

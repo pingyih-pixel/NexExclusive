@@ -350,7 +350,8 @@ static void source_uppercase(char *out, size_t n, const char *format) {
 
 /* ---- 配置：hook.cfg <-> JSON ------------------------------------------- */
 /* 顺序固定，面板与日志都依赖这个顺序 */
-static const char *kCfgKeys[] = {"enable","bits","rate","buffer","compat","dither","fade_ms","shared_fallback","src_prefer","hifi","audiohost"};
+static const char *kCfgKeys[] = {"enable","bits","rate","buffer","compat","dither","fade_ms","shared_fallback","src_prefer","hifi","audiohost",
+                                 "idle_release_ms","auto_shared"};
 #define CFG_N ((int)(sizeof(kCfgKeys)/sizeof(kCfgKeys[0])))
 
 /* Same defaults as nex_audio_policy_config_defaults(): bits=0 follows the
@@ -358,6 +359,7 @@ static const char *kCfgKeys[] = {"enable","bits","rate","buffer","compat","dithe
    the panel what the audio module will actually do. */
 static void cfg_defaults(int *v) {
     v[0]=1; v[1]=0; v[2]=0; v[3]=0; v[4]=1; v[5]=2; v[6]=0; v[7]=0; v[8]=0; v[9]=0; v[10]=0;
+    v[11]=0; v[12]=0;   /* idle release and automatic shared output: off */
 }
 
 /* Values posted by the panel that the audio module would reject fall back to
@@ -371,6 +373,9 @@ static void cfg_sanitize(int *v) {
     if (v[8] != 0 && v[8] != 1) v[8] = d[8];
     if (v[9] != 0 && v[9] != 1) v[9] = d[9];
     if (v[10] != 0 && v[10] != 1) v[10] = d[10];
+    /* same range as nex_audio_policy_idle_release_ms: 0 or 1 s .. 1 h */
+    if (v[11] != 0 && (v[11] < 1000 || v[11] > 3600000)) v[11] = d[11];
+    if (v[12] != 0 && v[12] != 1) v[12] = d[12];
 }
 
 static void cfg_read(int *v) {
@@ -801,6 +806,11 @@ static void status_json(char *out, size_t n) {
     char remote_status[2048] = "";
     char log_ep[256] = "";
     int  log_hw = -1;
+    /* How the device side is open right now. The ENGAGED line only covers a
+       fresh stream; a resume after an idle release, or a switch between
+       shared and exclusive, is a retarget line. */
+    char output_mode[16] = "";
+    char output_note[256] = "";
 
     char *line = tail;
     while (line && *line) {
@@ -819,10 +829,28 @@ static void status_json(char *out, size_t n) {
             remote_status[0] = 0;
             log_ep[0] = 0;
             log_hw = -1;
+            output_mode[0] = 0;
+            output_note[0] = 0;
         }
         if (strstr(line, "sink ENGAGED")) {
             snprintf(engaged, sizeof(engaged), "%s", line);
             ep_from_line(line, log_ep, sizeof(log_ep), &log_hw);
+            snprintf(output_mode, sizeof(output_mode), "%s",
+                     strstr(line, "output=shared") ? "shared" : "exclusive");
+            output_note[0] = 0;
+        }
+        if (strstr(line, "retarget(") && strstr(line, " output=")) {
+            snprintf(output_mode, sizeof(output_mode), "%s",
+                     strstr(line, "output=shared") ? "shared" : "exclusive");
+        }
+        if (strstr(line, "idle release: ")) {
+            snprintf(output_mode, sizeof(output_mode), "released");
+            output_note[0] = 0;
+        }
+        if (strstr(line, "output(") &&
+            (strstr(line, "exclusive takes the device from ") || strstr(line, ": shared"))) {
+            const char *o = strstr(line, "output(");
+            snprintf(output_note, sizeof(output_note), "%s", o);
         }
         if (strstr(line, "sink failed")) {
             snprintf(fault, sizeof(fault), "%s", line);
@@ -890,6 +918,7 @@ static void status_json(char *out, size_t n) {
     unsigned long long write_waits = line_ull(remote_status, "write_waits=");
     unsigned long long write_wait_max = line_ull(remote_status, "write_wait_max_ms=");
     char *rs = json_escape(remote_status);
+    char *on = json_escape(output_note);
     source_refresh_probe();
     if (!_stricmp(g_source.status, "pending") && !g_source.probe_started_ms &&
         g_source.updated_at_ms && GetTickCount64() - g_source.updated_at_ms > 30000) {
@@ -911,7 +940,7 @@ static void status_json(char *out, size_t n) {
              "\"ringUsedFrames\":%llu,\"ringCapacityFrames\":%llu,"
              "\"devicePaddingFrames\":%llu,\"remoteLatencyMs\":%llu,"
              "\"writeWaits\":%llu,\"writeWaitMaxMs\":%llu,"
-             "\"remoteStatus\":\"%s\",%s,%s,"
+             "\"remoteStatus\":\"%s\",\"outputMode\":\"%s\",\"outputNote\":\"%s\",%s,%s,"
              "\"source_status\":\"%s\",\"source_play_id\":\"%s\","
              "\"source_format\":\"%s\",\"source_rate\":%d,"
              "\"source_channels\":%d,\"source_sample_bytes\":%d,"
@@ -928,7 +957,7 @@ static void status_json(char *out, size_t n) {
              converted, source_waits, backpressure, underruns, dropped, generation,
              eos_submitted, eos_complete,
              ring_used, ring_capacity, device_padding, latency_ms, write_waits, write_wait_max,
-             rs ? rs : "", ep, verification,
+             rs ? rs : "", output_mode, on ? on : "", ep, verification,
              source_status, source_play_id ? source_play_id : "",
              source_format ? source_format : "", g_source.rate, g_source.channels,
              g_source.sample_bytes, g_source.valid_bits, g_source.container_bits,
@@ -938,7 +967,7 @@ static void status_json(char *out, size_t n) {
              g_source.quality_tier_hint, g_source.selection,
              (unsigned long long)g_source.audio_generation,
              (unsigned long long)g_source.updated_at_ms);
-    free(e); free(l); free(f); free(rs); free(source_play_id); free(source_format); free(source_encoding);
+    free(e); free(l); free(f); free(rs); free(on); free(source_play_id); free(source_format); free(source_encoding);
 }
 
 static ULONGLONG source_current_generation(void) {

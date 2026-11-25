@@ -197,6 +197,10 @@ static HRESULT STDMETHODCALLTYPE H_Start(void *self) {
         return fault;
     }
 
+    /* A shared stream opened next to another application returns to
+       exclusive here, at a resume, once that application has gone quiet. */
+    sink_end_shared_if_quiet("resume");
+
     /* The device is started by drain_once() after the first real frames have
        been committed. Starting it here would leave the endpoint running on an
        empty buffer, which the driver reports as an immediate underrun. */
@@ -206,15 +210,22 @@ static HRESULT STDMETHODCALLTYPE H_Start(void *self) {
            thread. The client still owns this stream and expects Start to play
            it; rebuild the device side instead of failing, which used to leave
            the rest of the track silent (ROADMAP 6c). */
-        HRESULT rebuilt = g_rebuild_device("start after abandoned generation");
+        /* The same path takes back a device that idle_release_ms gave away
+           during the pause, and replaces a shared device side that
+           sink_end_shared_if_quiet just dropped. */
+        const char *why = g_sink.idle_released ? "resume after idle release"
+                        : "start without a device side";
+        HRESULT rebuilt = g_rebuild_device(why);
+        g_sink.idle_released = 0;
         if (FAILED(rebuilt)) {
             LeaveCriticalSection(&g_control);
             log_line("Start -> device side could not be rebuilt 0x%08lX", (unsigned long)rebuilt);
             return rebuilt;
         }
         g = g_sink.gen;
-        log_line("Start: rebuilt the device side after an abandoned generation");
+        log_line("Start: rebuilt the device side (%s)", why);
     }
+    g_sink.pause_token = 0;
     if (!g) { LeaveCriticalSection(&g_control); log_line("Start -> no device generation"); return E_FAIL; }
     InterlockedExchange(&g->running, 1);
     g_sink.started = 1;
@@ -256,6 +267,10 @@ static HRESULT STDMETHODCALLTYPE H_Stop(void *self) {
     if (!g_sink.started) { LeaveCriticalSection(&g_control); log_line("Stop -> S_FALSE (not started)"); return S_FALSE; }
     HRESULT hr = sink_stop();
     log_line("sink: stopped 0x%08lX", (unsigned long)hr);
+    /* Arms the idle release timer (watch thread). The token is the stream's
+       generation: anything that rebuilds the device side changes it. */
+    g_sink.pause_token = g_sink.gen ? g_sink.generation : 0;
+    g_sink.pause_tick = GetTickCount();
     LeaveCriticalSection(&g_control);
     return hr;
 }
@@ -604,6 +619,7 @@ static DWORD WINAPI watch_thread(LPVOID unused) {
         if (g_h_wake) WaitForSingleObject(g_h_wake, 400); else Sleep(400);
         if (!g_watch_running) break;
         if (!g_sink.engaged) { failures = 0; continue; }
+        sink_watch_share_tick();
 
         int lost = (int)g_sink.device_lost;
         if (!watch_should_retarget(lost, 0)) continue;
