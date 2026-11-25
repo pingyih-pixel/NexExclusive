@@ -33,7 +33,8 @@
 enum {
     NEX_CONTROL_CMD_NONE      = 0,
     NEX_CONTROL_CMD_SHARE     = 1,  /* leave exclusive now, stay shared until CMD_EXCLUSIVE */
-    NEX_CONTROL_CMD_EXCLUSIVE = 2   /* lift CMD_SHARE; exclusive again at the next resume */
+    NEX_CONTROL_CMD_EXCLUSIVE = 2,  /* lift CMD_SHARE; exclusive again at the next resume */
+    NEX_CONTROL_CMD_EXCLUSIVE_NOW = 3 /* lift CMD_SHARE and go exclusive at once (the listener asked) */
 };
 
 enum {

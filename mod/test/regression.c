@@ -2155,6 +2155,20 @@ static void test_control_block_share_and_back(void) {
     sink_control_tick();
     CHECK(block.state == NEX_CONTROL_STATE_EXCLUSIVE && block.playing == 0);
 
+    /* "restore exclusive" pressed by the listener: rebuilt at once */
+    seq = nex_control_post(&block, NEX_CONTROL_CMD_SHARE);
+    sink_control_tick();
+    g_sink.gen->shared = 1;
+    int before_now = rebuild_calls;
+    seq = nex_control_post(&block, NEX_CONTROL_CMD_EXCLUSIVE_NOW);
+    sink_control_tick();
+    CHECK(block.ack_seq == seq && block.ack_result == S_OK && g_share_forced == 0);
+    CHECK(rebuild_calls == before_now + 1 && g_sink.gen && !g_sink.gen->shared);
+    /* already exclusive: nothing to rebuild */
+    seq = nex_control_post(&block, NEX_CONTROL_CMD_EXCLUSIVE_NOW);
+    sink_control_tick();
+    CHECK(block.ack_seq == seq && rebuild_calls == before_now + 1);
+
     /* an unknown command is acknowledged with an error, not applied */
     seq = nex_control_post(&block, 77);
     sink_control_tick();

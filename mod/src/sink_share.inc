@@ -352,6 +352,25 @@ static HRESULT sink_apply_control(LONG cmd) {
             log_line("control: exclusive allowed again; the next resume returns to it");
         return S_OK;
     }
+    if (cmd == NEX_CONTROL_CMD_EXCLUSIVE_NOW) {
+        /* The listener pressed "restore exclusive": waiting for the next
+           pause would look like the button did nothing. Rebuild now, the
+           same way CMD_SHARE switched away. With auto_shared on and another
+           application still sounding, sink_pick_output keeps it shared. */
+        InterlockedExchange(&g_share_forced, 0);
+        HRESULT hr = S_OK;
+        EnterCriticalSection(&g_control);
+        if (g_sink.engaged && g_sink.gen && g_sink.gen->shared) {
+            LONG was_started = g_sink.started;
+            sink_stop();
+            g_sink.started = was_started;
+            hr = g_rebuild_device("listener restored exclusive");
+            log_line("control: restored exclusive while %s -> 0x%08lX",
+                     was_started ? "playing" : "paused", (unsigned long)hr);
+        }
+        LeaveCriticalSection(&g_control);
+        return hr;
+    }
     if (cmd != NEX_CONTROL_CMD_SHARE) return E_INVALIDARG;
     int was = InterlockedExchange(&g_share_forced, 1);
     HRESULT hr = S_OK;

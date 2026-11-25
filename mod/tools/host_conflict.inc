@@ -230,12 +230,13 @@ static DWORD WINAPI conflict_thread(LPVOID unused) {
         if (req == 1) {
             nex_control_post(blk, NEX_CONTROL_CMD_SHARE);
             InterlockedExchange(&g_ctl_manual, 1);
-            host_log("托盘：暂时关闭独占");
+            host_log("用户：暂时改为共享");
         } else if (req == 2) {
-            nex_control_post(blk, NEX_CONTROL_CMD_EXCLUSIVE);
+            /* 用户亲手点的「恢复独占」：马上切回去，不等下一次继续播放 */
+            nex_control_post(blk, NEX_CONTROL_CMD_EXCLUSIVE_NOW);
             InterlockedExchange(&g_ctl_manual, 0);
             cs.yielded = 0;
-            host_log("托盘：恢复独占（下次继续播放时生效）");
+            host_log("用户：恢复独占");
         }
 
         /* 用户回答了询问（或者记住过的「是」直接走到这里） */

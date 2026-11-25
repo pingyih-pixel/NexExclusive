@@ -184,7 +184,7 @@ select { appearance: none; height: 32px; min-width: 168px; max-width: 320px; pad
       <div class="cards">
         <div class="card"><svg class="ic" viewBox="0 0 20 20"><rect x="5" y="4" width="3" height="12" rx="1"/><rect x="12" y="4" width="3" height="12" rx="1"/></svg><div class="t">暂停后让出声卡<div class="d">网易云暂停时也占着声卡，暂停够久就还给系统</div></div><div class="grow"></div><select data-cfg="idle_release_ms"></select></div>
         <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M4 5h12v8H9l-4 3v-3H4z"/></svg><div class="t">别的应用想出声时问我<div class="d">音乐播放器问要不要交出独占，其他应用问要不要一起播放</div></div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" data-cfg="auto_shared"><span>关</span><i></i></button></div>
-        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M3 7h14M3 13h14"/></svg><div class="t">暂时改为共享<div class="d">检测不到的应用想出声时手动用；关掉后下次继续播放时回到独占</div></div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" id="manual-share"><span>关</span><i></i></button></div>
+        <div class="card"><svg class="ic" viewBox="0 0 20 20"><path d="M3 7h14M3 13h14"/></svg><div class="t">暂时改为共享<div class="d">检测不到的应用想出声时手动用；关掉立即回到独占</div></div><div class="grow"></div><button class="tog" role="switch" aria-checked="false" id="manual-share"><span>关</span><i></i></button></div>
       </div>
       <div class="lbl">记住的选择</div>
       <div class="cards" id="apps-list"></div>
