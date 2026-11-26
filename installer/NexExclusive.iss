@@ -105,8 +105,9 @@ begin
   KeptLog := ExpandConstant('{localappdata}\NexExclusive-setup.log');
   FileCopy(LogPath, KeptLog, False);
   if not BuiltInInstallOk then
-    SuppressibleMsgBox('安装没有完成（NexExclusive.exe --install 退出码 ' + IntToStr(ResultCode) + '）。' +
-      #13#10 + '原有安装保持不变。' + #13#10#13#10 +
+    { 续行不能以 # 开头：ISPP 会把它当成预处理指令 }
+    SuppressibleMsgBox('安装没有完成（NexExclusive.exe --install 退出码 ' + IntToStr(ResultCode) + '）。' + #13#10 +
+      '原有安装保持不变。' + #13#10#13#10 +
       '详细输出：' + KeptLog + #13#10#13#10 +
       '如果文件被杀软隔离，请看便携包 README.txt 的「杀软报毒」一节。',
       mbCriticalError, MB_OK, IDOK);
