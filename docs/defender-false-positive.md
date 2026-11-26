@@ -3,10 +3,17 @@
 > 目标：让 `Behavior:Win32/DefenseEvasion.A!ml` 不再命中本程序。
 > 提交入口：<https://www.microsoft.com/en-us/wdsi/filesubmission>
 > 选 **「Submit a file for analysis」** → 下一步选 **「I believe this file is incorrectly detected (false positive)」**。
+>
+> **这份材料必须和实际提交的产物一致。** 架构改了（新增 PE 文件、新的注入对象、新的内存修改方式），
+> 先改这里再提交。分析员拿材料对照样本，描述对不上会直接打回。
+> 当前对应的架构：4 个 PE 文件（`NexExclusive.exe`、`NexAudioHost.exe`、`nexsink.dll`、`nexui.dll`），
+> 两条注入链路（主进程 → `nexsink.dll`，渲染子进程 → `nexui.dll`），两种内存修改（音频接口 vtable、`cloudmusic.dll` 的导入表）。
 
 ## 提交前准备
 
-1. 把**安装目录**里的 `NexExclusive.exe` 和 `nexsink.dll` 一起打包成 zip（WDSI 接受 zip，不接受散装多个文件）。
+1. 把**发布包**（`release.sh` 产出的 `NexExclusive-<版本>.zip`）原样提交，或者把安装目录里的 4 个 PE 文件
+   `NexExclusive.exe`、`NexAudioHost.exe`、`nexsink.dll`、`nexui.dll` 一起打包成 zip
+   （WDSI 接受 zip，不接受散装多个文件）。只交一部分，分析员看到的行为和样本对不上。
 2. 填下面这些字段。哈希必须和上传的文件一致，否则分析会打回。
 
 | 字段 | 值 |
@@ -14,17 +21,20 @@
 | Detection name | `Behavior:Win32/DefenseEvasion.A!ml` |
 | Threat ID | `2147738096` |
 | Severity | Severe (5) |
-| Product | NexExclusive 1.0.0 |
+| Product | NexExclusive `<版本>`（取 `mod/tools/nexhost.c` 的 `APP_VERSION`，与包名一致） |
 | Publisher | 无签名（unsigned，个人项目） |
 
-文件哈希：**必须填你实际上传的那两个文件**，不要照抄旧值。Zig 的产物换一个输出路径哈希就会变
-（PDB 绝对路径写进了 PE 调试目录），重新编译一次就对不上了。在安装目录里取：
+文件哈希：**必须填你实际上传的那几个文件**，不要照抄旧值。Zig 的产物换一个输出路径哈希就会变
+（PDB 绝对路径写进了 PE 调试目录），重新编译一次就对不上了。发布包里的 `manifest.txt` 就是包内
+各文件的 SHA-256；从安装目录取：
 
 ```powershell
-Get-FileHash .\NexExclusive.exe, .\nexsink.dll -Algorithm SHA256
+Get-FileHash .\NexExclusive.exe, .\NexAudioHost.exe, .\nexsink.dll, .\nexui.dll -Algorithm SHA256
 ```
 
 ## 可直接粘贴的英文正文
+
+正文里不写文件大小：每次构建都会变，写错了反而显得材料不可信。
 
 ### Description
 
@@ -35,14 +45,23 @@ Windows shared-mode audio engine, which resamples everything to the system mix
 format. NexExclusive makes the player open its output device in WASAPI exclusive
 mode instead, so the original sample rate reaches the DAC unmodified.
 
-The application is a single 324 KB executable plus one 278 KB DLL. It has no
-installer framework, no auto-updater, no telemetry, and no outbound network
-access. The only sockets it opens are local: an HTTP server bound to
-127.0.0.1:9334 that serves the settings panel, and a client connection to the
-player's own Chrome DevTools port on 127.0.0.1:9333. Nothing leaves the machine.
+The package contains four PE files, all built from the public source repository:
+  - NexExclusive.exe  the launcher and tray host. It starts the player, loads
+                      the two DLLs below into the player's processes, and
+                      serves a loopback-only settings API
+  - nexsink.dll       loaded into the player's main process; it handles the
+                      audio format negotiation
+  - nexui.dll         loaded into the player's renderer process; it adds the
+                      NexExclusive settings panel to the player's own page
+  - NexAudioHost.exe  an optional out-of-process audio renderer. It is off by
+                      default (hook.cfg: audiohost=0). When enabled, nexsink.dll
+                      starts it as a child process and hands it PCM through a
+                      named shared-memory ring; it then owns the sound device
+There is no installer framework, no auto-updater, no telemetry, and no outbound
+network access. Nothing leaves the machine.
 ```
 
-### Why it loads a DLL into another process
+### Why it loads DLLs into another process
 
 ```
 WASAPI exclusive mode is negotiated inside the player process: the player calls
@@ -51,39 +70,65 @@ for comes from the player's own settings. There is no documented, supported way
 for a third-party component to change that negotiation from outside the process.
 The only workable mechanism is to load a DLL into the player process and hook the
 IAudioClient / IMMDevice vtable entries, then answer the negotiation with the
-device's real exclusive-mode capabilities.
+device's real exclusive-mode capabilities. That is nexsink.dll.
 
-The DLL is loaded by the launcher with the standard sequence:
+The settings panel lives inside the player's Chromium (CEF) page. nexui.dll is
+loaded into the player's child processes and does nothing unless its own command
+line contains --type=renderer. In the renderer it replaces five libcef.dll
+entries in the import address table of the player's own cloudmusic.dll
+(cef_v8context_get_current_context, cef_v8context_get_entered_context,
+cef_v8value_create_string, cef_v8value_create_function,
+cef_v8value_create_object), and uses the first call inside the player's main
+page to evaluate the panel scripts shipped next to the executable (ui\panel.js,
+ui\simplify.js). This replaces an older approach that required starting the
+player with a remote debugging port; that port is now off by default.
+
+Both DLLs are loaded by the launcher with the standard sequence:
 OpenProcess -> VirtualAllocEx -> WriteProcessMemory -> CreateRemoteThread(LoadLibraryA).
 That is the textbook process-injection pattern, and we understand it is what
 triggers a behavior-based detection. It is used here for a legitimate purpose:
-the target process is a local music player started by our own launcher, the DLL
-is our own code shipped next to the executable, and the only effect is that the
-player's audio stream opens the sound device in exclusive mode.
+the target processes belong to a local music player started by our own launcher,
+the DLLs are our own code shipped next to the executable, the launcher refuses
+cross-bitness targets, and the only effects are that the player's audio stream
+opens the sound device in exclusive mode and that the player's page shows one
+extra settings panel.
 ```
 
 ### What the software does NOT do
 
 ```
-- No outbound network access and no telemetry. The host opens two loopback-only
-  sockets: an HTTP server on 127.0.0.1:9334 that serves the settings panel, and a
-  client connection to the player's own DevTools port on 127.0.0.1:9333. There is
-  no Internet traffic, no update check, and no data collection
+- No outbound network access and no telemetry. The host listens only on
+  127.0.0.1:9334 for the settings panel; requests must carry a loopback Host
+  header, and cross-origin browser access is allowed only for the player's own
+  orpheus:// page. A connection to
+  the player's DevTools port (127.0.0.1:9333) is made only if the user opts in
+  with cdp=1 in host.cfg; it is off by default. There is no Internet traffic, no
+  update check, and no data collection
 - No defence evasion: it never touches Defender, AMSI, ETW, event logs, or any
   other security product, and it does not unhook or hide anything belonging to
-  the system. The only memory it modifies is the vtable of the player's own audio
-  interfaces (IMMDevice / IAudioClient), inside the player's process
-- No privilege escalation: it runs as the current user, never requests admin
+  the system. The memory it modifies is limited to:
+    * the vtables of the player's audio interfaces (IMMDevice / IAudioClient),
+      inside the player's main process (nexsink.dll)
+    * five libcef.dll entries in the import address table of the player's
+      cloudmusic.dll, inside the player's renderer process (nexui.dll)
+- No privilege escalation: it runs as the current user and never requests admin.
+  At start-up it enables SeDebugPrivilege only if the user's token already holds
+  it (it does not for a standard user), so that injection into the player works
+  the same way for an elevated user
 - No kernel component: no driver, no service, no boot-time component
-- No persistence beyond two standard, user-visible entries written by the
-  built-in installer:
+- No persistence beyond standard, user-visible entries written by the built-in
+  installer:
     HKCU\Software\Microsoft\Windows\CurrentVersion\Run\NexExclusive
     HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\NexExclusive
-  Both are removed by "NexExclusive.exe --uninstall" and by Settings > Apps
+    a Start Menu shortcut
+  All are removed by "NexExclusive.exe --uninstall" and by Settings > Apps
 - No encryption, packing, or obfuscation of its own binaries
 - No collection or transmission of user data
-- Does not modify the music player's files on disk; it only loads a DLL into a
-  running process, and the DLL is unloaded when the player exits
+- Does not modify the music player's files on disk; all changes are in the
+  memory of the running player processes and disappear when the player exits
+- Media-session control is limited to the player itself: when another
+  application starts playing, the host can ask the user whether to pause the
+  player, and pauses it through the standard Windows media session API
 ```
 
 ### The detection name is misleading
@@ -92,23 +137,25 @@ player's audio stream opens the sound device in exclusive mode.
 The classification "DefenseEvasion" suggests the file tries to avoid or disable
 security controls. It does not. The behaviour that most likely drives the score is
 "writes an executable into %LOCALAPPDATA%, creates a Run key, creates a Start Menu
-shortcut, and injects a DLL into another process". Each of those is also common in
+shortcut, and injects DLLs into another process". Each of those is also common in
 droppers, so the combination scores high - but in this case every step is
 performed openly, by a user-initiated installer, with a visible uninstall entry,
-and the injected code is an unsigned but fully inspectable 278 KB DLL that
-only implements audio format negotiation.
+and the injected code is unsigned but fully inspectable: two DLLs that implement
+audio format negotiation and a settings panel, built from public source.
 ```
 
 ### Steps to reproduce
 
 ```
-1. Download and extract NexExclusive-1.0.0.zip (contains NexExclusive.exe,
-   nexsink.dll, hook.cfg, ui.json, ui/).
+1. Download and extract NexExclusive-<version>.zip (contains NexExclusive.exe,
+   NexAudioHost.exe, nexsink.dll, nexui.dll, hook.cfg, ui.json, ui/,
+   manifest.txt, README.txt).
 2. Run: NexExclusive.exe --install --client "<path to cloudmusic.exe>"
    This copies the files to %LOCALAPPDATA%\NexExclusive, writes the two HKCU
    entries above, and creates a Start Menu shortcut.
 3. Run: %LOCALAPPDATA%\NexExclusive\NexExclusive.exe
-   It starts the music player and injects nexsink.dll into it.
+   It starts the music player, injects nexsink.dll into the main process and
+   nexui.dll into the player's child processes.
 4. Within roughly one minute, Defender quarantines NexExclusive.exe and also
    removes the shortcut and both registry entries.
 ```
@@ -116,8 +163,8 @@ only implements audio format negotiation.
 ### Requested outcome
 
 ```
-Please reclassify Behavior:Win32/DefenseEvasion.A!ml so it no longer matches this
-file. If the behaviour-based detection cannot be adjusted for an unsigned binary,
+Please reclassify Behavior:Win32/DefenseEvasion.A!ml so it no longer matches these
+files. If the behaviour-based detection cannot be adjusted for unsigned binaries,
 please tell us which specific behaviour needs to change and we will redesign
 accordingly.
 ```
@@ -127,15 +174,16 @@ accordingly.
 WDSI 常见回信是「仍判定为威胁」。可以做的：
 
 1. **改注入方式**再提交一次。现在是最典型的 `VirtualAllocEx` + `CreateRemoteThread`。换成「代理 DLL」——把转发导出表的 `version.dll` / `winmm.dll` 放在客户端目录旁，客户端加载它时顺带加载 `nexsink.dll`。没有跨进程写入，没有远程线程，行为特征完全不同。代价：要写客户端安装目录，装在 `Program Files` 时没权限。
-2. **代码签名**。对 `!ml` 行为判定帮助有限（签名不能证明行为无害），但能显著降低 SmartScreen 和云查杀的分数，也更容易让分析员认真看材料。
-3. **开源仓库 + 公开构建**（已完成）。仓库 <https://github.com/pingyih-pixel/NexExclusive> 公开，
+2. **缩小 `nexui.dll` 的注入面**。现在是注入主进程的每个子进程，再由 DLL 自己看命令行；先在宿主侧读子进程命令行、只注入 `--type=renderer`，远程线程数会明显减少。
+3. **代码签名**。对 `!ml` 行为判定帮助有限（签名不能证明行为无害），但能显著降低 SmartScreen 和云查杀的分数，也更容易让分析员认真看材料。
+4. **开源仓库 + 公开构建**（已完成）。仓库 <https://github.com/pingyih-pixel/NexExclusive> 公开，
    CI 在 `windows-latest` 上跑同一套脚本出包。分析员可以直接对照源码与产物。
 
 ## 期间的分发办法
 
 在误报解决之前，Release 页面必须写清楚：
 
-- 首次运行前给 `NexExclusive.exe` 和 `nexsink.dll` 这两个文件加排除项（管理员），否则 exe 会被隔离
+- 首次运行前给 `NexExclusive.exe`、`nexsink.dll`、`nexui.dll` 这三个文件加排除项（管理员），否则 exe 会被隔离
 - 不要给整个目录加排除：那个目录对当前用户可写，整体排除等于让放进去的任何文件都不再被扫描
 - 给出确切命令，不要只说「加个白名单」
 - 明确写「不想加排除项就别用，不要为了这个关掉实时保护」

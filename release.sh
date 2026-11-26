@@ -29,10 +29,16 @@ if [[ ! "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     exit 2
 fi
 
-# 我们验过的客户端版本，写进说明里，让用户能自己对一下
-CLIENT_VER=$(sed -n 's/.*L"\([0-9][0-9.]*\)".*/\1/p' "$MOD_DIR/tools/nexhost.c" |
-             sed -n '/^3\./p' | head -1)
-CLIENT_VER=${CLIENT_VER:-未知}
+# 我们验过的客户端版本，写进说明里，让用户能自己对一下。只截取 kVerified[]
+# 数组本身：以前取整个文件里第一个 3.x 字符串，数组一加第二项就漏掉了。
+CLIENT_VERS=$(sed -n '/kVerified\[\] = {/,/};/p' "$MOD_DIR/tools/nexhost.c" |
+              sed -n 's/.*L"\([0-9][0-9.]*\)".*/\1/p')
+if [[ -z "$CLIENT_VERS" ]]; then
+    printf '读不出 nexhost.c 里 kVerified[] 的客户端版本列表\n' >&2
+    exit 2
+fi
+CLIENT_VER_LIST=$(printf '%s\n' "$CLIENT_VERS" | paste -sd'/' - | sed 's#/#、#g')
+CLIENT_VER_BULLETS=$(printf '%s\n' "$CLIENT_VERS" | sed 's/^/  - /')
 
 NAME="NexExclusive-$VER"
 STAGE="$DIST/$NAME"
@@ -87,7 +93,7 @@ NexExclusive $VER —— 给网易云音乐客户端加上 WASAPI 独占输出
 
 【要求】
   · Windows 10/11 64 位
-  · 网易云音乐客户端 $CLIENT_VER（这是唯一验证过的版本；其他版本能跑，
+  · 网易云音乐客户端 $CLIENT_VER_LIST（只验证过这几个版本；其他版本能跑，
     但客户端大版本更新有可能改动内部结构，日志里会标「未经验证」）
   · 独占输出要求声卡/耳机支持你要的采样率。客户端设置里选 44.1k / 48k 最稳，
     88.2k 及以上要看设备白名单——不是所有标称 96k 的设备都收 88.2k。
@@ -149,7 +155,7 @@ cat > "$NOTES" <<EOF
 - 单实例：自启的那份和手动双击的那份不会打架
 - 客户端路径七级探测（环境变量 → host.cfg → 运行中的进程 → 注册表 →
   桌面/开始菜单快捷方式 → 常见位置 → 文件选择框），装在非常规目录也能找到
-- 客户端版本检查：只对 $CLIENT_VER 做过验证，其他版本会在日志里标出来
+- 客户端版本检查：只对 $CLIENT_VER_LIST 做过验证，其他版本会在日志里标出来
 
 ## 已知问题
 
@@ -180,7 +186,8 @@ sha256       $SHA
 ## 验证环境
 
 - Windows 11 家庭版 build 26200（25H2）x64
-- 网易云音乐 $CLIENT_VER
+- 网易云音乐客户端：
+$CLIENT_VER_BULLETS
 - 已实测端点：HyperX Cloud III（44.1k/48k/96k 独占）、AudioQuest DragonFly MM3A（额外支持 88.2k）
 EOF
 

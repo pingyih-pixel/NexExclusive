@@ -1001,14 +1001,41 @@
     return undefined;
   }
 
+  // 源规格的证据等级（宿主 source_status）。只有解码器确认才算确定；缓存只能说明
+  // 「选中了哪个缓存文件、凭什么选」，按写入时间挑的必须明确写「推测」。
+  var SOURCE_EVIDENCE_LABELS = {
+    'decoder-confirmed': '解码器确认',
+    'client-reported': '客户端报告',
+    'cache-quality-match': '缓存质量档匹配',
+    'cache-rate-match': '缓存采样率匹配',
+    'cache-single': '唯一缓存文件',
+    'cache-mtime-inferred': '推测（按缓存写入时间）',
+    'observed': '推测（依据未知）'
+  };
+
+  function sourceEvidenceLabel(status) {
+    return Object.prototype.hasOwnProperty.call(SOURCE_EVIDENCE_LABELS, status)
+      ? SOURCE_EVIDENCE_LABELS[status] : '';
+  }
+
+  // 结果属于更早的输出代次时不展示：宿主会按新代次重挑，期间显示「查询中」。
+  // 任一边代次未知（0）时不做判断，避免没有 ENGAGED 记录时把结果全部藏掉。
+  function sourceGenerationStale(snapshot) {
+    var sourceGeneration = Number(snapshotField(snapshot, 'sourceAudioGeneration', 'source_audio_generation'));
+    var currentGeneration = Number(snapshotField(snapshot, 'currentGeneration', 'current_generation'));
+    return sourceGeneration > 0 && currentGeneration > 0 && sourceGeneration !== currentGeneration;
+  }
+
   function formatSourceAudioSpec(snapshot) {
     var sourceStatus = snapshotField(snapshot, 'sourceStatus', 'source_status');
     var rate = Number(snapshotField(snapshot, 'sourceRate', 'source_rate'));
     var valid = Number(snapshotField(snapshot, 'sourceValidBits', 'source_valid_bits'));
     var container = Number(snapshotField(snapshot, 'sourceContainerBits', 'source_container_bits'));
     var encoding = snapshotField(snapshot, 'sourceEncoding', 'source_encoding') || 'PCM';
+    var evidence = sourceEvidenceLabel(sourceStatus);
     if (sourceStatus === 'pending') return '源规格：查询中';
-    if (sourceStatus !== 'observed' || !rate) return '源规格：未取得';
+    if (!evidence || !rate) return '源规格：未取得';
+    if (sourceGenerationStale(snapshot)) return '源规格：查询中';
     if (!container) container = valid;
     if (encoding === 'float' || encoding === 'float32') encoding = 'float32';
     else if (encoding === 'integer' || encoding === 'int' || encoding === 'pcm') encoding = '整数 PCM';
@@ -1018,11 +1045,12 @@
       var details = [];
       if (valid > 0) details.push(valid + ' bit');
       if (kbps > 0) details.push(kbps + ' kbps');
-      return '源规格　' + formatRate(rate) + ' / ' + (details.length ? details.join(' · ') + ' ' : '') + encoding;
+      return '源规格　' + formatRate(rate) + ' / ' + (details.length ? details.join(' · ') + ' ' : '') + encoding
+        + ' · ' + evidence;
     }
     if (valid <= 0) return '源规格：未取得';
     return '源规格　' + formatRate(rate) + ' / ' + valid + ' bit ' + encoding
-      + '（' + container + ' bit 容器）';
+      + '（' + container + ' bit 容器）' + ' · ' + evidence;
   }
 
   function engagedSummary(text) {
