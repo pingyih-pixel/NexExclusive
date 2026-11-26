@@ -45,8 +45,21 @@ jobs:
           node mod/tools/nexhost.contract.test.js
           node mod/ui/panel.contract.test.js
 
+      # windows-latest 镜像不一定自带 Inno Setup；没有就用 choco 装
+      - name: 准备 Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE) { throw "innosetup 安装失败：$LASTEXITCODE" }
+          }
+          if (-not (Test-Path $iscc)) { throw "找不到 $iscc" }
+
       - name: 构建并打包
         shell: bash
+        env:
+          REQUIRE_INSTALLER: 1
         run: bash release.sh
 
       - name: 上传产物
@@ -55,6 +68,7 @@ jobs:
           name: NexExclusive-package
           path: |
             dist/*.zip
+            dist/*-setup.exe
             dist/SHA256SUMS.txt
             dist/RELEASE-NOTES.md
           if-no-files-found: error
@@ -70,9 +84,13 @@ jobs:
         with:
           name: NexExclusive-package
           path: dist
+      # 没有代码签名、Defender 误报也没解决之前，一律先发预发布。本机验证过再转正式版：
+      #   gh release edit <tag> --prerelease=false
       - uses: softprops/action-gh-release@v2
         with:
           body_path: dist/RELEASE-NOTES.md
+          prerelease: true
           files: |
             dist/*.zip
+            dist/*-setup.exe
             dist/SHA256SUMS.txt

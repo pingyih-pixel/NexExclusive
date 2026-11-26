@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 打发布包：编译 → 只挑出运行时要的 8 个文件 → 生成包内清单 → 加安装说明 → 压 zip → 出校验和与
-# Release 说明。产物全在 dist/ 下，不碰构建目录，也不会把 .pdb / 测试工具塞进去。
+# 打发布包：编译 → 只挑出运行时要的 8 个文件 → 生成包内清单 → 加安装说明 → 压 zip →（有 Inno Setup 时）
+# 打安装程序 → 出校验和与 Release 说明。产物全在 dist/ 下，不碰构建目录，也不会把 .pdb / 测试工具塞进去。
 #
 #   ./release.sh              用 nexhost.c 里的 APP_VERSION
 #   ./release.sh 1.0.1        临时指定版本号（不改源码）
@@ -128,13 +128,69 @@ rm -f -- "$ZIP"
 # 用户解压出来是一个文件夹而不是散落一地。
 ( cd "$DIST" && "$BSD_TAR" -a -c -f "$ZIP" "$NAME" )
 
+# 安装程序：Inno Setup 把上面同一个便携包目录（含 manifest.txt）打进 Setup.exe，
+# 安装时调用包内 NexExclusive.exe --install，安装逻辑仍只有一份。
+# 本机没装 Inno Setup 时跳过；CI 设 REQUIRE_INSTALLER=1，缺了就失败。
+SETUP_NAME="$NAME-setup.exe"
+SETUP="$DIST/$SETUP_NAME"
+rm -f -- "$SETUP"
+ISCC=${ISCC:-}
+if [[ -z "$ISCC" ]]; then
+    for c in "$(command -v iscc 2>/dev/null || true)" \
+             "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+             "/c/Program Files/Inno Setup 6/ISCC.exe"; do
+        if [[ -n "$c" && -x "$c" ]]; then ISCC=$c; break; fi
+    done
+fi
+if [[ -n "$ISCC" ]]; then
+    printf '==> 打安装程序（%s）\n' "$ISCC"
+    # /D 开头的参数会被 MSYS 当成路径改写，关掉转换并传 Windows 路径
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$ISCC" /Qp \
+        "/DAppVersion=$VER" \
+        "/DPackageDir=$(cygpath -w "$STAGE")" \
+        "/DOutputDir=$(cygpath -w "$DIST")" \
+        "$(cygpath -w "$ROOT/installer/NexExclusive.iss")"
+    if [[ ! -f "$SETUP" ]]; then
+        printf '安装程序没有生成：%s\n' "$SETUP" >&2
+        exit 1
+    fi
+elif [[ "${REQUIRE_INSTALLER:-0}" == 1 ]]; then
+    printf '找不到 Inno Setup 的 ISCC.exe，而 REQUIRE_INSTALLER=1\n' >&2
+    exit 1
+else
+    printf '==> 跳过安装程序：没找到 Inno Setup 6（ISCC.exe），可用 ISCC=/path/to/ISCC.exe 指定\n'
+fi
+
 printf '==> 校验和\n'
-( cd "$DIST" && sha256sum "$NAME.zip" > SHA256SUMS.txt && cat SHA256SUMS.txt )
+ARTIFACTS=("$NAME.zip")
+[[ -f "$SETUP" ]] && ARTIFACTS+=("$SETUP_NAME")
+( cd "$DIST" && sha256sum "${ARTIFACTS[@]}" > SHA256SUMS.txt && cat SHA256SUMS.txt )
 
 printf '==> 写 Release 说明\n'
 NOTES="$DIST/RELEASE-NOTES.md"
 SIZE=$(du -k "$ZIP" | cut -f1)
-SHA=$(cut -d' ' -f1 "$DIST/SHA256SUMS.txt")
+# sha256sum 在 MSYS 下可能输出「哈希 *文件名」（二进制模式标记），两种写法都认
+sum_of() { awk -v f="$1" '{n=$2; sub(/^\*/, "", n); if (n == f) print $1}' "$DIST/SHA256SUMS.txt"; }
+SHA=$(sum_of "$NAME.zip")
+if [[ -f "$SETUP" ]]; then
+    SETUP_SIZE=$(du -k "$SETUP" | cut -f1)
+    SETUP_SHA=$(sum_of "$SETUP_NAME")
+    INSTALL_SECTION="两种下载，二选一：
+
+- **安装版** \`$SETUP_NAME\`：双击安装到 \`%LOCALAPPDATA%\\NexExclusive\`，登记开机自启、
+  开始菜单和「设置 → 应用」里的卸载项。不需要管理员权限。
+- **便携版** \`$NAME.zip\`：解压后双击 \`NexExclusive.exe\` 直接用。第一次会问要不要安装，
+  选「否」就保持便携（不自启、不写卸载项）；选「是」和安装版效果相同。"
+    FILE_LINES="$SETUP_NAME    $SETUP_SIZE KB
+sha256       $SETUP_SHA
+
+$NAME.zip    $SIZE KB
+sha256       $SHA"
+else
+    INSTALL_SECTION="下载 \`$NAME.zip\`，解压，双击 \`NexExclusive.exe\`。第一次会问要不要安装，选「是」即可。"
+    FILE_LINES="$NAME.zip    $SIZE KB
+sha256       $SHA"
+fi
 cat > "$NOTES" <<EOF
 # NexExclusive $VER
 
@@ -142,8 +198,10 @@ cat > "$NOTES" <<EOF
 
 ## 安装
 
-下载 \`$NAME.zip\`，解压，双击 \`NexExclusive.exe\`。第一次会问要不要安装，选「是」即可。
-装完驻留托盘，之后开网易云自动生效。
+$INSTALL_SECTION
+
+装完驻留托盘，之后开网易云自动生效。两种方式都没有代码签名，SmartScreen 可能提示
+「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」。
 
 命令行方式：\`NexExclusive.exe --install\` / \`--uninstall\` / \`--help\`。
 
@@ -177,11 +235,10 @@ Add-MpPreference -ExclusionPath "\$env:LOCALAPPDATA\NexExclusive\nexui.dll"
 ## 文件
 
 \`\`\`
-$NAME.zip    $SIZE KB
-sha256       $SHA
+$FILE_LINES
 \`\`\`
 
-包内：\`NexExclusive.exe\`、\`NexAudioHost.exe\`、\`nexsink.dll\`、\`nexui.dll\`、\`hook.cfg\`、\`ui.json\`、\`ui/\`、\`manifest.txt\`、\`README.txt\`。
+zip 包内（安装版装的也是这些）：\`NexExclusive.exe\`、\`NexAudioHost.exe\`、\`nexsink.dll\`、\`nexui.dll\`、\`hook.cfg\`、\`ui.json\`、\`ui/\`、\`manifest.txt\`、\`README.txt\`。
 
 ## 验证环境
 
@@ -194,5 +251,6 @@ EOF
 rm -rf -- "$BUILD"
 printf '\n完成：\n'
 printf '  %s\n' "$ZIP"
+if [[ -f "$SETUP" ]]; then printf '  %s\n' "$SETUP"; fi
 printf '  %s\n' "$DIST/SHA256SUMS.txt"
 printf '  %s\n' "$NOTES"

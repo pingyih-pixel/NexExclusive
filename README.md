@@ -35,16 +35,17 @@ Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\NexExclusive\nexsink.dll"
 
 **与网易公司无关。** 这是非官方工具。往第三方客户端进程里加载 DLL，有违反其用户协议的风险，后果自负。
 
-**系统与设备。** 需要 Windows 10/11 x64。播放设备要在 Windows 声音属性的「高级」页里允许应用程序独占控制。客户端版本只验证过 3.1.42.205594，其余版本见[兼容性](#兼容性)。
+**系统与设备。** 需要 Windows 10/11 x64。播放设备要在 Windows 声音属性的「高级」页里允许应用程序独占控制。客户端版本只验证过 3.1.42.205594 和 3.1.43.205627，其余版本见[兼容性](#兼容性)。
 
 ## 下载与首次运行
 
-**目前没有正式的 Release。** Defender 误报还没有结论，此时发布一个装完半分钟就被删除的版本，会白白用掉第一印象，所以 Release 暂缓，原因记录在 [docs/ROADMAP.md](docs/ROADMAP.md)。取得程序有两种途径：
+**目前只有预发布（Pre-release）。** 程序没有代码签名，Defender 误报也还没有结论，装完可能被隔离，所以先以预发布形式提供，原因记录在 [docs/ROADMAP.md](docs/ROADMAP.md)。取得程序有三种途径：
 
-1. 打开 [Actions](https://github.com/pingyih-pixel/NexExclusive/actions/workflows/build.yml)，进入最近一次成功的构建，下载产物 `NexExclusive-package`（下载产物需要登录 GitHub）。包内有 `NexExclusive-x.y.z.zip` 和 `SHA256SUMS.txt`。
-2. 自行构建，步骤见 [docs/BUILDING.md](docs/BUILDING.md)。
-
-Release 发布后，这里会换成下载链接。
+1. 在 [Releases](https://github.com/pingyih-pixel/NexExclusive/releases) 下载，二选一：
+   - **安装版** `NexExclusive-x.y.z-setup.exe`：装到 `%LOCALAPPDATA%\NexExclusive`，登记开机自启、开始菜单和卸载项，不需要管理员权限；
+   - **便携版** `NexExclusive-x.y.z.zip`：解压后直接运行 `NexExclusive.exe`。
+2. 打开 [Actions](https://github.com/pingyih-pixel/NexExclusive/actions/workflows/build.yml)，进入最近一次成功的构建，下载产物 `NexExclusive-package`（下载产物需要登录 GitHub）。
+3. 自行构建，步骤见 [docs/BUILDING.md](docs/BUILDING.md)。
 
 下载后先核对哈希，输出应与 `SHA256SUMS.txt` 中对应的一行一致：
 
@@ -124,7 +125,7 @@ NexExclusive.exe --help
 | 项 | 已验证 | 尚未验证 |
 | --- | --- | --- |
 | 系统 | Windows 11 26200 家庭版 | Windows 10 22H2 |
-| 客户端 | 3.1.42.205594 | 其他版本。日志里会标「未经验证」；客户端更新若改动了内部布局，会出现没有声音也没有报错的情形 |
+| 客户端 | 3.1.42.205594、3.1.43.205627 | 其他版本。日志里会标「未经验证」；客户端更新若改动了内部布局，会出现没有声音也没有报错的情形 |
 | 设备 | HyperX Cloud III（44.1 / 48 / 96）；AudioQuest DragonFly MM3A（另有 88.2） | Realtek 集成声卡、HDMI 输出、352.8 / 384 kHz、5.1 / 7.1 多声道 |
 
 ## 已知问题

@@ -35,16 +35,17 @@ If you run it straight from the extracted folder, exclude the same two files the
 
 **Not affiliated with NetEase.** This is an unofficial tool. Loading a DLL into a third-party client may violate its terms of service; use at your own risk.
 
-**System and device.** Windows 10/11 x64. In the Windows sound properties ("Advanced" tab), the playback device must allow applications to take exclusive control. Only client version 3.1.42.205594 has been verified; see [Compatibility](#compatibility).
+**System and device.** Windows 10/11 x64. In the Windows sound properties ("Advanced" tab), the playback device must allow applications to take exclusive control. Only client versions 3.1.42.205594 and 3.1.43.205627 have been verified; see [Compatibility](#compatibility).
 
 ## Download and first run
 
-**There is no official Release yet.** The Defender false positive is unresolved, and publishing a build that is deleted thirty seconds after install would spend the first impression for nothing, so the Release is on hold; the reasoning is in [docs/ROADMAP.md](docs/ROADMAP.md) (Chinese). Two ways to get the program:
+**Only pre-releases so far.** The binaries are unsigned and the Defender false positive is unresolved, so an install may be quarantined; builds are published as pre-releases until that changes. The reasoning is in [docs/ROADMAP.md](docs/ROADMAP.md) (Chinese). Three ways to get the program:
 
-1. Open [Actions](https://github.com/pingyih-pixel/NexExclusive/actions/workflows/build.yml), go to the latest successful run and download the artifact `NexExclusive-package` (downloading artifacts requires a GitHub login). It contains `NexExclusive-x.y.z.zip` and `SHA256SUMS.txt`.
-2. Build it yourself; see [docs/BUILDING.md](docs/BUILDING.md).
-
-Once a Release is published, this section will link to it.
+1. Download from [Releases](https://github.com/pingyih-pixel/NexExclusive/releases), either:
+   - **Installer** `NexExclusive-x.y.z-setup.exe`: installs to `%LOCALAPPDATA%\NexExclusive` with autostart, a Start Menu entry and an uninstall entry; no admin rights needed;
+   - **Portable** `NexExclusive-x.y.z.zip`: extract and run `NexExclusive.exe`.
+2. Open [Actions](https://github.com/pingyih-pixel/NexExclusive/actions/workflows/build.yml), go to the latest successful run and download the artifact `NexExclusive-package` (downloading artifacts requires a GitHub login).
+3. Build it yourself; see [docs/BUILDING.md](docs/BUILDING.md).
 
 After downloading, check the hash; the output should match the corresponding line in `SHA256SUMS.txt`:
 
@@ -103,7 +104,7 @@ While the program runs, port 9334 (and 9333 with `cdp=1`) is open on the loopbac
 | Item | Verified | Not yet verified |
 | --- | --- | --- |
 | System | Windows 11 26200 Home | Windows 10 22H2 |
-| Client | 3.1.42.205594 | Other versions. The log marks them "unverified"; if a client update changes its internal layout, the result is silence without an error |
+| Client | 3.1.42.205594, 3.1.43.205627 | Other versions. The log marks them "unverified"; if a client update changes its internal layout, the result is silence without an error |
 | Device | HyperX Cloud III (44.1 / 48 / 96); AudioQuest DragonFly MM3A (88.2 as well) | Realtek onboard audio, HDMI output, 352.8 / 384 kHz, 5.1 / 7.1 multichannel |
 
 ## Known issues
