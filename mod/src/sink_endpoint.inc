@@ -16,6 +16,25 @@
    the client never has more than the device asks for, every period is
    submitted late, and the device replays or zero-fills it: stutter and noise.
    Periods are in device frames; the client counts in its own rate. */
+/* Cold start (NetEase, seen 2026-11-27): pressing play first opens a stream in
+   the system mix format (48 kHz float) and, 0.4 s later, reopens it in the
+   track's own format (44.1 kHz/16). Opening and starting the DAC on the first
+   one makes it switch rate twice and cuts the first stream while it sounds:
+   an audible click. So when nothing has played and nothing was opened for a
+   while, the hardware waits settle_ms before its first start; a reopen in the
+   meantime replaces the stream before the DAC ever ran at the passing format.
+   Track changes, a reopen right after another open, and resumes are not cold
+   and start at once. 0 = no hold. */
+#define SINK_COLD_GAP_MS 2000u
+static DWORD sink_cold_start_hold(DWORD now, int shared, int remote) {
+    int recent_engage = g_last_engage_tick && now - g_last_engage_tick < SINK_COLD_GAP_MS;
+    int recent_audio  = g_last_audible_tick && now - g_last_audible_tick < SINK_COLD_GAP_MS;
+    g_last_engage_tick = now ? now : 1;
+    if (shared || remote || g_settle_ms <= 0 || recent_engage || recent_audio) return 0;
+    DWORD until = now + (DWORD)g_settle_ms;
+    return until ? until : 1;
+}
+
 static UINT32 event_safe_client_frames(UINT32 want, const SinkGen *g) {
     if (!g) return want;
     UINT32 floor = g->real_frames;
@@ -947,6 +966,10 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     g_sink.device_lost  = 0;
     if (gen->shared) { g_sink.skip_frames = 0; g_sink.prime_left = 0; }
     else sink_arm_prime(gen, used_rate);
+    g_sink.start_hold_until = sink_cold_start_hold(GetTickCount(), gen->shared, gen->remote);
+    if (g_sink.start_hold_until)
+        log_line("sink: cold start, hardware waits %d ms for the client's format to settle",
+                 g_settle_ms);
 
     char a[160], b[240];
     describe("in", fmt, a, sizeof(a));

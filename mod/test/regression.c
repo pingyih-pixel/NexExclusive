@@ -2689,6 +2689,77 @@ static void test_drain_primes_silence(void) {
     printf("PASS prime: silence fills the first device buffer, client audio follows unchanged\n");
 }
 
+/* Cold start: the client opens in the mix format, then reopens in the track's
+   format. The hardware must not run on the first one. */
+static void test_cold_start_hold(void) {
+    g_settle_ms = 600;
+    g_last_engage_tick = 0;
+    g_last_audible_tick = 0;
+    /* nothing played or opened: hold */
+    CHECK(sink_cold_start_hold(100000, 0, 0) == 100600);
+    /* the reopen 0.4 s later: not cold, starts at once */
+    CHECK(sink_cold_start_hold(100400, 0, 0) == 0);
+    /* a track change while audio played: not cold */
+    g_last_audible_tick = 150000;
+    CHECK(sink_cold_start_hold(150500, 0, 0) == 0);
+    /* long silence and no recent open: cold again */
+    CHECK(sink_cold_start_hold(160000, 0, 0) == 160600);
+    /* shared, the separate host, or settle_ms=0: never held */
+    CHECK(sink_cold_start_hold(170000, 1, 0) == 0);
+    CHECK(sink_cold_start_hold(180000, 0, 1) == 0);
+    g_settle_ms = 0;
+    CHECK(sink_cold_start_hold(190000, 0, 0) == 0);
+    g_settle_ms = 600;
+
+    /* the drain honours the hold: full client buffer, still no start */
+    prepare_ring();
+    reset_patches();
+    SinkGen *gen = mock_gen();
+    gen->real_frames = 64;
+    g_sink.cap = 64;
+    free(g_sink.ring);
+    g_sink.ring = (BYTE *)calloc(64, 8);
+    g_sink.reported_frames = 32;
+    g_sink.in_rate = 48000;
+    g_sink.out_rate = 48000;
+    void *ac_vt[15] = {0}, *ac_orig[24] = {0};
+    ac_vt[AC_GETCURRENTPADDING] = (void *)mock_get_padding;
+    ac_vt[AC_START] = (void *)mock_start_counted;
+    ac_vt[AC_STOP] = (void *)mock_stop;
+    ac_vt[AC_RESET] = (void *)mock_reset;
+    for (int i = 0; i < 15; i++) ac_orig[i] = ac_vt[i];
+    register_originals(ac_vt, ac_orig);
+    void *rc_vt[5] = {0}, *rc_orig[24] = {0};
+    rc_vt[RC_GETBUFFER] = (void *)mock_render_get;
+    rc_vt[RC_RELEASEBUFFER] = (void *)mock_render_release;
+    for (int i = 0; i < 5; i++) rc_orig[i] = rc_vt[i];
+    register_originals(rc_vt, rc_orig);
+    void *ac_obj[1] = {ac_vt}, *rc_obj[1] = {rc_vt};
+    gen->real = (IAudioClient *)ac_obj;
+    gen->real_render = (IAudioRenderClient *)rc_obj;
+    free(g_inb);
+    g_inb = (BYTE *)malloc((size_t)SCRATCH_FRAMES * g_sink.in_block);
+    mock_padding = 0; mock_gb_calls = 0; mock_start_calls = 0;
+
+    g_sink.prime_left = 64;
+    g_sink.w = 64; g_sink.r = 0;
+    g_sink.start_hold_until = GetTickCount() + 60000;
+    CHECK(drain_once(gen) == S_FALSE);
+    CHECK(mock_gb_calls == 0 && mock_start_calls == 0 && !gen->device_started);
+    g_sink.start_hold_until = GetTickCount() - 1;   /* settled */
+    CHECK(drain_once(gen) == S_OK);
+    CHECK(mock_start_calls == 1 && gen->device_started && g_sink.start_hold_until == 0);
+
+    gen->real = NULL;
+    gen->real_render = NULL;
+    g_sink.gen = NULL;
+    gen_release(gen);
+    free_ring();
+    g_last_engage_tick = 0;
+    g_last_audible_tick = 0;
+    printf("PASS cold start: the first open waits for the client's format, reopens and track changes do not\n");
+}
+
 static void test_clock_excludes_primed_silence(void) {
     UINT64 pos = 0, qpc = 0;
     prepare_ring();
@@ -3063,6 +3134,7 @@ int main(void) {
     test_remote_transport_signals();
     test_log_queue_order_and_overflow();
     test_drain_primes_silence();
+    test_cold_start_hold();
     test_clock_excludes_primed_silence();
     test_remote_clock_converts_device_ticks();
     test_audio_buffers_locked();

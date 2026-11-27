@@ -177,6 +177,10 @@ static HRESULT drain_once(SinkGen *g) {
            hardware is still started only once a full buffer of client audio is
            waiting, so the silence is followed by music, never by an underrun. */
         if (!g->device_started) {
+            if (g_sink.start_hold_until &&
+                (LONG)(GetTickCount() - g_sink.start_hold_until) < 0)
+                return S_FALSE;               /* cold start: the format may still change */
+            g_sink.start_hold_until = 0;
             UINT64 need = g_sink.out_rate && g_sink.in_rate != g_sink.out_rate
                 ? ((UINT64)g->real_frames * (UINT64)g_sink.in_rate + g_sink.out_rate - 1) / g_sink.out_rate
                 : g->real_frames;
@@ -329,6 +333,7 @@ static HRESULT drain_once(SinkGen *g) {
         g->last_submit=(LONG)t;
         if(g_last_write) { DWORD gap=t-g_last_write; if(gap>g_max_gap) g_max_gap=gap; }
         g_last_write=t;
+        g_last_audible_tick=t ? t : 1;
         /* Polling can submit many small batches per second. Report by elapsed
            time so the log stays bounded and gaps use a consistent window. */
         g_writes++;

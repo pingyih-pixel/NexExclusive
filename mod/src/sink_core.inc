@@ -19,6 +19,8 @@ static int g_event       = 0;   /* 1: try event-driven exclusive first, timer po
 static int g_memlock     = 1;   /* VirtualLock the buffers the drain path touches */
 static int g_prime       = 1;   /* one device buffer of silence before a fresh start */
 static int g_resync_ms   = 200; /* extra silence when the DAC changes clock family */
+static int g_settle_ms   = 600; /* cold start: hold the hardware until the client's format settles */
+static DWORD g_last_engage_tick, g_last_audible_tick;  /* cold-start detection (sink_cold_start_hold) */
 static int g_idle_release_ms = 0; /* give the device back after this long paused; 0 = never */
 static int g_auto_shared = 0;   /* open shared next to another sounding application */
 static int g_share_quiet_ms = NEX_AUDIO_SHARE_QUIET_DEFAULT_MS;
@@ -347,6 +349,7 @@ typedef struct {
 
     UINT32             fade_total;      /* frames in the opening ramp */
     UINT32             fade_left;
+    DWORD              start_hold_until; /* GetTickCount; 0 = start as soon as primed */
 
     char               ep_name[128];    /* friendly name of the endpoint in use */
 
@@ -589,6 +592,7 @@ static void load_config(void) {
         else if (_strnicmp(p, "dedicated_core=", 15) == 0) g_dedicated_core = atoi(p + 15) != 0;
         else if (_strnicmp(p, "process_priority=", 17) == 0) g_process_priority = atoi(p + 17) != 0;
         else if (_strnicmp(p, "resync_ms=", 10) == 0) g_resync_ms = atoi(p + 10);
+        else if (_strnicmp(p, "settle_ms=", 10) == 0) g_settle_ms = atoi(p + 10);
         else if (_strnicmp(p, "idle_release_ms=", 16) == 0) g_idle_release_ms = atoi(p + 16);
         else if (_strnicmp(p, "auto_shared=", 12) == 0) g_auto_shared = atoi(p + 12) != 0;
         else if (_strnicmp(p, "share_quiet_ms=", 15) == 0) g_share_quiet_ms = atoi(p + 15);
@@ -605,6 +609,7 @@ static void load_config(void) {
     }
     fclose(f);
     if (g_resync_ms < 0 || g_resync_ms > 2000) g_resync_ms = 200;
+    if (g_settle_ms < 0 || g_settle_ms > 2000) g_settle_ms = 600;
     g_host_ring_ms = nex_audio_policy_host_ring_ms(g_host_ring_ms);
     g_idle_release_ms = nex_audio_policy_idle_release_ms(g_idle_release_ms);
     g_share_quiet_ms = nex_audio_policy_share_quiet_ms(g_share_quiet_ms);
@@ -666,7 +671,7 @@ static void load_config(void) {
              g_prime, g_resync_ms, g_event, g_memlock, g_dedicated_core, g_process_priority,
              g_host_ring_ms,
              g_log_enabled, g_endpoint_id[0] ? g_endpoint_id : "(follow client)");
-    log_line("config: idle_release_ms=%d auto_shared=%d share_quiet_ms=%d",
-             g_idle_release_ms, g_auto_shared, g_share_quiet_ms);
+    log_line("config: idle_release_ms=%d auto_shared=%d share_quiet_ms=%d settle_ms=%d",
+             g_idle_release_ms, g_auto_shared, g_share_quiet_ms, g_settle_ms);
 }
 
