@@ -9,10 +9,24 @@
 /* An event-driven WASAPI client prefills one complete public buffer before it
    waits for the hardware. Never advertise a buffer smaller than the real
    exclusive buffer: the device would wait for more frames while the client
-   waits for a hardware event, so playback would remain paused. */
+   waits for a hardware event, so playback would remain paused.
+   An event-driven device additionally takes one whole period per event, so the
+   client needs room for two: one period handed to the device while the next is
+   being written. With exactly one period (4410 = 4410, seen on a MOONDROP MM3A)
+   the client never has more than the device asks for, every period is
+   submitted late, and the device replays or zero-fills it: stutter and noise.
+   Periods are in device frames; the client counts in its own rate. */
 static UINT32 event_safe_client_frames(UINT32 want, const SinkGen *g) {
-    if (g && want < g->real_frames) return g->real_frames;
-    return want;
+    if (!g) return want;
+    UINT32 floor = g->real_frames;
+    if (g->real_evt) {
+        UINT64 period = g->real_frames;
+        if (g_sink.out_rate > 0 && g_sink.in_rate > 0 && g_sink.in_rate != g_sink.out_rate)
+            period = (period * (UINT64)g_sink.in_rate + (UINT64)g_sink.out_rate - 1) /
+                     (UINT64)g_sink.out_rate;
+        floor = (UINT32)((2 * period + 127u) & ~(UINT64)127u);
+    }
+    return want < floor ? floor : want;
 }
 
 /* Take an initialized IAudioClient into the generation: buffer size, render

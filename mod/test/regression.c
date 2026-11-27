@@ -1347,10 +1347,21 @@ static void test_event_buffer_floor(void) {
     gen.real_frames = 4410;
     /* The client can be event-driven even when the real endpoint uses polling. */
     CHECK(event_safe_client_frames(1408, &gen) == 4410);
+    /* event-driven device: two periods, so one can be written while the
+       device plays the other (one period stuttered on real hardware) */
     gen.real_evt = (HANDLE)(UINT_PTR)1;
-    CHECK(event_safe_client_frames(1408, &gen) == 4410);
-    CHECK(event_safe_client_frames(8192, &gen) == 8192);
-    printf("PASS event buffer: public prefill never below the real device buffer\n");
+    g_sink.in_rate = 44100;
+    g_sink.out_rate = 44100;
+    CHECK(event_safe_client_frames(1408, &gen) >= 2 * 4410);
+    CHECK(event_safe_client_frames(4410, &gen) >= 2 * 4410);
+    CHECK(event_safe_client_frames(16384, &gen) == 16384);
+    /* resampling 44.1k -> 96k: the period is counted in client frames */
+    gen.real_frames = 9600;
+    g_sink.out_rate = 96000;
+    CHECK(event_safe_client_frames(1408, &gen) >= 2 * 4410);
+    g_sink.in_rate = 0;
+    g_sink.out_rate = 0;
+    printf("PASS event buffer: public prefill never below the real buffer, two periods when event-driven\n");
 }
 
 /* Event-driven exclusive endpoints reject partial GetBuffer requests. The

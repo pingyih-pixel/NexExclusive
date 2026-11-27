@@ -13,7 +13,9 @@ static char g_endpoint_id[200];  /* hook.cfg endpoint=: output device chosen in 
 static int g_host_ring_ms = 500; /* separate host's shared ring depth */
 static int g_dedicated_core = 0; /* pin the drain thread to one fast core */
 static int g_process_priority = 0; /* HIGH_PRIORITY_CLASS while engaged */
-static int g_event       = 1;   /* try event-driven exclusive first, timer polling if refused */
+static int g_event       = 0;   /* 1: try event-driven exclusive first, timer polling if refused.
+                                   Off by default: polling is the path listened to on real hardware;
+                                   event mode stuttered there until the client buffer was doubled. */
 static int g_memlock     = 1;   /* VirtualLock the buffers the drain path touches */
 static int g_prime       = 1;   /* one device buffer of silence before a fresh start */
 static int g_resync_ms   = 200; /* extra silence when the DAC changes clock family */
