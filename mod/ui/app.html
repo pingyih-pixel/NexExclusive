@@ -405,7 +405,7 @@ select { appearance: none; height: 32px; min-width: 168px; max-width: 320px; pad
 
     /* signal chain */
     var srcFmt = s.source_status === 'observed' || s.source_rate
-      ? ((s.source_format || '') + ' ' + rateText(s.source_rate) + (s.source_valid_bits ? ' / ' + s.source_valid_bits + ' bit' : '')).trim()
+      ? ((s.source_format || '').toUpperCase() + ' ' + rateText(s.source_rate) + (s.source_valid_bits ? ' / ' + s.source_valid_bits + ' bit' : '')).trim()
       : '未取得';
     $('ch-src').textContent = srcFmt || '未取得';
     $('ch-cli').textContent = c.ok ? fmt(c.inRate, c.inBits, c.inFloat) : '—';
