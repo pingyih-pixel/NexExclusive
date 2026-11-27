@@ -508,6 +508,11 @@ static void test_rate_family_and_prime() {
     CHECK(nex_audio_policy_prime_frames(44100, 48000, 4800, 0, 200) == 9600);   /* prime off, resync on */
     CHECK(nex_audio_policy_prime_frames(44100, 48000, 4800, 1, 0) == 4800);     /* resync off */
     CHECK(nex_audio_policy_prime_frames(44100, 48000, 4800, 0, 0) == 0);
+    /* cold start: the idle DAC gets the resync silence too, once */
+    CHECK(nex_audio_policy_cold_prime_frames(4410, 4410, 44100, 200) == 4410 + 8820);
+    CHECK(nex_audio_policy_cold_prime_frames(4410 + 8820, 4410, 44100, 200) == 4410 + 8820);
+    CHECK(nex_audio_policy_cold_prime_frames(0, 4410, 44100, 200) == 0);       /* prime off */
+    CHECK(nex_audio_policy_cold_prime_frames(4410, 4410, 44100, 0) == 4410);   /* resync off */
     std::printf("PASS prime: one buffer of silence per fresh start, +resync across clock families\n");
 }
 

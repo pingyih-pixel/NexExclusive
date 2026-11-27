@@ -967,9 +967,14 @@ static HRESULT sink_engage(IAudioClient *self, const WAVEFORMATEX *fmt,
     if (gen->shared) { g_sink.skip_frames = 0; g_sink.prime_left = 0; }
     else sink_arm_prime(gen, used_rate);
     g_sink.start_hold_until = sink_cold_start_hold(GetTickCount(), gen->shared, gen->remote);
-    if (g_sink.start_hold_until)
-        log_line("sink: cold start, hardware waits %d ms for the client's format to settle",
-                 g_settle_ms);
+    if (g_sink.start_hold_until) {
+        UINT32 primed = g_sink.prime_left;
+        g_sink.prime_left = (UINT32)nex_audio_policy_cold_prime_frames(
+            (long)g_sink.prime_left, (long)gen->real_frames, (long)used_rate, g_resync_ms);
+        log_line("sink: cold start, hardware waits %d ms for the client's format to settle, "
+                 "then %lu frames of silence for the idle DAC (was %lu)",
+                 g_settle_ms, (unsigned long)g_sink.prime_left, (unsigned long)primed);
+    }
 
     char a[160], b[240];
     describe("in", fmt, a, sizeof(a));

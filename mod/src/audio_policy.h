@@ -145,6 +145,18 @@ NEX_AUDIO_POLICY_FN long nex_audio_policy_prime_frames(long previous_rate, long 
     return frames;
 }
 
+/* A cold start wakes a DAC that has been idle; its output stage can still be
+   opening (one channel ahead of the other, heard as "mono, then stereo" on a
+   MOONDROP MM3A) when one device buffer of silence is over. Give it the same
+   extra silence as a clock-family change, unless that was already added.
+   primed: what nex_audio_policy_prime_frames armed. */
+NEX_AUDIO_POLICY_FN long nex_audio_policy_cold_prime_frames(long primed, long device_frames,
+                                                            long rate, int resync_ms) {
+    if (primed <= 0 || rate <= 0 || resync_ms <= 0) return primed;
+    if (primed > device_frames) return primed;          /* resync already included */
+    return primed + (long)((long long)rate * resync_ms / 1000);
+}
+
 /* How long a teardown may wait for the separate host to play out what it
    holds: the audio still buffered (ring + device), plus a scheduling margin.
    A fixed 5 s held the client's teardown for seconds whenever the Host stalled,
