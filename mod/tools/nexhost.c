@@ -87,7 +87,7 @@ static char g_panel_script_id[128];
 static char g_simplify_script_id[128];
 
 typedef struct {
-    char status[16];
+    char status[32];
     char play_id[128];
     char format[16];
     char encoding[24];
@@ -100,7 +100,7 @@ typedef struct {
     int bitrate_kbps;
     int quality_tier;          /* 缓存文件名里的品质档（64..6999），0 = 非缓存来源 */
     int quality_tier_hint;     /* 面板从当前质量控件读到的选择提示，0 = 未取得 */
-    char selection[32];        /* 选择证据：quality/rate/mtime */
+    char selection[32];        /* 缓存选择方式：quality/rate/mtime */
     ULONGLONG audio_generation;
     ULONGLONG updated_at_ms;
     /* 播放中由宿主自己读缓存头：换歌后在一段时间窗内反复确认，
@@ -116,6 +116,7 @@ static void source_clear(void) {
     snprintf(g_source.status, sizeof(g_source.status), "unavailable");
 }
 static void source_refresh_probe(void);
+static int source_status_has_metadata(const char *status);
 
 static int module_dir(char *out, size_t n) {
     if (!out || n == 0) return 0;
@@ -1010,7 +1011,7 @@ static void status_json(char *out, size_t n) {
              source_format ? source_format : "", g_source.rate, g_source.channels,
              g_source.sample_bytes, g_source.valid_bits, g_source.container_bits,
              source_encoding ? source_encoding : "",
-             g_source.lossless ? "true" : (g_source.status[0] == 'o' ? "false" : "null"),
+             g_source.lossless ? "true" : (source_status_has_metadata(g_source.status) ? "false" : "null"),
              g_source.bitrate_kbps, g_source.quality_tier,
              g_source.quality_tier_hint, g_source.selection,
              (unsigned long long)g_source.audio_generation,

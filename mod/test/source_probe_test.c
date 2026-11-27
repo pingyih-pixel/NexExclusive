@@ -186,8 +186,9 @@ int main(int argc, char **argv) {
 
     DeleteFileA(kSinkLog);
     source_begin_probe("9_ABC", 0);
-    CHECK(!strcmp(g_source.status, "observed") && g_source.rate == 48000 && g_source.quality_tier == 999,
-          "no client rate -> newest file (rate=%d tier=%d)", g_source.rate, g_source.quality_tier);
+    CHECK(!strcmp(g_source.status, "cache-mtime-inferred") && g_source.rate == 48000 && g_source.quality_tier == 999,
+          "no client rate -> newest file is inferred (status=%s rate=%d tier=%d)",
+          g_source.status, g_source.rate, g_source.quality_tier);
 
     {
         FILE *log = fopen(kSinkLog, "wb");
@@ -196,9 +197,10 @@ int main(int argc, char **argv) {
         fclose(log);
     }
     source_begin_probe("9_DEF", 0);
-    CHECK(g_source.rate == 96000 && g_source.valid_bits == 24 && g_source.quality_tier == 1999,
-          "client rate 96k -> matching tier wins over newer file (rate=%d tier=%d)",
-          g_source.rate, g_source.quality_tier);
+    CHECK(g_source.rate == 96000 && g_source.valid_bits == 24 && g_source.quality_tier == 1999 &&
+          !strcmp(g_source.status, "cache-rate-match"),
+          "client rate 96k -> rate-matched cache wins (status=%s rate=%d tier=%d)",
+          g_source.status, g_source.rate, g_source.quality_tier);
 
     /* 同采样率的不同档位必须使用当前质量提示，不能退回文件时间。 */
     snprintf(path, sizeof(path), "%s\\10-999-old.uc", cache);
@@ -206,9 +208,10 @@ int main(int argc, char **argv) {
     snprintf(path, sizeof(path), "%s\\10-1999-new.uc", cache);
     n = make_flac(buf, 44100, 2, 24); write_xor(path, buf, n); set_mtime(path, 1);
     CHECK(source_update_from_json("{\"source_status\":\"probe\",\"source_play_id\":\"10_HINT\",\"source_quality_tier_hint\":999}") == 200 &&
-          g_source.rate == 44100 && g_source.valid_bits == 16 && g_source.quality_tier == 999,
-          "quality hint 999 must select the 16-bit tier (rate=%d bits=%d tier=%d)",
-          g_source.rate, g_source.valid_bits, g_source.quality_tier);
+          g_source.rate == 44100 && g_source.valid_bits == 16 && g_source.quality_tier == 999 &&
+          !strcmp(g_source.status, "cache-quality-match"),
+          "quality hint 999 must select and label the 16-bit tier (status=%s bits=%d tier=%d)",
+          g_source.status, g_source.valid_bits, g_source.quality_tier);
     CHECK(source_update_from_json("{\"source_status\":\"probe\",\"source_play_id\":\"10_HINT2\",\"source_quality_tier_hint\":1999}") == 200 &&
           g_source.rate == 44100 && g_source.valid_bits == 24 && g_source.quality_tier == 1999,
           "quality hint 1999 must select the 24-bit tier (rate=%d bits=%d tier=%d)",
@@ -229,13 +232,14 @@ int main(int argc, char **argv) {
           "PCM zero sample width must be rejected");
     CHECK(source_update_from_json("{\"source_status\":\"probe\",\"source_play_id\":\"pcm_X\"}") == 200 &&
           source_update_from_json("{\"source_status\":\"observed\",\"source_play_id\":\"pcm_X\",\"source_format\":\"pcm\",\"source_sample_bytes\":2,\"source_rate\":44100,\"source_channels\":2}") == 200 &&
-          g_source.valid_bits == 16 && !strcmp(g_source.encoding, "整数 PCM"),
-          "PCM two-byte samples must map to 16 bits (bits=%d encoding=%s)",
-          g_source.valid_bits, g_source.encoding);
+          g_source.valid_bits == 16 && !strcmp(g_source.encoding, "整数 PCM") &&
+          !strcmp(g_source.status, "client-reported"),
+          "PCM two-byte samples must map to 16 bits with client evidence (status=%s bits=%d encoding=%s)",
+          g_source.status, g_source.valid_bits, g_source.encoding);
 
     /* 同一 playId 的 probe 请求不重来；换 playId 才重新挑 */
     CHECK(source_update_from_json("{\"source_status\":\"probe\",\"source_play_id\":\"9_DEF\"}") == 200 &&
-          !strcmp(g_source.status, "observed"), "same playId probe keeps observed");
+          !strcmp(g_source.status, "cache-rate-match"), "same playId probe keeps rate-matched cache evidence");
 
     /* 缓存文件还没出现：pending，文件出现后在窗口内补上 */
     source_update_from_json("{\"source_status\":\"probe\",\"source_play_id\":\"77_X\"}");
@@ -244,9 +248,34 @@ int main(int argc, char **argv) {
     n = make_mp4(buf, 44100, 160000); write_xor(path, buf, n);
     g_source.probe_last_ms = 0;
     source_refresh_probe();
-    CHECK(!strcmp(g_source.status, "observed"), "late cache file picked up");
+    CHECK(!strcmp(g_source.status, "cache-single"), "late single cache file picked up with single-candidate evidence");
     CHECK(g_source.bitrate_kbps == 160 && !strcmp(g_source.encoding, "AAC") && !strcmp(g_source.play_id, "77_X"),
           "late cache aac kbps=%d playId=%s", g_source.bitrate_kbps, g_source.play_id);
+
+    /* 确认窗口过后，同一首歌的代次没变就不重挑；代次变了（暂停后重新接管、
+       换格式重建）就按新代次重挑并重新盖章，面板才不会一直把它当作过期。 */
+    CHECK(g_source.audio_generation == 3, "cache result carries the probe generation (%llu)",
+          (unsigned long long)g_source.audio_generation);
+    g_source.probe_started_ms -= SOURCE_PROBE_WINDOW_MS + 1;
+    g_source.probe_last_ms = 0;
+    source_refresh_probe();
+    CHECK(!strcmp(g_source.status, "cache-single") && g_source.audio_generation == 3,
+          "same generation after the window keeps the result (status=%s gen=%llu)",
+          g_source.status, (unsigned long long)g_source.audio_generation);
+    {
+        FILE *log = fopen(kSinkLog, "wb");
+        fputs("=== nexsink attached ===\r\n"
+              "10:00:05.000 [1] sink ENGAGED  generation=4  in=rate:44100/cont:32/valid:24/ch:2 -> out=rate:44100/cont:32.24\r\n", log);
+        fclose(log);
+    }
+    g_source.probe_started_ms -= SOURCE_PROBE_WINDOW_MS + 1;
+    g_source.probe_last_ms = 0;
+    source_refresh_probe();
+    CHECK(g_source.audio_generation == 4 && !strcmp(g_source.status, "cache-rate-match") &&
+          !strcmp(g_source.play_id, "77_X") &&
+          GetTickCount64() - g_source.probe_started_ms <= SOURCE_PROBE_WINDOW_MS,
+          "new generation after the window re-probes and re-stamps (status=%s gen=%llu)",
+          g_source.status, (unsigned long long)g_source.audio_generation);
 
     /* 窗口过期仍没有缓存 -> unavailable */
     source_update_from_json("{\"source_status\":\"probe\",\"source_play_id\":\"88_X\"}");
@@ -256,7 +285,17 @@ int main(int argc, char **argv) {
 
     /* 非数字歌曲 id 不拼进路径 */
     source_begin_probe("..\\x_1", 0);
-    CHECK(strcmp(g_source.status, "observed") != 0, "non-numeric id rejected");
+    CHECK(!source_status_has_metadata(g_source.status), "non-numeric id rejected");
+
+    /* 旧 playId 或旧代次的探测结果都不得覆盖当前状态。 */
+    CHECK(source_probe_commit_allowed("same", "same", 7, 7), "matching probe identity may commit");
+    CHECK(!source_probe_commit_allowed("next", "same", 7, 7), "stale playId must be dropped");
+    CHECK(!source_probe_commit_allowed("same", "same", 7, 8), "stale generation must be dropped");
+    CHECK(source_status_has_metadata("client-reported") &&
+          source_status_has_metadata("cache-mtime-inferred") &&
+          !source_status_has_metadata("pending") &&
+          !source_status_has_metadata("unavailable"),
+          "metadata states must be distinguished from pending and unavailable");
 
     if (!g_fail) printf("PASS source probe: FLAC/MP3/AAC headers, tier selection, probe window\n");
     return g_fail ? 1 : 0;

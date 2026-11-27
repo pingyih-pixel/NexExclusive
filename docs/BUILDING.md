@@ -25,7 +25,7 @@ bash mod/build.sh test    # 19 组回归，不开设备、不注入进程
 node mod/ui/panel.contract.test.js
 node --check mod/ui/panel.js
 node --check mod/ui/simplify.js
-bash release.sh           # → dist/NexExclusive-<版本>.zip + SHA256SUMS.txt
+bash release.sh           # → dist/NexExclusive-<版本>.zip（+ 装了 Inno Setup 6 时的 -setup.exe）+ SHA256SUMS.txt
 ```
 
 `build.sh` 还支持单独构建 `sink`（只有音频 DLL）、`ui`（只有界面 DLL `nexui.dll`）、`host`（宿主 exe）或 `audiohost`（独立 WASAPI 端点进程）。产物默认落在 `mod/`，用 `OUT_DIR=/绝对路径` 可以改，必须是绝对路径。

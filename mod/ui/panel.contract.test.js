@@ -156,9 +156,9 @@ const formatterStart = source.indexOf('  function formatRate');
 const formatterEnd = source.indexOf('  function isPlaybackPaused');
 check(formatterStart >= 0 && formatterEnd > formatterStart, 'audio specification formatter must be isolated for behavioral checks');
 vm.runInNewContext(source.slice(formatterStart, formatterEnd), context);
-const normalizedFlac = { source_status: 'observed', source_rate: 44100, source_valid_bits: 16,
+const normalizedFlac = { source_status: 'cache-quality-match', source_rate: 44100, source_valid_bits: 16,
   source_container_bits: 16, source_encoding: 'FLAC' };
-const lossySource = { source_status: 'observed', source_rate: 44100, source_valid_bits: 0,
+const lossySource = { source_status: 'cache-rate-match', source_rate: 44100, source_valid_bits: 0,
   source_encoding: 'MP3' };
 const integerDepthOnlySnapshot = {
   lastEngaged: 'sink ENGAGED in=rate:44100/cont:32/valid:32/ch:2/tag:0xFFFE/sub:0x00000001 -> out=rate:44100/cont:24.24/ch:2 [depth only]',
@@ -200,32 +200,46 @@ check(!unavailableSource.includes('源规格　44.1 kHz'), 'client PCM must not 
 check((unavailableSource.match(/源规格/g) || []).length === 1, 'unavailable source metadata must not be repeated in the detail card');
 const observedSource = context.formatAudioSpec({
   lastEngaged: integerDepthOnlySnapshot.lastEngaged,
-  source_status: 'observed',
+  source_status: 'client-reported',
   source_rate: 44100,
   source_container_bits: 24,
   source_valid_bits: 24,
   source_encoding: '整数 PCM'
 });
-check(observedSource.includes('源规格　44.1 kHz / 24 bit 整数 PCM（24 bit 容器）'), 'observed source metadata must be shown separately from client PCM');
+check(observedSource.includes('源规格　44.1 kHz / 24 bit 整数 PCM（24 bit 容器）'), 'client-reported source metadata must be shown separately from client PCM');
+check(observedSource.includes('客户端报告'), 'client-reported metadata must expose its evidence level');
 const observedFlac = context.formatSourceAudioSpec(normalizedFlac);
 check(observedFlac.includes('源规格　44.1 kHz / 16 bit FLAC'), 'FLAC source metadata must avoid PCM container wording');
+check(observedFlac.includes('缓存质量档匹配'), 'cache quality matches must expose their evidence level');
 check(!observedFlac.includes('容器'), 'FLAC source metadata must not be labelled as a PCM container');
 check(context.formatSourceAudioSpec(lossySource).includes('44.1 kHz / MP3'),
   'lossy source metadata must show codec and rate without bit depth');
-check(context.formatSourceAudioSpec({ source_status: 'observed', source_rate: 48000, source_encoding: 'AAC',
+check(context.formatSourceAudioSpec({ source_status: 'cache-rate-match', source_rate: 48000, source_encoding: 'AAC',
   source_bitrate_kbps: 256 }).includes('48.0 kHz / 256 kbps AAC'), 'lossy AAC must show the bitrate instead of a bit depth');
-check(context.formatSourceAudioSpec({ source_status: 'observed', source_rate: 96000, source_valid_bits: 24,
+check(context.formatSourceAudioSpec({ source_status: 'cache-quality-match', source_rate: 96000, source_valid_bits: 24,
   source_encoding: 'FLAC', source_bitrate_kbps: 0 }).includes('96.0 kHz / 24 bit FLAC'), 'lossless FLAC must keep the bit depth');
-check(context.formatSourceAudioSpec({ source_status: 'observed', source_rate: 96000, source_valid_bits: 24,
+check(context.formatSourceAudioSpec({ source_status: 'cache-quality-match', source_rate: 96000, source_valid_bits: 24,
   source_encoding: 'FLAC', source_bitrate_kbps: 1411 }).includes('96.0 kHz / 24 bit · 1411 kbps FLAC'),
   'source metadata must show both bit depth and bitrate when both are present');
-check(context.formatSourceAudioSpec({ source_status: 'observed', source_rate: 44100,
+check(context.formatSourceAudioSpec({ source_status: 'client-reported', source_rate: 44100,
   source_valid_bits: 0, source_container_bits: 0, source_encoding: '整数 PCM' }) === '源规格：未取得',
   'PCM without a valid sample width must remain unavailable instead of showing 0 bit');
 check(!observedFlac.includes('记录代次'), 'source specification must keep generation out of user-facing audio details');
 check(context.formatSourceAudioSpec({
   source_status: 'pending', source_play_id: 'next'
 }) === '源规格：查询中', 'pending source metadata must have a distinct UI state');
+check(context.formatSourceAudioSpec({
+  source_status: 'cache-mtime-inferred', source_rate: 48000, source_valid_bits: 16,
+  source_encoding: 'FLAC'
+}).includes('推测'), 'mtime-only cache selection must be labelled as inferred');
+check(context.formatSourceAudioSpec({
+  source_status: 'cache-quality-match', source_rate: 48000, source_valid_bits: 16,
+  source_encoding: 'FLAC', source_audio_generation: 7, currentGeneration: 8
+}) === '源规格：查询中', 'stale source generation must not render as current metadata');
+check(context.formatSourceAudioSpec({
+  source_status: 'cache-quality-match', source_rate: 48000, source_valid_bits: 16,
+  source_encoding: 'FLAC', source_audio_generation: 8, currentGeneration: 8
+}).includes('48.0 kHz'), 'matching source generation must render normally');
 check(source.includes("formatTitle.textContent = '音频规格'"), 'settings audio specification title must stay short');
 check(source.includes('max-width:calc(100vw - 16px)'), 'settings window must fit narrow viewports');
 check(!source.includes("existing.className = 'nex-quality-card'"), 'audio specification must not create a playbar card');

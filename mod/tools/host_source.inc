@@ -229,6 +229,35 @@ static int source_client_input_rate(void) {
     return rate;
 }
 
+/* source_status 同时表达发布状态和证据强度。只有下面这些状态可以把缓存或
+   客户端字段展示为源规格；pending/unavailable 不得提升为有损或无格式。 */
+static int source_status_has_metadata(const char *status) {
+    static const char *const levels[] = {
+        "client-reported", "cache-quality-match", "cache-rate-match",
+        "cache-mtime-inferred", "cache-single", "decoder-confirmed",
+        "observed"  /* 兼容旧快照；新代码不再产生这一级 */
+    };
+    size_t i;
+    if (!status) return 0;
+    for (i = 0; i < sizeof(levels) / sizeof(levels[0]); i++)
+        if (!_stricmp(status, levels[i])) return 1;
+    return 0;
+}
+
+static const char *source_cache_status(const char *selection, int candidate_count) {
+    if (selection && !strncmp(selection, "cache_quality", 13)) return "cache-quality-match";
+    if (selection && !strncmp(selection, "cache_rate", 10)) return "cache-rate-match";
+    if (candidate_count == 1) return "cache-single";
+    return "cache-mtime-inferred";
+}
+
+/* 扫描缓存可能跨过一次输出代次切换。提交时必须仍属于开始扫描时的歌曲和代次。 */
+static int source_probe_commit_allowed(const char *active_play_id, const char *probe_play_id,
+                                       ULONGLONG started_generation, ULONGLONG ended_generation) {
+    return active_play_id && probe_play_id && !strcmp(active_play_id, probe_play_id) &&
+           started_generation == ended_generation;
+}
+
 static int source_probe_cache(const char *play_id_in, int quality_tier_hint) {
     /* 调用方常传 g_source.play_id 本身，而下面会 source_clear()，先拷一份。 */
     char play_id[sizeof(g_source.play_id)];
@@ -241,9 +270,10 @@ static int source_probe_cache(const char *play_id_in, int quality_tier_hint) {
     WIN32_FIND_DATAA fd;
     HANDLE find;
     CacheProbe best, cand;
-    int have = 0, best_score = -1, client_rate;
+    int have = 0, best_score = -1, client_rate, candidate_count = 0;
     const char *best_selection = "cache_mtime_fallback";
     ULONGLONG keep_started = g_source.probe_started_ms;
+    ULONGLONG probe_generation = source_current_generation();
     ULONGLONG now = GetTickCount64();
 
     g_source.probe_last_ms = now;
@@ -269,6 +299,7 @@ static int source_probe_cache(const char *play_id_in, int quality_tier_hint) {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         memset(&cand, 0, sizeof(cand));
         if (snprintf(cand.path, sizeof(cand.path), "%s\\%s", dir, fd.cFileName) <= 0) continue;
+        candidate_count++;
         if (!cache_parse_file(cand.path, &cand)) continue;
         cand.tier = atoi(fd.cFileName + prefix_len + 1);
         cand.mtime = fd.ftLastWriteTime;
@@ -291,11 +322,29 @@ static int source_probe_cache(const char *play_id_in, int quality_tier_hint) {
     if (!have) return 0;
 
     {
-        int changed = strcmp(g_source.probe_path, best.path) != 0 ||
-                      _stricmp(g_source.status, "observed") != 0 ||
-                      strcmp(g_source.play_id, play_id) != 0;
+        ULONGLONG ended_generation = source_current_generation();
+        const char *evidence;
+        int changed;
+        if (!source_probe_commit_allowed(g_source.play_id, play_id, probe_generation, ended_generation)) {
+            if (strcmp(g_source.play_id, play_id)) return 0;
+            source_clear();
+            snprintf(g_source.status, sizeof(g_source.status), "pending");
+            snprintf(g_source.play_id, sizeof(g_source.play_id), "%s", play_id);
+            g_source.audio_generation = ended_generation;
+            g_source.updated_at_ms = now;
+            g_source.probe_started_ms = keep_started;
+            g_source.probe_last_ms = now;
+            g_source.quality_tier_hint = quality_tier_hint;
+            host_log("source cache probe: dropped stale generation playId=%s started=%llu ended=%llu",
+                     play_id, (unsigned long long)probe_generation, (unsigned long long)ended_generation);
+            return 0;
+        }
+        evidence = source_cache_status(best_selection, candidate_count);
+        changed = strcmp(g_source.probe_path, best.path) != 0 ||
+                  _stricmp(g_source.status, evidence) != 0 ||
+                  strcmp(g_source.play_id, play_id) != 0;
         source_clear();
-        snprintf(g_source.status, sizeof(g_source.status), "observed");
+        snprintf(g_source.status, sizeof(g_source.status), "%s", evidence);
         snprintf(g_source.play_id, sizeof(g_source.play_id), "%s", play_id);
         snprintf(g_source.format, sizeof(g_source.format), "%s", best.format);
         snprintf(g_source.encoding, sizeof(g_source.encoding), "%s", best.encoding);
@@ -310,13 +359,13 @@ static int source_probe_cache(const char *play_id_in, int quality_tier_hint) {
         g_source.quality_tier = best.tier;
         g_source.quality_tier_hint = quality_tier_hint;
         snprintf(g_source.selection, sizeof(g_source.selection), "%s", best_selection);
-        g_source.audio_generation = source_current_generation();
+        g_source.audio_generation = probe_generation;
         g_source.updated_at_ms = now;
         g_source.probe_started_ms = keep_started;
         g_source.probe_last_ms = now;
         if (changed)
-            host_log("source cache probe: observed playId=%s %s rate=%d channels=%d bits=%d kbps=%d tier=%d client_rate=%d selection=%s file=%s",
-                     play_id, best.encoding, best.rate, best.channels, best.bits, best.kbps,
+            host_log("source cache probe: %s playId=%s %s rate=%d channels=%d bits=%d kbps=%d tier=%d client_rate=%d selection=%s file=%s",
+                     evidence, play_id, best.encoding, best.rate, best.channels, best.bits, best.kbps,
                      best.tier, client_rate, best_selection, best.path);
     }
     return 1;
@@ -342,11 +391,28 @@ static void source_refresh_probe(void) {
     ULONGLONG now = GetTickCount64();
     if (!g_source.probe_started_ms || !g_source.play_id[0]) return;
     if (now - g_source.probe_started_ms > SOURCE_PROBE_WINDOW_MS) {
+        ULONGLONG generation;
         if (!_stricmp(g_source.status, "pending")) {
             snprintf(g_source.status, sizeof(g_source.status), "unavailable");
             g_source.updated_at_ms = now;
             host_log("source cache probe: no cache header for playId=%s", g_source.play_id);
+            return;
         }
+        /* 窗口外，同一首歌的输出代次仍会变：暂停让出设备后再接管、换格式重建
+           都会重新 ENGAGED。缓存选择依赖当时协商到的客户端采样率，所以按新代次
+           重挑一次、重新盖章，并开一个新的确认窗口；否则面板会把旧代次的结果
+           当作过期，一直显示「查询中」。窗口内的常规重挑本身就会按当前代次盖章。
+           客户端报告的结果不来自缓存，不在这里重挑。 */
+        if (strncmp(g_source.status, "cache-", 6) != 0 ||
+            now - g_source.probe_last_ms < SOURCE_PROBE_INTERVAL_MS) return;
+        g_source.probe_last_ms = now;
+        generation = source_current_generation();
+        if (!generation || generation == g_source.audio_generation) return;
+        host_log("source cache probe: generation %llu -> %llu for playId=%s, re-probing",
+                 (unsigned long long)g_source.audio_generation,
+                 (unsigned long long)generation, g_source.play_id);
+        g_source.probe_started_ms = now;
+        source_probe_cache(g_source.play_id, g_source.quality_tier_hint);
         return;
     }
     if (now - g_source.probe_last_ms < SOURCE_PROBE_INTERVAL_MS) return;
@@ -354,7 +420,7 @@ static void source_refresh_probe(void) {
 }
 
 static int source_update_from_json(const char *body) {
-    char status[16] = "", play_id[128] = "", format[16] = "";
+    char status[32] = "", play_id[128] = "", format[16] = "";
     int sample_bytes = 0, rate = 0, channels = 0, quality_tier_hint = 0;
     if (!json_get_string(body, "source_status", status, sizeof(status))) return 400;
     if (!_stricmp(status, "reset")) {
@@ -376,14 +442,16 @@ static int source_update_from_json(const char *body) {
     }
     if (!_stricmp(status, "probe") || !_stricmp(status, "unavailable")) {
         /* 面板在换歌时报告 playId 和当前质量提示；源规格由宿主读缓存头取得。
-           同一 playId 已经在确认窗口内或已取得结果时不重来，避免清掉 observed。 */
+           同一 playId 已经在确认窗口内或已取得结果时不重来，避免清掉已取得的结果。 */
         if (!strcmp(g_source.play_id, play_id) &&
             g_source.quality_tier_hint == quality_tier_hint &&
-            (g_source.probe_started_ms || !_stricmp(g_source.status, "observed"))) return 200;
+            (g_source.probe_started_ms || source_status_has_metadata(g_source.status))) return 200;
         source_begin_probe(play_id, quality_tier_hint);
         return 200;
     }
-    if (_stricmp(status, "observed") != 0 ||
+    /* 面板直接报告的规格只算「客户端报告」，不是解码器确认。请求里的
+       "observed" 是旧接口的写法，继续接受。 */
+    if ((_stricmp(status, "observed") != 0 && _stricmp(status, "client-reported") != 0) ||
         !json_get_string(body, "source_format", format, sizeof(format)) ||
         !source_format_allowed(format) ||
         !json_get_int(body, "source_sample_bytes", &sample_bytes) ||
@@ -394,7 +462,7 @@ static int source_update_from_json(const char *body) {
         rate < 8000 || rate > 768000 ||
         channels < 1 || channels > 32 || strcmp(g_source.play_id, play_id) != 0) return 409;
     source_clear();
-    snprintf(g_source.status, sizeof(g_source.status), "observed");
+    snprintf(g_source.status, sizeof(g_source.status), "client-reported");
     snprintf(g_source.play_id, sizeof(g_source.play_id), "%s", play_id);
     snprintf(g_source.format, sizeof(g_source.format), "%s", format);
     g_source.rate = rate;

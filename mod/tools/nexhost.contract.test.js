@@ -71,7 +71,9 @@ check(source.includes('requestedEngine') && source.includes('activeEngine'), 'st
 check(source.includes('convertedFrames') && source.includes('sourceWaits') && source.includes('backpressure'), 'status endpoint must expose remote transport counters');
 check(source.includes('currentGeneration') && source.includes('eosSubmittedGeneration') && source.includes('eosCompleteGeneration'), 'status endpoint must expose generation and EOS counters');
 check(source.includes('json_get_string') && source.includes('source_update_from_json'), 'source endpoint must validate string metadata fields');
-check(source.includes('strcmp(path, "/api/source")') && source.includes('source_status'), 'host must accept pending, observed and unavailable source metadata');
+check(source.includes('strcmp(path, "/api/source")') && source.includes('source_status'), 'host must accept pending, reported and unavailable source metadata');
+check(source.includes('client-reported') && source.includes('cache-mtime-inferred'), 'source status must distinguish client reports from inferred cache metadata');
+check(source.includes('source_probe_commit_allowed'), 'source probe must reject stale playId and generation results');
 check(source.includes('source_play_id') && source.includes('source_audio_generation'), 'status endpoint must expose playId binding and host generation stamp');
 check(source.includes('source_bits_from_bytes') && source.includes('source_format_allowed'), 'host must validate sample byte units and codec names');
 check(source.includes('source_uppercase') && source.includes('source_format_allowed(format)'), 'host must normalize codec labels before publishing status');
@@ -152,6 +154,9 @@ console.log('PASS host contract: visible launch and injection hand-off');
     'uninstall must remove nexui.dll and its logs');
   const release = fs.readFileSync(path.join(__dirname, '..', '..', 'release.sh'), 'utf8');
   check(/^FILES=\(.*\bnexui\.dll\b.*\)$/m.test(release), 'release package must include nexui.dll');
+  const clientVersionExtraction = release.slice(release.indexOf('CLIENT_VERS='), release.indexOf('NAME='));
+  check(clientVersionExtraction.includes('kVerified') && !clientVersionExtraction.includes('head -1'),
+    'release notes must include every verified client version');
 }
 
 /* The host carries its own icon (tray, Explorer, shortcuts) instead of the
